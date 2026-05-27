@@ -7,6 +7,7 @@ use colored::Colorize;
 use crate::palette;
 static VERBOSE: AtomicBool = AtomicBool::new(false);
 static REQUESTED_VERBOSE: AtomicBool = AtomicBool::new(false);
+static IN_ALT_SCREEN: AtomicBool = AtomicBool::new(false);
 
 fn alt_screen_verbose_state(
     requested_verbose: bool,
@@ -23,12 +24,16 @@ fn alt_screen_verbose_state(
 /// Enable or disable verbose logging output.
 pub fn set_verbose(enabled: bool) {
     REQUESTED_VERBOSE.store(enabled, Ordering::SeqCst);
-    VERBOSE.store(enabled, Ordering::SeqCst);
+    VERBOSE.store(
+        alt_screen_verbose_state(enabled, IN_ALT_SCREEN.load(Ordering::SeqCst), cfg!(windows)),
+        Ordering::SeqCst,
+    );
 }
 
 /// Suppress verbose CLI logging while the TUI owns the alt-screen.
 pub fn suppress_for_tui_alt_screen() {
     let requested = REQUESTED_VERBOSE.load(Ordering::SeqCst);
+    IN_ALT_SCREEN.store(true, Ordering::SeqCst);
     VERBOSE.store(
         alt_screen_verbose_state(requested, true, cfg!(windows)),
         Ordering::SeqCst,
@@ -38,6 +43,7 @@ pub fn suppress_for_tui_alt_screen() {
 /// Restore the user's requested verbosity after leaving the alt-screen.
 pub fn restore_after_tui_alt_screen() {
     let requested = REQUESTED_VERBOSE.load(Ordering::SeqCst);
+    IN_ALT_SCREEN.store(false, Ordering::SeqCst);
     VERBOSE.store(
         alt_screen_verbose_state(requested, false, cfg!(windows)),
         Ordering::SeqCst,
@@ -123,5 +129,28 @@ mod tests {
     fn alt_screen_verbose_state_is_noop_off_windows() {
         assert!(alt_screen_verbose_state(true, true, false));
         assert!(!alt_screen_verbose_state(false, true, false));
+    }
+
+    #[test]
+    fn set_verbose_respects_alt_screen_suppression() {
+        IN_ALT_SCREEN.store(true, Ordering::SeqCst);
+        set_verbose(true);
+        assert_eq!(
+            is_verbose(),
+            alt_screen_verbose_state(true, IN_ALT_SCREEN.load(Ordering::SeqCst), cfg!(windows))
+        );
+        IN_ALT_SCREEN.store(false, Ordering::SeqCst);
+        VERBOSE.store(false, Ordering::SeqCst);
+        REQUESTED_VERBOSE.store(false, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn set_verbose_restores_requested_state_outside_alt_screen() {
+        IN_ALT_SCREEN.store(false, Ordering::SeqCst);
+        set_verbose(true);
+        assert!(is_verbose());
+        set_verbose(false);
+        assert!(!is_verbose());
+        REQUESTED_VERBOSE.store(false, Ordering::SeqCst);
     }
 }
