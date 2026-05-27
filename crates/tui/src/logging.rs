@@ -101,6 +101,18 @@ pub fn warn(message: impl AsRef<str>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn logging_state_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn reset_logging_state() {
+        IN_ALT_SCREEN.store(false, Ordering::SeqCst);
+        VERBOSE.store(false, Ordering::SeqCst);
+        REQUESTED_VERBOSE.store(false, Ordering::SeqCst);
+    }
 
     #[test]
     fn log_value_parser_accepts_common_rust_log_directives() {
@@ -133,24 +145,25 @@ mod tests {
 
     #[test]
     fn set_verbose_respects_alt_screen_suppression() {
+        let _guard = logging_state_test_lock().lock().unwrap();
+        reset_logging_state();
         IN_ALT_SCREEN.store(true, Ordering::SeqCst);
         set_verbose(true);
         assert_eq!(
             is_verbose(),
             alt_screen_verbose_state(true, IN_ALT_SCREEN.load(Ordering::SeqCst), cfg!(windows))
         );
-        IN_ALT_SCREEN.store(false, Ordering::SeqCst);
-        VERBOSE.store(false, Ordering::SeqCst);
-        REQUESTED_VERBOSE.store(false, Ordering::SeqCst);
+        reset_logging_state();
     }
 
     #[test]
     fn set_verbose_restores_requested_state_outside_alt_screen() {
-        IN_ALT_SCREEN.store(false, Ordering::SeqCst);
+        let _guard = logging_state_test_lock().lock().unwrap();
+        reset_logging_state();
         set_verbose(true);
         assert!(is_verbose());
         set_verbose(false);
         assert!(!is_verbose());
-        REQUESTED_VERBOSE.store(false, Ordering::SeqCst);
+        reset_logging_state();
     }
 }
