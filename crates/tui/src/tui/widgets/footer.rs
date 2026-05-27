@@ -11,7 +11,7 @@ use ratatui::{
     layout::Rect,
     style::{Color, Style},
     text::{Line, Span},
-    widgets::{Block, Paragraph, Widget},
+    widgets::{Paragraph, Widget},
 };
 use unicode_width::UnicodeWidthStr;
 
@@ -573,12 +573,16 @@ impl Renderable for FooterWidget {
             return;
         }
 
-        // Repaint the whole footer row first so stale transcript glyphs from
+        // Clear the whole footer row first so stale transcript glyphs from
         // the previous frame cannot survive in cells this frame's spans do not
         // touch (#2244).
-        Block::default()
-            .style(Style::default().bg(self.props.footer_bg))
-            .render(area, buf);
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                buf[(x, y)]
+                    .set_symbol(" ")
+                    .set_style(Style::default().bg(self.props.footer_bg));
+            }
+        }
 
         let preview_left_spans = self.left_spans(available_width);
         let preview_left_width = span_width(&preview_left_spans);
