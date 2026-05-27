@@ -1524,13 +1524,6 @@ fn footer_controls(locale: Locale) -> &'static str {
 /// metadata. The header summarises the variant — `+N -M` for normal diffs,
 /// a "new file" or "no change" hint for the degenerate cases — so the user
 /// always knows what's behind the preview window even when it's empty.
-/// Build the rendered body + header for the approval popup diff area.
-///
-/// The popup uses the compact renderer (no summary / `--- +++` lines) so a
-/// 10-row preview window shows a few real lines of code instead of just
-/// metadata. The header summarises the variant — `+N -M` for normal diffs,
-/// a "new file" or "no change" hint for the degenerate cases — so the user
-/// always knows what's behind the preview window even when it's empty.
 ///
 /// Body lines are indented by two spaces to line up with the rest of the
 /// popup body (the popup margin) so the hunk header and code rows visually

@@ -495,7 +495,12 @@ pub(crate) fn format_shell_command_for_approval(command: &str) -> Vec<String> {
             }
 
             if quote.is_none() && ch == '|' {
-                push_shell_clause(&mut out, &mut current, Some("|"));
+                if chars.peek() == Some(&'|') {
+                    chars.next();
+                    push_shell_clause(&mut out, &mut current, Some("||"));
+                } else {
+                    push_shell_clause(&mut out, &mut current, Some("|"));
+                }
                 continue;
             }
 
@@ -1808,6 +1813,13 @@ mod tests {
             .as_ref()
             .expect("shell command lines should be cached");
         assert!(shell_lines.iter().any(|line| line.contains("cat /tmp/x")));
+    }
+
+    #[test]
+    fn test_shell_formatter_preserves_logical_or_operator() {
+        let lines = format_shell_command_for_approval("cargo build || echo fallback");
+
+        assert_eq!(lines, vec!["cargo build ||", "echo fallback"]);
     }
 
     #[test]
