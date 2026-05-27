@@ -2104,9 +2104,123 @@ impl Engine {
                                     continue;
                                 }
                                 _ => {
-                                    // Retry also failed — fall through to
-                                    // normal error handling. Future: try
-                                    // Fin Flash here (Option B).
+                                    // Option B: Fin Flash inner-loop.
+                                    // Fuzzy matcher couldn't find a match
+                                    // — ask Flash (thinking off) to locate
+                                    // the closest text in the file.
+                                    if let Some(client) = self.deepseek_client.as_ref()
+                                        && let Some(path_str) = tool_input
+                                            .get("path")
+                                            .and_then(|v| v.as_str())
+                                    {
+                                        let resolved = if std::path::Path::new(path_str).is_absolute()
+                                        {
+                                            std::path::Path::new(path_str).to_path_buf()
+                                        } else {
+                                            self.session.workspace.join(path_str)
+                                        };
+                                        if let Ok(file_content) =
+                                            std::fs::read_to_string(&resolved)
+                                        {
+                                            if let Some(search_str) = tool_input
+                                                .get("search")
+                                                .and_then(|v| v.as_str())
+                                            {
+                                                if let Some(flash_match) =
+                                                    verify::flash_correct_search(
+                                                        client,
+                                                        &file_content,
+                                                        search_str,
+                                                    )
+                                                    .await
+                                                {
+                                                    let mut flash_input =
+                                                        corrected_input.clone();
+                                                    if let Some(obj) =
+                                                        flash_input.as_object_mut()
+                                                    {
+                                                        obj.insert(
+                                                            "search".to_string(),
+                                                            serde_json::Value::String(
+                                                                flash_match.clone(),
+                                                            ),
+                                                        );
+                                                        obj.insert(
+                                                            "flash_correction"
+                                                                .to_string(),
+                                                            serde_json::Value::String(
+                                                                format!(
+                                                                    "search string corrected \
+                                                                     by Fin Flash: \"{search_str}\" \
+                                                                     → \"{flash_match}\""
+                                                                ),
+                                                            ),
+                                                        );
+                                                    }
+                                                    // Retry with Flash-corrected input.
+                                                    match Engine::retry_file_tool(
+                                                        tool_exec_lock.clone(),
+                                                        &outcome.name,
+                                                        flash_input.clone(),
+                                                        self.tx_event.clone(),
+                                                        tool_registry,
+                                                        mcp_pool.clone(),
+                                                    )
+                                                    .await
+                                                    {
+                                                        Ok((flash_result, true)) =>
+                                                        {
+                                                            corrected = true;
+                                                            let flash_output =
+                                                                compact_tool_result_for_context(
+                                                                    &self.session.model,
+                                                                    &outcome.name,
+                                                                    &flash_result,
+                                                                );
+                                                            emit_tool_audit(json!({
+                                                                "event": "tool.result",
+                                                                "tool_id": outcome.id.clone(),
+                                                                "tool_name": outcome.name.clone(),
+                                                                "success": true,
+                                                                "corrected": true,
+                                                                "flash_correction": flash_match,
+                                                            }));
+                                                            let flash_annotation =
+                                                                verify::retry_annotation(2);
+                                                            let final_output =
+                                                                format!("{flash_output}{flash_annotation}");
+                                                            tool_call.set_result(
+                                                                final_output.clone(),
+                                                                duration,
+                                                            );
+                                                            self.session.working_set.observe_tool_call(
+                                                                &tool_name_for_ws,
+                                                                &flash_input,
+                                                                Some(&final_output),
+                                                                &self.session.workspace,
+                                                            );
+                                                            self.add_session_message(Message {
+                                                                role: "user".to_string(),
+                                                                content: vec![ContentBlock::ToolResult {
+                                                                    tool_use_id: outcome.id,
+                                                                    content: final_output,
+                                                                    is_error: None,
+                                                                    content_blocks: None,
+                                                                }],
+                                                            })
+                                                            .await;
+                                                            continue;
+                                                        }
+                                                        _ => {
+                                                            // Flash correction also
+                                                            // failed — fall through
+                                                            // to normal error handling.
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }

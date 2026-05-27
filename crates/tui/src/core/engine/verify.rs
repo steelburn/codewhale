@@ -347,6 +347,80 @@ fn levenshtein_distance(a: &str, b: &str) -> usize {
     prev[b_len]
 }
 
+/// Fin Flash inner-loop: when the deterministic fuzzy matcher can't find
+/// a close match, ask Flash (thinking off, fork_context for cache sharing)
+/// to find the closest text in the file. Costs ~$0.0001, returns in ~200ms.
+///
+/// This is Option B — the fallback when Option A (fuzzy matching) can't
+/// find a match above the similarity threshold.
+pub async fn flash_correct_search(
+    client: &crate::client::DeepSeekClient,
+    file_content: &str,
+    failed_search: &str,
+) -> Option<String> {
+    use crate::llm_client::LlmClient;
+    use crate::models::{ContentBlock, Message, MessageRequest};
+
+    // Truncate file content to avoid token bloat — Flash just needs context.
+    let file_snippet = if file_content.len() > 8000 {
+        let half = 4000;
+        let start = &file_content[..half];
+        let end = &file_content[file_content.len().saturating_sub(half)..];
+        format!("{start}\n... [truncated] ...\n{end}")
+    } else {
+        file_content.to_string()
+    };
+
+    let request = MessageRequest {
+        model: "deepseek-v4-flash".to_string(),
+        messages: vec![Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text {
+                text: format!(
+                    "The following edit_file search string did not match any text in this file:\n\
+                     \nSEARCH STRING:\n{failed_search}\n\
+                     \nFILE CONTENT:\n{file_snippet}\n\
+                     \nReturn ONLY the exact text from the file above that most closely \
+                     matches the search string. Return just the matching text, nothing else. \
+                     If no reasonable match exists, return the word NOMATCH."
+                ),
+                cache_control: None,
+            }],
+        }],
+        max_tokens: 128,
+        system: None,
+        temperature: Some(0.0),
+        top_p: None,
+        stream: Some(false),
+        reasoning_effort: Some("off".to_string()),
+        response_format: None,
+        tools: None,
+        tool_choice: None,
+        metadata: None,
+        thinking: None,
+    };
+
+    match client.create_message(request).await {
+        Ok(response) => {
+            let text = response
+                .content
+                .first()
+                .and_then(|block| match block {
+                    ContentBlock::Text { text, .. } => Some(text.trim().to_string()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+
+            if text.is_empty() || text.eq_ignore_ascii_case("NOMATCH") {
+                None
+            } else {
+                Some(text)
+            }
+        }
+        Err(_) => None,
+    }
+}
+
 /// Attempt to correct a failed edit_file search string and retry the operation.
 ///
 /// Called when edit_file fails with a "search string not found" error.
