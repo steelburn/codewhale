@@ -3798,7 +3798,7 @@ async fn run_cache_warmup(app: &App, config: &Config) -> Result<Usage> {
         stream: None,
         temperature: None,
         top_p: None,
-                response_format: None,
+        response_format: None,
     };
     let warmup = build_cache_warmup_request(&request);
     let response =
@@ -5867,7 +5867,7 @@ fn render(f: &mut Frame, app: &mut App) {
                     let tooltip = ratatui::widgets::Paragraph::new(tooltip_text.as_str()).style(
                         Style::default()
                             .bg(palette::STATUS_WARNING)
-                            .fg(palette::TEXT_MUTED),
+                            .fg(palette::DEEPSEEK_INK),
                     );
                     f.render_widget(tooltip, tooltip_area);
                 }

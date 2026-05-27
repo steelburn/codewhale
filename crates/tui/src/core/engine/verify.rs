@@ -20,14 +20,9 @@ pub enum VerifyVerdict {
     /// Re-check confirmed the claim.
     Pass,
     /// Re-check contradicted the claim with evidence.
-    Fail {
-        expected: String,
-        observed: String,
-    },
+    Fail { expected: String, observed: String },
     /// Could not re-check (no read-only path available, or re-check tool failed).
-    Unverifiable {
-        reason: String,
-    },
+    Unverifiable { reason: String },
     /// Explicitly skipped (read-only tool, or tool returned `verification: "skip"` metadata).
     Skipped,
 }
@@ -46,10 +41,13 @@ pub struct VerifyRecord {
 #[derive(Debug, Clone)]
 pub struct VerifyConfig {
     /// Enable the verification gate.
+    #[allow(dead_code)]
     pub enabled: bool,
     /// Tools to skip verification for.
+    #[allow(dead_code)]
     pub skip_tools: Vec<String>,
     /// Max verification retries. Default: 1.
+    #[allow(dead_code)]
     pub max_retries: u8,
 }
 
@@ -84,22 +82,47 @@ pub fn run_verification(
 
     let verdict = match tool_name {
         // Read-only tools — skip
-        "read_file" | "grep_files" | "file_search" | "list_dir" | "web_search"
-        | "fetch_url" | "git_status" | "git_diff" | "git_log" | "git_show"
-        | "git_blame" | "diagnostics" | "handle_read" | "task_list" | "task_read"
-        | "pr_attempt_list" | "pr_attempt_read" | "automation_list" | "automation_read"
-        | "github_issue_context" | "github_pr_context" | "code_execution"
-        | "validate_data" | "note" | "request_user_input" | "recall_archive"
-        | "tool_search_tool_regex" | "tool_search_tool_bm25" => {
-            VerifyVerdict::Skipped
-        }
+        "read_file"
+        | "grep_files"
+        | "file_search"
+        | "list_dir"
+        | "web_search"
+        | "fetch_url"
+        | "git_status"
+        | "git_diff"
+        | "git_log"
+        | "git_show"
+        | "git_blame"
+        | "diagnostics"
+        | "handle_read"
+        | "task_list"
+        | "task_read"
+        | "pr_attempt_list"
+        | "pr_attempt_read"
+        | "automation_list"
+        | "automation_read"
+        | "github_issue_context"
+        | "github_pr_context"
+        | "code_execution"
+        | "validate_data"
+        | "note"
+        | "request_user_input"
+        | "recall_archive"
+        | "tool_search_tool_regex"
+        | "tool_search_tool_bm25" => VerifyVerdict::Skipped,
 
         // Self-verifying or review tools — skip
-        "review" | "agent_open" | "agent_eval" | "agent_close" | "tool_agent"
-        | "rlm_open" | "rlm_eval" | "rlm_configure" | "rlm_close"
-        | "rlm_session_objects" | "run_tests" => {
-            VerifyVerdict::Skipped
-        }
+        "review"
+        | "agent_open"
+        | "agent_eval"
+        | "agent_close"
+        | "tool_agent"
+        | "rlm_open"
+        | "rlm_eval"
+        | "rlm_configure"
+        | "rlm_close"
+        | "rlm_session_objects"
+        | "run_tests" => VerifyVerdict::Skipped,
 
         // Core file-mutating tools — inline verification: re-read the file
         // to confirm the write/edit/patch actually landed. If the file is
@@ -111,19 +134,47 @@ pub fn run_verification(
 
         // Other side-effect tools — trust but don't block on verification
         "exec_shell"
-        | "exec_shell_wait" | "exec_shell_interact" | "shell_cancel"
-        | "exec_wait" | "exec_interact" | "task_shell_start" | "task_shell_wait"
-        | "task_create" | "task_gate_run" | "github_comment" | "github_close_issue"
-        | "github_close_pr" | "pr_attempt_record" | "pr_attempt_preflight"
-        | "automation_create" | "automation_update" | "automation_pause"
-        | "automation_resume" | "automation_delete" | "automation_run"
-        | "task_cancel" | "remember" | "notify" | "revert_turn" | "fim_edit"
-        | "pandoc_convert" | "image_analyze" | "image_ocr" | "web_run"
-        | "finance" | "skill_install" | "checklist_write" | "checklist_add"
-        | "checklist_update" | "todo_write" | "todo_add" | "todo_update"
-        | "update_plan" | "create_goal" | "get_goal" | "update_goal" => {
-            VerifyVerdict::Pass
-        }
+        | "exec_shell_wait"
+        | "exec_shell_interact"
+        | "shell_cancel"
+        | "exec_wait"
+        | "exec_interact"
+        | "task_shell_start"
+        | "task_shell_wait"
+        | "task_create"
+        | "task_gate_run"
+        | "github_comment"
+        | "github_close_issue"
+        | "github_close_pr"
+        | "pr_attempt_record"
+        | "pr_attempt_preflight"
+        | "automation_create"
+        | "automation_update"
+        | "automation_pause"
+        | "automation_resume"
+        | "automation_delete"
+        | "automation_run"
+        | "task_cancel"
+        | "remember"
+        | "notify"
+        | "revert_turn"
+        | "fim_edit"
+        | "pandoc_convert"
+        | "image_analyze"
+        | "image_ocr"
+        | "web_run"
+        | "finance"
+        | "skill_install"
+        | "checklist_write"
+        | "checklist_add"
+        | "checklist_update"
+        | "todo_write"
+        | "todo_add"
+        | "todo_update"
+        | "update_plan"
+        | "create_goal"
+        | "get_goal"
+        | "update_goal" => VerifyVerdict::Pass,
 
         // Unknown tools — skip verification
         _ => VerifyVerdict::Unverifiable {
@@ -159,15 +210,14 @@ pub fn is_auto_retryable(tool_name: &str) -> bool {
 /// Inline file verification: read the file back and check it exists with
 /// content. Returns Pass if the file is present and non-empty, Fail if
 /// missing/empty, Unverifiable if we can't read it.
-fn inline_verify_file_tool(
-    tool_input: &serde_json::Value,
-    workspace: &Path,
-) -> VerifyVerdict {
+fn inline_verify_file_tool(tool_input: &serde_json::Value, workspace: &Path) -> VerifyVerdict {
     let path_str = match tool_input.get("path").and_then(|v| v.as_str()) {
         Some(p) => p,
-        None => return VerifyVerdict::Unverifiable {
-            reason: "no path in tool input".to_string(),
-        },
+        None => {
+            return VerifyVerdict::Unverifiable {
+                reason: "no path in tool input".to_string(),
+            };
+        }
     };
 
     let resolved = if Path::new(path_str).is_absolute() {
@@ -336,10 +386,14 @@ fn levenshtein_distance(a: &str, b: &str) -> usize {
     for i in 1..=a_len {
         curr[0] = i;
         for j in 1..=b_len {
-            let cost = if a_chars[i - 1] == b_chars[j - 1] { 0 } else { 1 };
-            curr[j] = (prev[j] + 1)        // deletion
-                .min(curr[j - 1] + 1)       // insertion
-                .min(prev[j - 1] + cost);   // substitution
+            let cost = if a_chars[i - 1] == b_chars[j - 1] {
+                0
+            } else {
+                1
+            };
+            curr[j] = (prev[j] + 1) // deletion
+                .min(curr[j - 1] + 1) // insertion
+                .min(prev[j - 1] + cost); // substitution
         }
         std::mem::swap(&mut prev, &mut curr);
     }
@@ -452,7 +506,10 @@ pub fn correct_edit_file_input(
     // Build corrected input with the fuzzy-matched text as the new search string.
     let mut corrected = original_input.clone();
     if let Some(obj) = corrected.as_object_mut() {
-        obj.insert("search".to_string(), serde_json::Value::String(fuzzy.text.clone()));
+        obj.insert(
+            "search".to_string(),
+            serde_json::Value::String(fuzzy.text.clone()),
+        );
         // Add a note so the model understands the correction.
         obj.insert(
             "fuzzy_correction".to_string(),
@@ -482,6 +539,7 @@ pub fn retry_annotation(retry_count: u32) -> String {
 
 /// Determine whether a tool name represents a side-effect tool that should
 /// be verified.
+#[allow(dead_code)]
 pub fn is_side_effect_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
@@ -539,6 +597,7 @@ pub fn is_side_effect_tool(tool_name: &str) -> bool {
 ///
 /// Returns `Some(VerifyVerdict)` when verification was possible,
 /// `None` when the tool doesn't support post-hoc file checks.
+#[allow(dead_code)]
 pub fn post_hoc_verify_file(
     tool_name: &str,
     tool_input: &serde_json::Value,
@@ -566,10 +625,7 @@ pub fn post_hoc_verify_file(
                     }
                 }
                 Err(e) => Some(VerifyVerdict::Unverifiable {
-                    reason: format!(
-                        "cannot read {} for verification: {e}",
-                        resolved.display()
-                    ),
+                    reason: format!("cannot read {} for verification: {e}", resolved.display()),
                 }),
             }
         }
@@ -605,11 +661,7 @@ mod tests {
             "git_diff",
             "web_search",
         ] {
-            let (verdict, _) = run_verification(
-                tool,
-                &serde_json::json!({}),
-                Path::new("/tmp"),
-            );
+            let (verdict, _) = run_verification(tool, &serde_json::json!({}), Path::new("/tmp"));
             assert!(
                 matches!(verdict, VerifyVerdict::Skipped),
                 "{tool} should be skipped, got {verdict:?}"
@@ -675,7 +727,10 @@ mod tests {
             tmp.path(),
         );
         assert!(verdict.is_some());
-        assert!(matches!(verdict.unwrap(), VerifyVerdict::Unverifiable { .. }));
+        assert!(matches!(
+            verdict.unwrap(),
+            VerifyVerdict::Unverifiable { .. }
+        ));
     }
 
     #[test]
@@ -695,12 +750,9 @@ mod tests {
 
     #[test]
     fn post_hoc_verify_returns_none_for_unsupported_tools() {
-        assert!(post_hoc_verify_file(
-            "read_file",
-            &serde_json::json!({}),
-            Path::new("/tmp")
-        )
-        .is_none());
+        assert!(
+            post_hoc_verify_file("read_file", &serde_json::json!({}), Path::new("/tmp")).is_none()
+        );
     }
 
     #[test]

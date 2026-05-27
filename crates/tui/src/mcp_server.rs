@@ -404,7 +404,7 @@ impl McpServer {
             stream: None,
             temperature: None,
             top_p: None,
-                response_format: None,
+            response_format: None,
         };
 
         let response = runtime

@@ -351,6 +351,7 @@ pub struct Engine {
     lsp_manager: Arc<crate::lsp::LspManager>,
     /// Closed-loop verification gate. Re-checks tool claims before
     /// the result enters the session message stream.
+    #[allow(dead_code)]
     verify_config: verify::VerifyConfig,
     /// Session-scoped workshop variable store (#548). Shared across all tool
     /// calls so `last_tool_result` persists within the session and can be

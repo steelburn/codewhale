@@ -523,7 +523,7 @@ impl<'a> PromptBuilder<'a> {
             stream: None,
             temperature: Some(0.0),
             top_p: None,
-                response_format: None,
+            response_format: None,
         }
     }
 }
@@ -2772,7 +2772,7 @@ mod stream_decoder_tests {
             stream: None,
             temperature: None,
             top_p: None,
-                response_format: None,
+            response_format: None,
         };
 
         let inspection = inspect_prompt_for_request(&request);

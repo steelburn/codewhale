@@ -1905,13 +1905,9 @@ impl Engine {
                         let mut verify_annotation = String::new();
                         let mut retry_count: u32 = 0;
 
-                        if self.config.verification_enabled
-                            && output_success
-                            && tool_was_executed
-                        {
+                        if self.config.verification_enabled && output_success && tool_was_executed {
                             let max_retries = self.config.verification_max_retries;
-                            let is_retryable =
-                                verify::is_auto_retryable(&outcome.name);
+                            let is_retryable = verify::is_auto_retryable(&outcome.name);
 
                             loop {
                                 let (verdict, annotation) = verify::run_verification(
@@ -1921,9 +1917,10 @@ impl Engine {
                                 );
 
                                 // If passed, skipped, or unverifiable — done.
-                                let should_retry = matches!(verdict, verify::VerifyVerdict::Fail { .. })
-                                    && is_retryable
-                                    && retry_count < max_retries;
+                                let should_retry =
+                                    matches!(verdict, verify::VerifyVerdict::Fail { .. })
+                                        && is_retryable
+                                        && retry_count < max_retries;
 
                                 if !should_retry {
                                     verify_verdict = verdict;
@@ -1982,8 +1979,7 @@ impl Engine {
                         });
                         // Bounded ledger: keep at most 200 entries.
                         const MAX_VERIFICATION_RECORDS: usize = 200;
-                        if self.session.verification_ledger.len() > MAX_VERIFICATION_RECORDS
-                        {
+                        if self.session.verification_ledger.len() > MAX_VERIFICATION_RECORDS {
                             let excess =
                                 self.session.verification_ledger.len() - MAX_VERIFICATION_RECORDS;
                             self.session.verification_ledger.drain(0..excess);
@@ -1996,12 +1992,12 @@ impl Engine {
                             format!("{output_for_context}{verify_annotation}")
                         };
 
-                        let is_error = if matches!(verify_verdict, verify::VerifyVerdict::Fail { .. })
-                        {
-                            Some(true)
-                        } else {
-                            None
-                        };
+                        let is_error =
+                            if matches!(verify_verdict, verify::VerifyVerdict::Fail { .. }) {
+                                Some(true)
+                            } else {
+                                None
+                            };
 
                         self.add_session_message(Message {
                             role: "user".to_string(),
@@ -2019,7 +2015,7 @@ impl Engine {
                         // "search string not found" error, try fuzzy matching
                         // to find the closest real text and retry once.
                         let error_str = e.to_string();
-                        let mut corrected = false;
+                        let corrected = false;
                         if outcome.name == "edit_file"
                             && verify::correct_edit_file_input(
                                 &tool_input,
@@ -2048,7 +2044,6 @@ impl Engine {
                             {
                                 Ok((retry_result, retry_ok)) if retry_ok => {
                                     // Retry succeeded — treat as success.
-                                    corrected = true;
                                     emit_tool_audit(json!({
                                         "event": "tool.result",
                                         "tool_id": outcome.id.clone(),
@@ -2060,30 +2055,24 @@ impl Engine {
                                             .and_then(|v| v.as_str())
                                             .unwrap_or(""),
                                     }));
-                                    let mut corrected_output =
-                                        compact_tool_result_for_context(
-                                            &self.session.model,
-                                            &outcome.name,
-                                            &retry_result,
-                                        );
+                                    let mut corrected_output = compact_tool_result_for_context(
+                                        &self.session.model,
+                                        &outcome.name,
+                                        &retry_result,
+                                    );
                                     // Verification for corrected result.
-                                    let (v_verdict, _v_annotation) =
-                                        verify::run_verification(
-                                            &outcome.name,
-                                            &corrected_input,
-                                            &self.session.workspace,
-                                        );
-                                    if matches!(v_verdict, verify::VerifyVerdict::Pass)
-                                    {
+                                    let (v_verdict, _v_annotation) = verify::run_verification(
+                                        &outcome.name,
+                                        &corrected_input,
+                                        &self.session.workspace,
+                                    );
+                                    if matches!(v_verdict, verify::VerifyVerdict::Pass) {
                                         corrected_output = format!(
                                             "{corrected_output}{}",
                                             verify::retry_annotation(1)
                                         );
                                     }
-                                    tool_call.set_result(
-                                        corrected_output.clone(),
-                                        duration,
-                                    );
+                                    tool_call.set_result(corrected_output.clone(), duration);
                                     self.session.working_set.observe_tool_call(
                                         &tool_name_for_ws,
                                         &corrected_input,
@@ -2109,22 +2098,20 @@ impl Engine {
                                     // — ask Flash (thinking off) to locate
                                     // the closest text in the file.
                                     if let Some(client) = self.deepseek_client.as_ref()
-                                        && let Some(path_str) = tool_input
-                                            .get("path")
-                                            .and_then(|v| v.as_str())
+                                        && let Some(path_str) =
+                                            tool_input.get("path").and_then(|v| v.as_str())
                                     {
-                                        let resolved = if std::path::Path::new(path_str).is_absolute()
+                                        let resolved =
+                                            if std::path::Path::new(path_str).is_absolute() {
+                                                std::path::Path::new(path_str).to_path_buf()
+                                            } else {
+                                                self.session.workspace.join(path_str)
+                                            };
+                                        #[allow(clippy::collapsible_if)]
+                                        if let Ok(file_content) = std::fs::read_to_string(&resolved)
                                         {
-                                            std::path::Path::new(path_str).to_path_buf()
-                                        } else {
-                                            self.session.workspace.join(path_str)
-                                        };
-                                        if let Ok(file_content) =
-                                            std::fs::read_to_string(&resolved)
-                                        {
-                                            if let Some(search_str) = tool_input
-                                                .get("search")
-                                                .and_then(|v| v.as_str())
+                                            if let Some(search_str) =
+                                                tool_input.get("search").and_then(|v| v.as_str())
                                             {
                                                 if let Some(flash_match) =
                                                     verify::flash_correct_search(
@@ -2134,11 +2121,8 @@ impl Engine {
                                                     )
                                                     .await
                                                 {
-                                                    let mut flash_input =
-                                                        corrected_input.clone();
-                                                    if let Some(obj) =
-                                                        flash_input.as_object_mut()
-                                                    {
+                                                    let mut flash_input = corrected_input.clone();
+                                                    if let Some(obj) = flash_input.as_object_mut() {
                                                         obj.insert(
                                                             "search".to_string(),
                                                             serde_json::Value::String(
@@ -2168,9 +2152,7 @@ impl Engine {
                                                     )
                                                     .await
                                                     {
-                                                        Ok((flash_result, true)) =>
-                                                        {
-                                                            corrected = true;
+                                                        Ok((flash_result, true)) => {
                                                             let flash_output =
                                                                 compact_tool_result_for_context(
                                                                     &self.session.model,
@@ -2187,26 +2169,31 @@ impl Engine {
                                                             }));
                                                             let flash_annotation =
                                                                 verify::retry_annotation(2);
-                                                            let final_output =
-                                                                format!("{flash_output}{flash_annotation}");
+                                                            let final_output = format!(
+                                                                "{flash_output}{flash_annotation}"
+                                                            );
                                                             tool_call.set_result(
                                                                 final_output.clone(),
                                                                 duration,
                                                             );
-                                                            self.session.working_set.observe_tool_call(
-                                                                &tool_name_for_ws,
-                                                                &flash_input,
-                                                                Some(&final_output),
-                                                                &self.session.workspace,
-                                                            );
+                                                            self.session
+                                                                .working_set
+                                                                .observe_tool_call(
+                                                                    &tool_name_for_ws,
+                                                                    &flash_input,
+                                                                    Some(&final_output),
+                                                                    &self.session.workspace,
+                                                                );
                                                             self.add_session_message(Message {
                                                                 role: "user".to_string(),
-                                                                content: vec![ContentBlock::ToolResult {
-                                                                    tool_use_id: outcome.id,
-                                                                    content: final_output,
-                                                                    is_error: None,
-                                                                    content_blocks: None,
-                                                                }],
+                                                                content: vec![
+                                                                    ContentBlock::ToolResult {
+                                                                        tool_use_id: outcome.id,
+                                                                        content: final_output,
+                                                                        is_error: None,
+                                                                        content_blocks: None,
+                                                                    },
+                                                                ],
                                                             })
                                                             .await;
                                                             continue;

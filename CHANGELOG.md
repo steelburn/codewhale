@@ -95,6 +95,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Clippy warnings resolved.** (#2237).
 - **Windows alt-screen logging suppressed.** Verbose CLI logging no
   longer leaks into the TUI on Windows alt-screen (#1910).
+- **PDF and OCR reads no longer block the async runtime.** `read_file`
+  on PDF and image files now runs extraction inside `spawn_blocking`,
+  preventing the tokio worker pool from stalling on large documents.
+- **Sidebar hover tooltip contrast fixed.** Tooltip foreground changed
+  from pale gray (`TEXT_MUTED`) to deep navy (`DEEPSEEK_INK`) for
+  readable contrast against the amber warning background.
 
 ### Community
 
@@ -113,6 +119,7 @@ Thanks to contributors whose PRs landed in this release:
 **@aboimpinto** (#1910),
 **@HUQIANTAO** (#2240),
 **@mvanhorn** (#2156),
+**@LING71671** (#1797),
 and **@reidliu41** (#2241, #2235).
 
 ## [0.8.46] - 2026-05-26
@@ -5076,7 +5083,8 @@ Welcome — and thank you.
 - Hooks system and config profiles
 - Example skills and launch assets
 
-[Unreleased]: https://github.com/Hmbown/CodeWhale/compare/v0.8.46...HEAD
+[Unreleased]: https://github.com/Hmbown/CodeWhale/compare/v0.8.47...HEAD
+[0.8.47]: https://github.com/Hmbown/CodeWhale/compare/v0.8.46...v0.8.47
 [0.8.46]: https://github.com/Hmbown/CodeWhale/compare/v0.8.45...v0.8.46
 [0.8.45]: https://github.com/Hmbown/CodeWhale/compare/v0.8.44...v0.8.45
 [0.8.44]: https://github.com/Hmbown/CodeWhale/compare/v0.8.43...v0.8.44
