@@ -5,6 +5,7 @@
 //!
 //! - `WHALE.md` - CodeWhale-native project instructions (highest priority)
 //! - `AGENTS.md` - Generic agent instructions (compatible with other agents)
+//! - `DEEPSEEK.md` - DeepSeek TUI-specific project instructions
 //! - `.claude/instructions.md` - Claude-style hidden instructions
 //! - `CLAUDE.md` - Claude-style instructions
 //! - `.codewhale/instructions.md` - Hidden instructions file (new)
@@ -27,6 +28,7 @@ use thiserror::Error;
 const PROJECT_CONTEXT_FILES: &[&str] = &[
     "WHALE.md",
     "AGENTS.md",
+    "DEEPSEEK.md",
     ".claude/instructions.md",
     "CLAUDE.md",
     ".codewhale/instructions.md",
