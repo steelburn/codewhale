@@ -304,6 +304,7 @@ pub async fn run_tui(config: &Config, options: TuiOptions) -> Result<()> {
     let mut stdout = io::stdout();
     if use_alt_screen {
         execute!(stdout, EnterAlternateScreen)?;
+        crate::logging::suppress_for_tui_alt_screen();
     }
     // Initialize the file-backed TUI log and (on Unix) redirect raw stderr
     // away from the alt-screen for the lifetime of this guard. Any
@@ -575,6 +576,7 @@ pub async fn run_tui(config: &Config, options: TuiOptions) -> Result<()> {
     disable_raw_mode()?;
     if use_alt_screen {
         execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+        crate::logging::restore_after_tui_alt_screen();
     }
     if use_mouse_capture {
         execute!(terminal.backend_mut(), DisableMouseCapture)?;
@@ -637,6 +639,7 @@ impl Drop for TerminalCleanupGuard {
         let _ = disable_raw_mode();
         if self.use_alt_screen {
             let _ = execute!(stdout, LeaveAlternateScreen);
+            crate::logging::restore_after_tui_alt_screen();
         }
         if self.use_mouse_capture {
             let _ = execute!(stdout, DisableMouseCapture);
@@ -6971,6 +6974,7 @@ fn pause_terminal(
     disable_raw_mode()?;
     if use_alt_screen {
         execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+        crate::logging::restore_after_tui_alt_screen();
     }
     if use_mouse_capture {
         execute!(terminal.backend_mut(), DisableMouseCapture)?;
@@ -6991,6 +6995,7 @@ fn resume_terminal(
     enable_raw_mode()?;
     if use_alt_screen {
         execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+        crate::logging::suppress_for_tui_alt_screen();
     }
     recover_terminal_modes(
         terminal.backend_mut(),
@@ -7104,6 +7109,7 @@ pub fn emergency_restore_terminal() {
     let _ = execute!(stdout, DisableMouseCapture);
     let _ = disable_raw_mode();
     let _ = execute!(stdout, LeaveAlternateScreen);
+    crate::logging::restore_after_tui_alt_screen();
 }
 
 /// Re-establish terminal mode flags. Idempotent and best-effort: each
