@@ -805,6 +805,13 @@ impl ConfigView {
             },
             ConfigRow {
                 section: ConfigSection::History,
+                key: "auto_compact_threshold_percent".to_string(),
+                value: format!("{:.0}", settings.auto_compact_threshold_percent),
+                editable: true,
+                scope: ConfigScope::Saved,
+            },
+            ConfigRow {
+                section: ConfigSection::History,
                 key: "max_history".to_string(),
                 value: settings.max_input_history.to_string(),
                 editable: true,
@@ -1180,6 +1187,7 @@ fn config_hint_for_key(key: &str) -> &'static str {
         "sidebar_width" => "10..=50",
         "sidebar_focus" => "auto | work | tasks | agents | context | hidden",
         "max_history" => "integer (0 allowed)",
+        "auto_compact_threshold_percent" => "10..=100",
         "default_model" => "deepseek-v4-pro | deepseek-v4-flash | deepseek-* | none/default",
         "reasoning_effort" => "auto | off | low | medium | high | max | default",
         "mcp_config_path" => "path to mcp.json",
