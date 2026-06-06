@@ -385,6 +385,36 @@ fn picker_model_rows_for_app(app: &App) -> Vec<ModelPickerRow> {
         );
     }
 
+    // Surface models saved under *other* providers in config (#2596). The
+    // active provider's list comes first; cross-provider saved models follow as
+    // a clearly labelled tail so a custom model that has never been selected on
+    // the current provider is still reachable. Selecting one switches provider
+    // on apply via `resolved_provider` / `build_event`. Rows are sorted by
+    // provider key so ordering stays deterministic regardless of map iteration.
+    let mut other_provider_models: Vec<(&String, &String)> = app
+        .provider_models
+        .iter()
+        .filter(|(key, _)| ApiProvider::parse(key) != Some(app.api_provider))
+        .collect();
+    other_provider_models.sort_by(|(a, _), (b, _)| a.cmp(b));
+    for (key, model) in other_provider_models {
+        let Some(provider) = ApiProvider::parse(key) else {
+            // Unknown provider key — we cannot switch to it, so skip rather
+            // than offer a row that would fail to apply.
+            continue;
+        };
+        let model = model.trim();
+        if model.is_empty() {
+            continue;
+        }
+        push_model_row(
+            &mut rows,
+            model.to_string(),
+            Some(provider),
+            format!("{} saved", provider.display_name()),
+        );
+    }
+
     rows
 }
 
@@ -855,7 +885,9 @@ mod tests {
     }
 
     #[test]
-    fn picker_hides_saved_models_from_other_providers() {
+    fn picker_lists_saved_models_from_other_providers() {
+        // #2596: custom models saved under a non-active provider must be
+        // reachable from the picker, after the active provider's own models.
         let (mut app, _lock) = create_test_app();
         app.api_provider = crate::config::ApiProvider::XiaomiMimo;
         app.model = "mimo-v2.5-pro".to_string();
@@ -868,10 +900,53 @@ mod tests {
         let view = ModelPickerView::new(&app);
         let model_ids = view.visible_model_ids();
 
+        // Active provider's own model stays present (and ahead of the tail).
         assert!(model_ids.contains(&"mimo-v2.5-pro"));
-        assert!(!model_ids.contains(&"deepseek-v4-pro"));
-        assert!(!model_ids.contains(&"kimi-k2.6"));
+        // Cross-provider saved models are now visible.
+        assert!(model_ids.contains(&"deepseek-v4-pro"));
+        assert!(model_ids.contains(&"kimi-k2.6"));
         assert!(!view.show_custom_model_row);
+
+        // Each cross-provider row carries its own provider so applying it
+        // switches CodeWhale to that provider (verified via build_event below).
+        let deepseek_row = view
+            .visible_model_rows()
+            .iter()
+            .find(|row| row.id == "deepseek-v4-pro")
+            .expect("deepseek-v4-pro row present");
+        assert_eq!(
+            deepseek_row.provider,
+            Some(crate::config::ApiProvider::Deepseek)
+        );
+
+        // Active-provider model must appear before any cross-provider tail row.
+        let active_idx = model_ids
+            .iter()
+            .position(|id| *id == "mimo-v2.5-pro")
+            .expect("active model index");
+        let cross_idx = model_ids
+            .iter()
+            .position(|id| *id == "kimi-k2.6")
+            .expect("cross-provider model index");
+        assert!(
+            active_idx < cross_idx,
+            "active provider models should precede cross-provider tail"
+        );
+    }
+
+    #[test]
+    fn picker_skips_unknown_provider_saved_models() {
+        // A config key that maps to no known provider cannot be applied, so it
+        // must not produce a picker row (#2596).
+        let (mut app, _lock) = create_test_app();
+        app.api_provider = crate::config::ApiProvider::XiaomiMimo;
+        app.model = "mimo-v2.5-pro".to_string();
+        app.auto_model = false;
+        app.provider_models
+            .insert("totally-unknown".to_string(), "ghost-model".to_string());
+
+        let view = ModelPickerView::new(&app);
+        assert!(!view.visible_model_ids().contains(&"ghost-model"));
     }
 
     #[test]
