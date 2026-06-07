@@ -816,15 +816,6 @@ pub(crate) fn render_core_tool_taxonomy_body(mode: AppMode) -> String {
     sentences.join(" ")
 }
 
-/// Render the full taxonomy block **with** a `## Core Tool Taxonomy` heading.
-/// Kept for backward-compatibility with existing callers (tests, diagnostics).
-pub(crate) fn render_core_tool_taxonomy_block(mode: AppMode) -> String {
-    format!(
-        "## Core Tool Taxonomy\n\n{}",
-        render_core_tool_taxonomy_body(mode)
-    )
-}
-
 fn core_taxonomy_tools_for_mode(mode: AppMode) -> Vec<&'static str> {
     let core_tools = crate::core::engine::default_active_native_tool_names();
     core_tools
@@ -1606,7 +1597,7 @@ mod tests {
 
     #[test]
     fn plan_prompt_taxonomy_omits_run_tests() {
-        let taxonomy = render_core_tool_taxonomy_block(AppMode::Plan);
+        let taxonomy = render_core_tool_taxonomy_body(AppMode::Plan);
         // Plan taxonomy should omit execution tools (verified at the source).
         assert!(
             taxonomy.contains("for discovery") && taxonomy.contains("for git inspection"),
@@ -2056,7 +2047,7 @@ mod tests {
             "base prompt must not contain static CJK priming tokens"
         );
         for mode in [AppMode::Agent, AppMode::Plan, AppMode::Yolo] {
-            let taxonomy = render_core_tool_taxonomy_block(mode);
+            let taxonomy = render_core_tool_taxonomy_body(mode);
             assert!(
                 !contains_cjk(&taxonomy),
                 "tool taxonomy must not contain static CJK priming tokens: {taxonomy:?}"
