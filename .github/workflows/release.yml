@@ -159,48 +159,6 @@ jobs:
             target: x86_64-pc-windows-msvc
             binary: codewhale-tui.exe
             artifact_name: codewhale-tui-windows-x64.exe
-          # --- deepseek (legacy dispatcher shim; compatibility-only) ---
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            binary: deepseek
-            artifact_name: deepseek-linux-x64
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-            binary: deepseek
-            artifact_name: deepseek-linux-arm64
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            binary: deepseek
-            artifact_name: deepseek-macos-x64
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            binary: deepseek
-            artifact_name: deepseek-macos-arm64
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            binary: deepseek.exe
-            artifact_name: deepseek-windows-x64.exe
-          # --- deepseek-tui (legacy TUI shim; compatibility-only) ---
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            binary: deepseek-tui
-            artifact_name: deepseek-tui-linux-x64
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-            binary: deepseek-tui
-            artifact_name: deepseek-tui-linux-arm64
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            binary: deepseek-tui
-            artifact_name: deepseek-tui-macos-x64
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            binary: deepseek-tui
-            artifact_name: deepseek-tui-macos-arm64
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            binary: deepseek-tui.exe
-            artifact_name: deepseek-tui-windows-x64.exe
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -504,8 +462,6 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
-          # Match both the canonical `codewhale*` artifacts and the legacy
-          # `deepseek*` shim artifacts that ship for the transition release.
           pattern: '*'
       - name: Generate Windows npm launcher asset
         shell: bash
@@ -537,11 +493,6 @@ jobs:
             base="$(basename "${file}")"
             printf '%s  %s\n' "${hash}" "${base}" >> "${manifest}"
           done < <(find artifacts -type f ! -path 'artifacts/checksums/*' -print0 | sort -z)
-          # Legacy alias manifest so v0.8.40 `deepseek update` clients can
-          # still find a manifest by their hardcoded name. Same content as the
-          # canonical manifest; retire it only with an explicit release-infra
-          # cutover that also removes the legacy shim artifacts.
-          cp "${manifest}" "artifacts/checksums/deepseek-artifacts-sha256.txt"
           cat "${manifest}"
       - uses: softprops/action-gh-release@v1
         with:
@@ -632,8 +583,6 @@ jobs:
             shasum -a 256 -c codewhale-artifacts-sha256.txt
             ```
 
-            The legacy `deepseek-artifacts-sha256.txt` is also attached for backward compatibility and contains the same hashes as the canonical manifest.
-
             ## Contributors
 
             Thanks to @sximelon, @cyq1017, @Artenx, @LHqweasd, @wywsoor,
@@ -679,13 +628,13 @@ jobs:
         run: |
           gh release download ${{ needs.resolve.outputs.tag }} \
             --repo ${{ github.repository }} \
-            --pattern 'deepseek-artifacts-sha256.txt' \
+            --pattern 'codewhale-artifacts-sha256.txt' \
             --dir /tmp
       - name: Update Homebrew tap
         if: steps.homebrew-token.outputs.available == 'true'
         env:
           TAG: ${{ needs.resolve.outputs.tag }}
-          MANIFEST: /tmp/deepseek-artifacts-sha256.txt
+          MANIFEST: /tmp/codewhale-artifacts-sha256.txt
           TAP_REPO: Hmbown/homebrew-deepseek-tui
           TOKEN: ${{ secrets.HOMEBREW_TAP_PAT || secrets.RELEASE_TAG_PAT }}
         run: bash .github/scripts/update-homebrew-tap.sh

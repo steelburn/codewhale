@@ -226,12 +226,6 @@ impl Harness {
         {
             return PathBuf::from(path);
         }
-        // Legacy fallback for callers still referencing the old bin name.
-        if name == "codewhale-tui"
-            && let Some(path) = option_env!("CARGO_BIN_EXE_deepseek-tui")
-        {
-            return PathBuf::from(path);
-        }
         panic!("env {key} not set; is the binary declared in this crate?")
     }
 

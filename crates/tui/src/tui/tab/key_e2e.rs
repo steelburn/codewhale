@@ -212,11 +212,11 @@ mod tests {
         manager.switch_to_by_id(to);
 
         // Press Ctrl+Shift+D 4 times
-        assert_eq!(simulate_process_delegation(&mut manager).is_some(), true);
-        assert_eq!(simulate_process_delegation(&mut manager).is_some(), true);
-        assert_eq!(simulate_process_delegation(&mut manager).is_some(), true);
+        assert!(simulate_process_delegation(&mut manager).is_some());
+        assert!(simulate_process_delegation(&mut manager).is_some());
+        assert!(simulate_process_delegation(&mut manager).is_some());
         // 4th should be the last task
-        assert_eq!(simulate_process_delegation(&mut manager).is_some(), true);
+        assert!(simulate_process_delegation(&mut manager).is_some());
         // 5th should be none
         assert_eq!(simulate_process_delegation(&mut manager), None);
     }

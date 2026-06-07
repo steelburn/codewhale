@@ -356,7 +356,7 @@ mod tests {
 
         mgr.delete_group(&g1);
         assert!(mgr.group_of(tab1).is_none());
-        assert!(mgr.tab_to_group.get(&tab1).is_none());
+        assert!(!mgr.tab_to_group.contains_key(&tab1));
     }
 
     #[test]

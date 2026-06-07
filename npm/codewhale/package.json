@@ -1,7 +1,7 @@
 {
   "name": "codewhale",
-  "version": "0.8.53",
-  "codewhaleBinaryVersion": "0.8.53",
+  "version": "0.9.0",
+  "codewhaleBinaryVersion": "0.9.0",
   "description": "Install and run CodeWhale, the agentic terminal for DeepSeek and other OpenAI-compatible coding models.",
   "author": "Hmbown",
   "license": "MIT",

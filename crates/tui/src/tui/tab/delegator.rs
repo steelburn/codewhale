@@ -406,7 +406,7 @@ mod tests {
 
         let results_to = delegator.results_for_tab(to);
         assert_eq!(results_to.len(), 1);
-        assert_eq!(results_to[0].was_successful, true);
+        assert!(results_to[0].was_successful);
     }
 
     #[test]

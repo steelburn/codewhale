@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-06-07
+
 ### Added
 
 - Added `/restore list [N]` so users can inspect more side-git rollback
@@ -233,6 +235,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Removed the deprecated `deepseek` and `deepseek-tui` binary shims from the
+  v0.9.0 Cargo crates and GitHub release artifact matrix. The canonical
+  `codewhale`, `codew`, and `codewhale-tui` entry points remain, the private
+  deprecated `npm/deepseek-tui` notice package stays unpublished, and DeepSeek
+  provider/model/env/config compatibility remains first-class.
+- Command-adjacent config persistence and auto model routing now live in
+  neutral TUI modules instead of command-owned files, reducing command-boundary
+  coupling while preserving current `/config`, `/model`, UI, runtime, and
+  sub-agent behavior (#2871). Thanks @aboimpinto for landing this first staged
+  command-boundary layer from the broader #2851/#2791 design direction.
 - `/config` now reports the canonical `~/.codewhale/settings.toml` path for TUI
   settings while still reading legacy DeepSeek-branded settings fallbacks and
   migrating them into the CodeWhale home on load.
@@ -407,6 +419,8 @@ HarmonyOS/OpenHarmony port and MatePad Edge validation trail (#2634),
 #2867), **@reidliu41** for the hotbar action-registry foundation (#2866), and
 **@ljm3790865** for the multi-tab core/persistence foundation and broader
 collaboration direction (#2864, #2753),
+**@aboimpinto** for the direct command-support boundary cleanup in #2871 and
+the broader #2851/#2791 command-layer design direction,
 **@idling11** for the PlanArtifact direction in Plan mode (#2733), the dense
 tool-call transcript collapse/sidebar detail direction (#2738, #2734, #2692,
 #2694), and the HarnessPosture config model for provider/model posture (#2741,
@@ -5836,7 +5850,8 @@ Welcome — and thank you.
 - Hooks system and config profiles
 - Example skills and launch assets
 
-[Unreleased]: https://github.com/Hmbown/CodeWhale/compare/v0.8.53...HEAD
+[Unreleased]: https://github.com/Hmbown/CodeWhale/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/Hmbown/CodeWhale/compare/v0.8.53...v0.9.0
 [0.8.53]: https://github.com/Hmbown/CodeWhale/compare/v0.8.52...v0.8.53
 [0.8.52]: https://github.com/Hmbown/CodeWhale/compare/v0.8.51...v0.8.52
 [0.8.51]: https://github.com/Hmbown/CodeWhale/compare/v0.8.50...v0.8.51

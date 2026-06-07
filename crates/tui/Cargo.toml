@@ -18,19 +18,13 @@ toml = ["schemaui/toml"]
 name = "codewhale-tui"
 path = "src/main.rs"
 
-# Legacy alias — forwards to `codewhale-tui` and prints a deprecation
-# notice. Will be removed in v0.9.0.
-[[bin]]
-name = "deepseek-tui"
-path = "src/bin/deepseek_tui_legacy_shim.rs"
-
 [dependencies]
 anyhow = "1.0.100"
-codewhale-config = { path = "../config", version = "0.8.53" }
-codewhale-protocol = { path = "../protocol", version = "0.8.53" }
-codewhale-release = { path = "../release", version = "0.8.53" }
-codewhale-secrets = { path = "../secrets", version = "0.8.53" }
-codewhale-tools = { path = "../tools", version = "0.8.53" }
+codewhale-config = { path = "../config", version = "0.9.0" }
+codewhale-protocol = { path = "../protocol", version = "0.9.0" }
+codewhale-release = { path = "../release", version = "0.9.0" }
+codewhale-secrets = { path = "../secrets", version = "0.9.0" }
+codewhale-tools = { path = "../tools", version = "0.9.0" }
 schemaui = { version = "0.12.0", default-features = false, optional = true }
 async-stream = "0.3.6"
 async-trait = "0.1"
