@@ -38,14 +38,15 @@ not enumerate.
 
 ## 2. Version pins are in sync
 
-- [ ] `Cargo.toml` workspace `version` is bumped.
-- [ ] All per-crate `crates/*/Cargo.toml` path-dependency `version = "..."`
-      pins match the new workspace version.
-- [ ] `npm/codewhale/package.json` `version` AND `codewhaleBinaryVersion`
-      are both bumped.
+- [ ] Run `./scripts/release/prepare-release.sh X.Y.Z` — it bumps the
+      workspace version, every per-crate dependency pin,
+      `npm/codewhale/package.json` (`version` + `codewhaleBinaryVersion`),
+      the README install-tag examples, refreshes `Cargo.lock`, regenerates
+      `crates/tui/CHANGELOG.md` and `web/lib/facts.generated.ts`, and ends
+      by running `check-versions.sh`. Write the CHANGELOG entry **before**
+      running it.
 - [ ] `npm/deepseek-tui/package.json` remains private/compatibility-only and
       is **not** bumped or published.
-- [ ] `Cargo.lock` is refreshed (`cargo update --workspace --offline`).
 - [ ] `./scripts/release/check-versions.sh` reports
       `Version state OK: workspace=X.Y.Z, npm=X.Y.Z, lockfile in sync.`
 - [ ] `./scripts/release/check-ohos-deps.sh` reports that the OpenHarmony

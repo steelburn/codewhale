@@ -145,6 +145,11 @@ $:
               tag_name="$(git describe --tags --exact-match 2>/dev/null || true)"
             fi
             version="${tag_name#v}"
+            cargo_version="$(grep -E '^version = "' Cargo.toml | head -n1 | sed -E 's/^version = "([^"]+)".*/\1/')"
+            if [ -n "$tag_name" ] && [ "$version" != "$cargo_version" ]; then
+              echo "ERROR: tag ${tag_name} does not match Cargo.toml version ${cargo_version}" >&2
+              exit 1
+            fi
             commit_sha="${CNB_COMMIT:-$(git rev-parse HEAD)}"
             {
               echo "# ${tag_name:-CNB release}"

@@ -149,7 +149,24 @@ if grep -qF "hmbown.dev@gmail.com" SECURITY.md; then
   fail=1
 fi
 
-# 8) Cargo.lock in sync.
+# 8) Generated web facts carry the workspace version.
+facts_version="$(grep -oE '"version": "[0-9]+\.[0-9]+\.[0-9]+"' web/lib/facts.generated.ts | head -n1 | sed -E 's/.*"([0-9.]+)".*/\1/')"
+if [[ "${facts_version}" != "${workspace_version}" ]]; then
+  echo "::error::web/lib/facts.generated.ts version (${facts_version}) does not match workspace (${workspace_version}). Run: node web/scripts/derive-facts.mjs" >&2
+  fail=1
+fi
+
+# 9) README install-tag examples point at the current release.
+for readme in README.md README.zh-CN.md README.ja-JP.md README.vi.md; do
+  stale_tags="$(grep -nE -- "--tag v[0-9]+\.[0-9]+\.[0-9]+" "${readme}" | grep -v -- "--tag v${workspace_version}" || true)"
+  if [[ -n "${stale_tags}" ]]; then
+    echo "::error::${readme} has install examples pinned to an old tag (want v${workspace_version}):" >&2
+    echo "${stale_tags}" >&2
+    fail=1
+  fi
+done
+
+# 10) Cargo.lock in sync.
 if ! cargo metadata --locked --format-version 1 --no-deps >/dev/null 2>&1; then
   echo "::error::Cargo.lock is out of sync with the manifests. Run 'cargo update -p codewhale-tui' or 'cargo build' and commit the result." >&2
   fail=1
