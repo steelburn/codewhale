@@ -1275,6 +1275,9 @@ pub struct App {
     pub next_history_revision: u64,
     pub api_messages: Vec<Message>,
     pub is_loading: bool,
+    /// Whether the once-per-turn provider-wait incident (#3095) has already
+    /// been logged for the current turn.
+    pub provider_wait_incident_logged: bool,
     /// Ghost-text follow-up suggestion shown in the composer when empty.
     /// Generated asynchronously after each completed turn; cleared on new input.
     pub prompt_suggestion: Option<String>,
@@ -2135,6 +2138,7 @@ impl App {
             next_history_revision: 1,
             api_messages: Vec::new(),
             is_loading: false,
+            provider_wait_incident_logged: false,
             prompt_suggestion: None,
             prompt_suggestion_gen: std::sync::atomic::AtomicU64::new(0),
             offline_mode: false,

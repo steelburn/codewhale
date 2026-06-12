@@ -3528,6 +3528,100 @@ fn fanout_started_sibling_bumps_existing_card_revision() {
 }
 
 #[test]
+fn stall_reason_provider_wait_includes_route_and_idle_budget() {
+    let mut app = create_test_app();
+    app.is_loading = true;
+    app.turn_started_at = Some(Instant::now() - Duration::from_secs(45));
+    app.turn_last_activity_at = Some(Instant::now() - Duration::from_secs(40));
+
+    let reason = crate::tui::footer_ui::stall_reason(&app).expect("stalled turn has a reason");
+    assert!(
+        reason.contains(&format!(
+            "waiting for {} {}",
+            app.api_provider.as_str(),
+            app.model
+        )),
+        "{reason}"
+    );
+    assert!(
+        reason.contains(&format!("/{}s idle timeout", app.stream_chunk_timeout_secs)),
+        "{reason}"
+    );
+}
+
+#[test]
+fn stall_reason_provider_wait_reports_zero_running_for_planned_fanout() {
+    let mut app = create_test_app();
+    app.is_loading = true;
+    app.turn_started_at = Some(Instant::now() - Duration::from_secs(45));
+
+    // A fanout plan exists (card seeded with pending workers) but no child
+    // agent has launched yet: the reason must say 0 running explicitly.
+    let card = crate::tui::widgets::agent_card::FanoutCard::new("rlm", app.ui_locale)
+        .with_workers(["task:a", "task:b", "task:c", "task:d"]);
+    app.history
+        .push(HistoryCell::SubAgent(SubAgentCell::Fanout(card)));
+    app.history_revisions.push(0);
+    app.last_fanout_card_index = Some(app.history.len() - 1);
+
+    let reason = crate::tui::footer_ui::stall_reason(&app).expect("stalled turn has a reason");
+    assert!(reason.contains("fanout 0/4 running"), "{reason}");
+
+    // Once a worker is actually running the marker disappears.
+    if let Some(HistoryCell::SubAgent(SubAgentCell::Fanout(card))) = app
+        .last_fanout_card_index
+        .and_then(|idx| app.history.get_mut(idx))
+    {
+        card.upsert_worker(
+            "task:a",
+            crate::tui::widgets::agent_card::AgentLifecycle::Running,
+        );
+    }
+    let reason = crate::tui::footer_ui::stall_reason(&app).expect("stalled turn has a reason");
+    assert!(!reason.contains("0/4 running"), "{reason}");
+}
+
+#[test]
+fn stall_reason_provider_wait_flags_pending_dispatch() {
+    let mut app = create_test_app();
+    app.is_loading = true;
+    app.turn_started_at = Some(Instant::now() - Duration::from_secs(31));
+    app.pending_subagent_dispatch = Some("agent_spawn".to_string());
+
+    let reason = crate::tui::footer_ui::stall_reason(&app).expect("stalled turn has a reason");
+    assert!(
+        reason.contains("sub-agent dispatch pending, 0 running"),
+        "{reason}"
+    );
+}
+
+#[test]
+fn provider_wait_incident_logs_once_per_turn() {
+    let mut app = create_test_app();
+    app.is_loading = true;
+    app.turn_started_at = Some(Instant::now() - Duration::from_secs(150));
+    app.pending_subagent_dispatch = Some("rlm".to_string());
+
+    assert!(!app.provider_wait_incident_logged);
+    crate::tui::footer_ui::maybe_log_provider_wait_incident(&mut app);
+    assert!(app.provider_wait_incident_logged, "incident logged once");
+
+    // Below threshold or without a fanout plan, nothing is logged.
+    let mut quiet = create_test_app();
+    quiet.is_loading = true;
+    quiet.turn_started_at = Some(Instant::now() - Duration::from_secs(150));
+    crate::tui::footer_ui::maybe_log_provider_wait_incident(&mut quiet);
+    assert!(!quiet.provider_wait_incident_logged);
+
+    let mut early = create_test_app();
+    early.is_loading = true;
+    early.turn_started_at = Some(Instant::now() - Duration::from_secs(60));
+    early.pending_subagent_dispatch = Some("rlm".to_string());
+    crate::tui::footer_ui::maybe_log_provider_wait_incident(&mut early);
+    assert!(!early.provider_wait_incident_logged);
+}
+
+#[test]
 fn format_token_count_compact_formats_units() {
     assert_eq!(format_token_count_compact(999), "999");
     assert_eq!(format_token_count_compact(1_200), "1.2k");

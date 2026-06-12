@@ -1788,6 +1788,7 @@ async fn run_event_loop(
                         let now = Instant::now();
                         app.turn_started_at = Some(now);
                         app.turn_last_activity_at = Some(now);
+                        app.provider_wait_incident_logged = false;
                         // Discoverability hint for users who don't know how
                         // to interrupt a long-running turn (#1367). Only
                         // surface when the status_message slot is empty so
