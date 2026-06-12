@@ -3912,7 +3912,12 @@ async fn run_subagent_task(task: SubAgentTask) {
                 }
                 _launch_permit = Arc::clone(gate).acquire_owned().await.ok();
             }
-            Err(tokio::sync::TryAcquireError::Closed) => {}
+            Err(tokio::sync::TryAcquireError::Closed) => {
+                crate::logging::warn(format!(
+                    "interactive launch gate closed for {}; proceeding without backpressure",
+                    task.agent_id
+                ));
+            }
         }
     }
 

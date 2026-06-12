@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Provider-wait observability (#3095).** Footer stall reasons now name the
+  active provider/model route, idle seconds vs stream budget, and whether a
+  fanout plan is still at `0 running` or dispatch is pending. Structured
+  provider-wait incidents log once per turn from the main tick loop (not on
+  every footer redraw).
+- **Interactive fanout launch gate (#3095).** Direct sub-agent children queue
+  behind a configurable semaphore (`[subagents] interactive_max_launch`,
+  default 4) with a visible `queued: waiting for an interactive fanout slot`
+  reason before their first model step.
+
+### Fixed
+
+- **TUI mouse-report leak (#3063/#3067).** Strip raw SGR mouse coordinate
+  tails from the composer even when `use_mouse_capture` is false, covering
+  orphaned terminal reporting state after crashes or focus races.
+- **Interrupted sub-agent lifecycle (#3080).** API-timeout interruptions now
+  emit `MailboxMessage::Interrupted`, render terminal interrupted cards, and
+  reconcile stale running fanout counts from manager snapshots.
+- **Runtime prompt autonomous loop guard (#3061).** Runtime policy reference
+  now explicitly forbids initiating new work when `<runtime_prompt>` is the
+  only new turn content and no tool/sub-agent handoff is pending.
+
+### Contributors
+
+- Devin session work on #3080/#3095 (PRs #3103, #3104, #3106) — Hunter Bown
+  (maintainer integration/cherry-pick on `codex/v0.8.59-release-ready`).
+
 ## [0.8.58] - 2026-06-11
 
 ### Added

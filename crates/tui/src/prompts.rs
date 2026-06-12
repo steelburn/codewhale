@@ -738,7 +738,12 @@ pub(crate) fn render_runtime_policy_reference() -> String {
          The `visibility=\"internal\"` attribute means this tag is a runtime \
          instruction for the model, not user input. Do not announce the \
          current mode or restate the tag content to the user — just apply \
-         the referenced rules silently.\n\n",
+         the referenced rules silently.\n\n\
+         When this tag is the only new content in a turn and there is no \
+         pending tool output, sub-agent completion handoff, or explicit user \
+         message requesting continuation, do not initiate new edits, shell \
+         commands, git commits, or sub-agent launches. End the turn and wait \
+         for the user's next message.\n\n",
     );
 
     // ── Mode reference ─────────────────────────────────────────────────
