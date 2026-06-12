@@ -882,6 +882,7 @@ fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
         // human-noticeable; we trust the operator over a hard step cap.
         max_steps: u32::MAX,
         max_subagents: app.max_subagents,
+        interactive_launch_limit: config.interactive_launch_limit(),
         features: config.features(),
         compaction: app.compaction_config(),
         capacity: crate::core::capacity::CapacityControllerConfig::from_app_config(config),

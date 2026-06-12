@@ -5863,6 +5863,7 @@ async fn run_exec_agent(
         show_thinking: settings.show_thinking,
         max_steps: max_turns,
         max_subagents,
+        interactive_launch_limit: config.interactive_launch_limit(),
         features: config.features(),
         compaction,
         capacity: crate::core::capacity::CapacityControllerConfig::from_app_config(config),

@@ -278,6 +278,10 @@ pub struct EngineConfig {
     pub max_steps: u32,
     /// Maximum number of concurrently active subagents.
     pub max_subagents: usize,
+    /// Number of direct (depth-1) sub-agents that may execute concurrently
+    /// before further interactive fanout launches queue for a slot (#3095).
+    /// Resolved from `[subagents] interactive_max_launch`.
+    pub interactive_launch_limit: usize,
     /// Feature flags controlling tool availability.
     pub features: Features,
     /// Auto-compaction settings for long conversations.
@@ -391,6 +395,7 @@ impl Default for EngineConfig {
             show_thinking: true,
             max_steps: 100,
             max_subagents: DEFAULT_MAX_SUBAGENTS,
+            interactive_launch_limit: crate::config::DEFAULT_INTERACTIVE_LAUNCH_LIMIT,
             features: Features::with_defaults(),
             compaction: CompactionConfig::default(),
             capacity: CapacityControllerConfig::default(),
@@ -722,6 +727,7 @@ impl Engine {
             config.workspace.clone(),
             config.max_subagents,
             config.subagent_heartbeat_timeout,
+            config.interactive_launch_limit,
         );
         let shell_manager = config
             .runtime_services

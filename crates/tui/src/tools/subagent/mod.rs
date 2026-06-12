@@ -14,7 +14,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, Semaphore};
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -1197,6 +1197,13 @@ pub struct SubAgentManager {
     /// agents whose `session_boot_id` doesn't match this value as
     /// "from prior session" so `agent_list` can hide them by default.
     current_session_boot_id: String,
+    /// Launch gate for direct (depth-1) interactive fanout (#3095). Each
+    /// permit is one actively executing direct child; further direct
+    /// children spawn immediately but queue for a permit before starting,
+    /// publishing a visible "queued" reason instead of bursting. Deeper
+    /// descendants bypass the gate so a permit-holding parent waiting on
+    /// its own children cannot deadlock the tree.
+    launch_gate: Arc<Semaphore>,
 }
 
 impl SubAgentManager {
@@ -1215,7 +1222,18 @@ impl SubAgentManager {
             // Fresh boot id per manager. Used by #405 to classify
             // re-loaded persisted agents as "prior session".
             current_session_boot_id: format!("boot_{}", &Uuid::new_v4().to_string()[..12]),
+            launch_gate: Arc::new(Semaphore::new(
+                crate::config::DEFAULT_INTERACTIVE_LAUNCH_LIMIT.min(max_agents),
+            )),
         }
+    }
+
+    /// Set the number of direct children that may execute concurrently
+    /// before further launches queue (#3095). Clamped to `1..=max_agents`.
+    #[must_use]
+    pub fn with_interactive_launch_limit(mut self, limit: usize) -> Self {
+        self.launch_gate = Arc::new(Semaphore::new(limit.clamp(1, self.max_agents)));
+        self
     }
 
     /// Return the boot id this manager stamps on agents it spawns.
@@ -1540,6 +1558,7 @@ impl SubAgentManager {
             });
         }
 
+        let launch_gate = (runtime.spawn_depth == 1).then(|| self.launch_gate.clone());
         let task = SubAgentTask {
             manager_handle,
             runtime,
@@ -1552,6 +1571,7 @@ impl SubAgentManager {
             started_at,
             max_steps,
             input_rx,
+            launch_gate,
         };
         let handle = spawn_supervised(
             "subagent-task",
@@ -1670,6 +1690,7 @@ impl SubAgentManager {
             if !agent.model.trim().is_empty() && agent.model != "unknown" {
                 restart_runtime.model.clone_from(&agent.model);
             }
+            let launch_gate = (restart_runtime.spawn_depth == 1).then(|| self.launch_gate.clone());
             let task = SubAgentTask {
                 manager_handle,
                 runtime: restart_runtime,
@@ -1682,6 +1703,7 @@ impl SubAgentManager {
                 started_at: restarted_at,
                 max_steps: self.max_steps,
                 input_rx,
+                launch_gate,
             };
             let handle = spawn_supervised(
                 "subagent-task-resume",
@@ -2188,6 +2210,7 @@ pub fn new_shared_subagent_manager(workspace: PathBuf, max_agents: usize) -> Sha
         workspace,
         max_agents,
         Duration::from_secs(crate::config::DEFAULT_SUBAGENT_HEARTBEAT_TIMEOUT_SECS),
+        crate::config::DEFAULT_INTERACTIVE_LAUNCH_LIMIT,
     )
 }
 
@@ -2198,11 +2221,13 @@ pub fn new_shared_subagent_manager_with_timeout(
     workspace: PathBuf,
     max_agents: usize,
     running_heartbeat_timeout: Duration,
+    interactive_launch_limit: usize,
 ) -> SharedSubAgentManager {
     let max_agents = max_agents.clamp(1, MAX_SUBAGENTS);
     let state_path = default_state_path(&workspace);
     let mut manager = SubAgentManager::new(workspace, max_agents)
         .with_running_heartbeat_timeout(running_heartbeat_timeout)
+        .with_interactive_launch_limit(interactive_launch_limit)
         .with_state_path(state_path);
     if let Err(err) = manager.load_state() {
         // Routed through tracing instead of stderr — see comment in
@@ -2505,7 +2530,7 @@ impl ToolSpec for AgentSpawnTool {
 
     fn description(&self) -> &'static str {
         concat!(
-            "Spawn a background sub-agent for a focused task. Returns an agent_id immediately; follow with agent_result to retrieve the final result. Default cap of 10 concurrent sub-agents (configurable via `[subagents].max_concurrent`); each is a full sub-agent loop, so cancel or wait if you hit the cap. For parallel one-shot LLM queries, just emit multiple tool calls in one turn — the dispatcher runs them in parallel.\n\n",
+            "Spawn a background sub-agent for a focused task. Returns an agent_id immediately; follow with agent_result to retrieve the final result. Default cap of 10 concurrent sub-agents (configurable via `[subagents].max_concurrent`); each is a full sub-agent loop, so cancel or wait if you hit the cap. Direct children beyond the interactive launch limit (default 4, `[subagents].interactive_max_launch`) queue for a slot instead of executing at once. For parallel one-shot LLM queries, just emit multiple tool calls in one turn — the dispatcher runs them in parallel.\n\n",
             "## Trust model: subagent results are self-reports, not verified facts\n\n",
             "`agent_result` returns the child's narrative summary of what happened. For operations with external side effects, the child's summary may be wrong. Re-verify before reporting success to the user:\n\n",
             "| Side effect | Re-verify with |\n|---|---|\n| URL claimed posted/written | `fetch_url` and check the response |\n| File claimed created | `read_file` or `list_dir` |\n| File claimed edited | `read_file` and check the change is present |\n| HTTP POST/PUT response | inspect status code and body |\n| Git operation | `git_status` / `git_diff` |\n| Test claimed passing | `run_tests` |\n| Process claimed started | `exec_shell` (e.g. `pgrep`, `lsof -i`) |\n\n",
@@ -3855,10 +3880,42 @@ struct SubAgentTask {
     started_at: Instant,
     max_steps: u32,
     input_rx: mpsc::UnboundedReceiver<SubAgentInput>,
+    /// Interactive launch gate (#3095). `Some` only for direct (depth-1)
+    /// children: the task acquires a permit before its first model step and
+    /// holds it until completion, so a fanout burst beyond the limit queues
+    /// with a visible reason instead of executing all at once.
+    launch_gate: Option<Arc<Semaphore>>,
 }
 
 #[allow(clippy::too_many_lines)]
 async fn run_subagent_task(task: SubAgentTask) {
+    // Interactive launch gate (#3095): direct children acquire a permit
+    // before their first model step so a fanout burst beyond the limit
+    // queues visibly instead of executing all at once. The permit is held
+    // for the lifetime of the task. Cancellation while queued is handled by
+    // `run_subagent`'s own first-step cancel check.
+    let mut _launch_permit = None;
+    if let Some(gate) = task.launch_gate.as_ref() {
+        match Arc::clone(gate).try_acquire_owned() {
+            Ok(permit) => _launch_permit = Some(permit),
+            Err(tokio::sync::TryAcquireError::NoPermits) => {
+                record_agent_progress(
+                    &task.runtime,
+                    &task.agent_id,
+                    "queued: waiting for an interactive fanout slot".to_string(),
+                );
+                if let Some(mb) = task.runtime.mailbox.as_ref() {
+                    let _ = mb.send(MailboxMessage::progress(
+                        &task.agent_id,
+                        "queued: waiting for an interactive fanout slot".to_string(),
+                    ));
+                }
+                _launch_permit = Arc::clone(gate).acquire_owned().await.ok();
+            }
+            Err(tokio::sync::TryAcquireError::Closed) => {}
+        }
+    }
+
     let result = run_subagent(
         &task.runtime,
         task.agent_id.clone(),

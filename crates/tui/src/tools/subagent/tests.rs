@@ -1330,6 +1330,7 @@ async fn api_timeout_preserves_checkpoint_and_agent_eval_continues_from_it() {
         started_at: Instant::now(),
         max_steps: 3,
         input_rx: task_input_rx,
+        launch_gate: None,
     };
     let task_handle = tokio::spawn(run_subagent_task(task));
 
@@ -3059,6 +3060,7 @@ async fn run_subagent_task_emits_parent_completion_before_terminal_update() {
         started_at: Instant::now(),
         max_steps: 0,
         input_rx: task_input_rx,
+        launch_gate: None,
     };
 
     let manager_lock = manager.write().await;
@@ -3337,4 +3339,142 @@ fn format_step_counter_hides_unbounded_sentinel() {
 fn format_step_counter_keeps_concrete_budgets() {
     assert_eq!(format_step_counter(3, 25), "step 3/25");
     assert_eq!(format_step_counter(0, 1), "step 0/1");
+}
+
+// ── #3095: interactive fanout launch gate ────────────────────────────────────
+
+#[test]
+fn launch_gate_defaults_to_interactive_limit_capped_by_max_agents() {
+    let tmp = tempdir().expect("tempdir");
+    let manager = SubAgentManager::new(tmp.path().to_path_buf(), 10);
+    assert_eq!(
+        manager.launch_gate.available_permits(),
+        crate::config::DEFAULT_INTERACTIVE_LAUNCH_LIMIT
+    );
+
+    let small = SubAgentManager::new(tmp.path().to_path_buf(), 2);
+    assert_eq!(small.launch_gate.available_permits(), 2);
+
+    let custom =
+        SubAgentManager::new(tmp.path().to_path_buf(), 10).with_interactive_launch_limit(0);
+    assert_eq!(custom.launch_gate.available_permits(), 1, "clamps up to 1");
+
+    let oversized =
+        SubAgentManager::new(tmp.path().to_path_buf(), 3).with_interactive_launch_limit(99);
+    assert_eq!(
+        oversized.launch_gate.available_permits(),
+        3,
+        "clamps down to max_agents"
+    );
+}
+
+#[tokio::test]
+async fn interactive_launch_gate_queues_extra_direct_children() {
+    use tokio::sync::Semaphore;
+    use tokio_util::sync::CancellationToken;
+
+    let tmp = tempdir().expect("tempdir");
+    let manager = Arc::new(RwLock::new(SubAgentManager::new(
+        tmp.path().to_path_buf(),
+        4,
+    )));
+
+    let (client, _calls, _bodies) = delayed_chat_client(Duration::from_millis(150), "done").await;
+    let (mailbox, mut mailbox_rx) = Mailbox::new(CancellationToken::new());
+    let mut runtime = stub_runtime();
+    runtime.client = client;
+    runtime.manager = Arc::clone(&manager);
+    runtime.context = ToolContext::new(tmp.path());
+    runtime.mailbox = Some(mailbox);
+
+    let gate = Arc::new(Semaphore::new(1));
+    let spawn = |agent_id: &str, gate: Option<Arc<Semaphore>>| {
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let agent = SubAgent::new(
+            agent_id.to_string(),
+            SubAgentType::General,
+            "Answer".to_string(),
+            make_assignment(),
+            "deepseek-v4-flash".to_string(),
+            None,
+            Some(vec![]),
+            input_tx,
+            tmp.path().to_path_buf(),
+            "boot_test".to_string(),
+        );
+        let task = SubAgentTask {
+            manager_handle: Arc::clone(&manager),
+            runtime: runtime.clone(),
+            agent_id: agent_id.to_string(),
+            agent_type: SubAgentType::General,
+            prompt: "Answer".to_string(),
+            assignment: make_assignment(),
+            allowed_tools: Some(vec![]),
+            fork_context: false,
+            started_at: Instant::now(),
+            max_steps: 1,
+            input_rx,
+            launch_gate: gate,
+        };
+        (agent, task)
+    };
+
+    let (agent_a, task_a) = spawn("agent_gate_a", Some(Arc::clone(&gate)));
+    let (agent_b, task_b) = spawn("agent_gate_b", Some(Arc::clone(&gate)));
+    {
+        let mut mgr = manager.write().await;
+        mgr.agents.insert(agent_a.id.clone(), agent_a);
+        mgr.agents.insert(agent_b.id.clone(), agent_b);
+    }
+
+    tokio::spawn(run_subagent_task(task_a));
+    // Give the first task time to take the only permit before the second
+    // task tries; the second must then queue with a visible reason.
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    tokio::spawn(run_subagent_task(task_b));
+
+    let mut messages = Vec::new();
+    let collected = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut completed = 0;
+        while completed < 2 {
+            let Some(envelope) = mailbox_rx.recv().await else {
+                break;
+            };
+            if matches!(envelope.message, MailboxMessage::Completed { .. }) {
+                completed += 1;
+            }
+            messages.push(envelope.message);
+        }
+    })
+    .await;
+    assert!(collected.is_ok(), "both gated children should complete");
+
+    let queued_b = messages.iter().position(|m| {
+        matches!(
+            m,
+            MailboxMessage::Progress { agent_id, status }
+                if agent_id == "agent_gate_b" && status.contains("queued")
+        )
+    });
+    assert!(
+        queued_b.is_some(),
+        "second child must publish a visible queued reason: {messages:?}"
+    );
+
+    let completed_a = messages
+        .iter()
+        .position(
+            |m| matches!(m, MailboxMessage::Completed { agent_id, .. } if agent_id == "agent_gate_a"),
+        )
+        .expect("first child completes");
+    let started_b = messages
+        .iter()
+        .position(
+            |m| matches!(m, MailboxMessage::Started { agent_id, .. } if agent_id == "agent_gate_b"),
+        )
+        .expect("second child eventually starts");
+    assert!(
+        started_b > completed_a,
+        "queued child must not start until a permit frees: {messages:?}"
+    );
 }

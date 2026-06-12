@@ -20,6 +20,11 @@ use crate::hooks::HooksConfig;
 
 pub const DEFAULT_MAX_SUBAGENTS: usize = 10;
 pub const MAX_SUBAGENTS: usize = 20;
+/// Default number of direct (depth-1) sub-agents that may execute
+/// concurrently in an interactive session before further launches queue
+/// for a slot (#3095). Deliberately lower than `DEFAULT_MAX_SUBAGENTS`,
+/// which caps total live agents across the whole spawn tree.
+pub const DEFAULT_INTERACTIVE_LAUNCH_LIMIT: usize = 4;
 /// Default per-step DeepSeek API timeout for sub-agent requests, in seconds.
 /// Matches the legacy hardcoded value so existing configs keep their old
 /// behavior when `[subagents] api_timeout_secs` is unset (#1806, #1808).
@@ -1534,6 +1539,12 @@ pub struct SubagentsConfig {
     /// setting. Clamped to [1, MAX_SUBAGENTS].
     #[serde(default)]
     pub max_concurrent: Option<usize>,
+    /// Number of direct (depth-1) sub-agents that may execute concurrently
+    /// before further interactive fanout launches queue for a slot (#3095).
+    /// Defaults to `DEFAULT_INTERACTIVE_LAUNCH_LIMIT` (4) and is clamped to
+    /// [1, max_subagents].
+    #[serde(default)]
+    pub interactive_max_launch: Option<usize>,
     /// Per-step DeepSeek API timeout for sub-agent requests, in seconds. The
     /// timeout wraps `client.create_message` so a stuck single step cannot
     /// pin the parent's parent-completion wakeup channel indefinitely.
@@ -2920,6 +2931,20 @@ impl Config {
         self.max_subagents
             .unwrap_or(DEFAULT_MAX_SUBAGENTS)
             .clamp(1, MAX_SUBAGENTS)
+    }
+
+    /// Number of direct (depth-1) sub-agents that may execute concurrently
+    /// before further interactive fanout launches queue for a slot (#3095).
+    /// Reads `[subagents] interactive_max_launch`, defaults to
+    /// `DEFAULT_INTERACTIVE_LAUNCH_LIMIT`, and clamps to
+    /// `[1, max_subagents]`.
+    #[must_use]
+    pub fn interactive_launch_limit(&self) -> usize {
+        self.subagents
+            .as_ref()
+            .and_then(|cfg| cfg.interactive_max_launch)
+            .unwrap_or(DEFAULT_INTERACTIVE_LAUNCH_LIMIT)
+            .clamp(1, self.max_subagents())
     }
 
     /// Resolved per-step DeepSeek API timeout for sub-agents, in seconds.
@@ -6809,6 +6834,35 @@ action = "session.compact"
     fn max_subagents_defaults_to_ten() {
         assert_eq!(Config::default().max_subagents(), DEFAULT_MAX_SUBAGENTS);
         assert_eq!(DEFAULT_MAX_SUBAGENTS, 10);
+    }
+
+    #[test]
+    fn interactive_launch_limit_defaults_and_clamps_to_max_subagents() {
+        assert_eq!(
+            Config::default().interactive_launch_limit(),
+            DEFAULT_INTERACTIVE_LAUNCH_LIMIT
+        );
+
+        let mut config = Config {
+            subagents: Some(SubagentsConfig {
+                interactive_max_launch: Some(50),
+                ..SubagentsConfig::default()
+            }),
+            ..Config::default()
+        };
+        assert_eq!(config.interactive_launch_limit(), config.max_subagents());
+
+        config.subagents = Some(SubagentsConfig {
+            interactive_max_launch: Some(0),
+            ..SubagentsConfig::default()
+        });
+        assert_eq!(config.interactive_launch_limit(), 1);
+
+        config.subagents = Some(SubagentsConfig {
+            interactive_max_launch: Some(2),
+            ..SubagentsConfig::default()
+        });
+        assert_eq!(config.interactive_launch_limit(), 2);
     }
 
     #[test]

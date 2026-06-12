@@ -2036,6 +2036,7 @@ impl RuntimeThreadManager {
             show_thinking: settings.show_thinking,
             max_steps: 100,
             max_subagents: self.config.max_subagents().clamp(1, MAX_SUBAGENTS),
+            interactive_launch_limit: self.config.interactive_launch_limit(),
             features: self.config.features(),
             compaction,
             capacity: crate::core::capacity::CapacityControllerConfig::from_app_config(
