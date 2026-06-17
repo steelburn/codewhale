@@ -5,8 +5,6 @@ import { getFacts } from "@/lib/facts";
 import { Ticker } from "@/components/ticker";
 import { StatGrid } from "@/components/stat-grid";
 import { Seal } from "@/components/seal";
-import { ThinkingTrace } from "@/components/thinking-trace";
-import { MermaidDiagram } from "@/components/mermaid-diagram";
 import type { CuratedDispatch, FeedItem, RepoStats } from "@/lib/types";
 
 export const revalidate = 1800;
@@ -81,84 +79,6 @@ const RELEASE_HELPERS = [
   "@nbiish",
 ];
 
-const RELEASE_FEATURES = [
-  {
-    area: "Fleet runs",
-    title: "Agent Fleet real-run cutover",
-    zhTitle: "Agent Fleet 真实执行切换",
-    tag: "#3154 / #3096",
-    blurb:
-      "fleet run now launches durable workers through the headless exec stream instead of the old local simulator, with lease-freeing events so queued work can keep moving.",
-    zhBlurb:
-      "fleet run 现在通过 headless exec 流启动持久 worker，不再走本地模拟器；终端 worker 事件会释放租约，让排队任务继续推进。",
-    prompt:
-      "Tell us whether the fleet task started, which worker/lease state looked wrong, and paste the fleet run output or event stream if you can.",
-  },
-  {
-    area: "Read-only shell parallelism",
-    title: "Read-only shell parallelism",
-    zhTitle: "只读 Shell 并行执行",
-    tag: "#2983",
-    blurb:
-      "conservative read-only shell calls can run in parallel, while writes, stdin, pipes, redirects, command substitution, TTY work, and follow-mode tails stay serial.",
-    zhBlurb:
-      "保守的只读 shell 调用可以并行执行；写入、stdin、管道、重定向、命令替换、TTY 和 follow-mode tail 仍保持串行。",
-    prompt:
-      "Tell us the exact command, whether it should have been parallel or serial, and whether CodeWhale asked for approval at the right time.",
-  },
-  {
-    area: "Terminal interaction polish",
-    title: "TUI/provider polish",
-    zhTitle: "TUI 与 provider 细节修复",
-    tag: "#3196 / #2743",
-    blurb:
-      "slash-menu Ctrl+P/Ctrl+N navigation, nonblocking sub-agent eval, Z.ai GLM thinking traces, and Claude-style skill archive handling are smoother.",
-    zhBlurb:
-      "slash 菜单 Ctrl+P/Ctrl+N、非阻塞 sub-agent eval、Z.ai GLM thinking trace，以及 Claude 风格 skill 压缩包处理都更顺。",
-    prompt:
-      "Tell us which interaction failed, your terminal/provider/model, and the shortest reproduction you have.",
-  },
-];
-// NOTE: WhaleFlow is intentionally kept off the homepage hero for v0.8.61.
-// The typed IR and compile-only authoring exist, but live runtime execution is
-// still being wired. Mention it only in docs/roadmap/v0.9-track copy until
-// smoke-tested. See .private/whalecycle/reports/mission-whaleflow-positioning.md
-
-const LATEST_RELEASE_CREDITS = [
-  {
-    handle: "@1Git2Clone",
-    note: "slash-menu Ctrl+P/Ctrl+N navigation",
-    zhNote: "slash 菜单 Ctrl+P/Ctrl+N 导航",
-  },
-  {
-    handle: "@AiurArtanis",
-    note: "Claude-style skill archive compatibility request",
-    zhNote: "Claude 风格 skill 压缩包兼容性请求",
-  },
-];
-
-function releaseIssueHref(area: string, prompt: string): string {
-  const body = [
-    `## Area`,
-    area,
-    ``,
-    `## What happened?`,
-    ``,
-    `## What did you expect?`,
-    ``,
-    `## Useful detail`,
-    prompt,
-    ``,
-    `## Version`,
-    `0.8.61`,
-  ].join("\n");
-  const params = new URLSearchParams({
-    title: `[0.8.61] ${area}: `,
-    body,
-  });
-  return `https://github.com/Hmbown/CodeWhale/issues/new?${params.toString()}`;
-}
-
 const FALLBACK_DISPATCH_EN: CuratedDispatch = {
   generatedAt: new Date().toISOString(),
   headline: "Quiet release week — install paths and contributor guides up to date.",
@@ -218,38 +138,43 @@ export default async function HomePage({ params }: { params: Promise<{ locale: s
     <>
       <Ticker items={feed} />
 
-      {/* HERO */}
+      {/* HERO — what it is, plainly */}
       <section className="relative">
         <div className="mx-auto max-w-[1400px] px-4 sm:px-6 pt-10 sm:pt-14 pb-12 grid lg:grid-cols-12 gap-10">
           <div className="lg:col-span-7">
             <div className="mb-6">
-              <span className="pill pill-hot">{isZh ? "开源 · 多模型 · 本地优先" : "Open source · multi-model · local-first"}</span>
+              <span className="pill pill-hot">{isZh ? "开源 · 多模型 · 本地运行" : "Open source · multi-model · runs locally"}</span>
             </div>
 
             <h1 className="font-display tracking-crisp">
               {isZh
-                ? "面向最佳可用模型的终端智能体。"
-                : "An agentic terminal for the best available models."}
+                ? "把最好的模型，带给尽可能多的人。"
+                : "The best available models, for as many people as possible."}
             </h1>
 
             <p className="mt-6 text-lg text-ink-soft leading-relaxed max-w-2xl">
               <span className="font-cjk text-indigo font-semibold">CodeWhale</span>
               {isZh
-                ? " 是社区共建的终端智能体，本地运行，支持你真正在用的模型——GLM、DeepSeek、Kimi、MiniMax、OpenRouter 等等。完整的工具面、审批闸门、快照回滚、子智能体与可恢复会话，都在你的终端里。"
-                : " is a community-built terminal agent that runs locally and works with the models you actually use — GLM, DeepSeek, Kimi, MiniMax, OpenRouter, and more. A full tool surface, approval gates, snapshots you can roll back, sub-agents, and sessions you can resume."}
+                ? " 是一个开源的终端编程智能体（TUI + CLI）。你指向一个模型和一个项目，它就开始干活：读代码、改文件、跑命令、查结果、规划多步任务，并在出错时自我修正。它真正具备 agentic 能力——系统提示就是为此设计的，带计划的长时间任务是常态。目标很朴素：跟上商业编码智能体的研究和特性，然后超越它们。"
+                : " is an open source terminal coding agent — a TUI and a CLI. Point it at a model and a project and it gets to work: reading code, making edits, running commands, checking results, planning multi-step tasks, and correcting itself when something fails. It's genuinely agentic — the system prompt is built for it, and long-running tasks with a real plan are the norm. The goal is simple: stay current with the best commercial coding agents, and surpass them."}
             </p>
 
-            {/* MISSION IDEA CALLOUT — v0.8.61 puts the design thesis in place; the exact shape will keep iterating */}
-            <div className="mt-6 px-4 py-3 bg-indigo-pale border-l-4 border-indigo text-sm leading-relaxed max-w-2xl">
+            {/* HONEST STATUS — what's working right now, and what isn't */}
+            <div className="mt-6 px-4 py-3 hairline-t hairline-b hairline-l hairline-r text-sm leading-relaxed max-w-2xl space-y-1.5">
+              <div className="eyebrow mb-1.5">{isZh ? "当前状态" : "Where things stand"}</div>
               {isZh ? (
                 <>
-                  <span className="font-display text-indigo font-semibold mr-1">这个版本放进来的想法 / Mission idea put in this version</span>
-                  先有可追责的自我（这个终端、这个仓库、这次会话），再有一套处理冲突的 constitution，最后让工具、审批、回滚和交接都留下本地证据。具体形态会继续迭代。
+                  <div><span className="text-jade font-mono text-xs mr-2">✓</span>当前推荐：<span className="font-mono">GLM 5.2</span>，<span className="font-mono">high</span> reasoning，在 CodeWhale 里表现很好。</div>
+                  <div><span className="text-jade font-mono text-xs mr-2">✓</span>OpenAI Codex 登录可用。</div>
+                  <div><span className="text-ink-mute font-mono text-xs mr-2">✗</span>Kimi OAuth 暂时不可用，正在修。</div>
+                  <div className="pt-1 text-xs text-ink-mute">没看到你想要的模型或端点？<a href="https://github.com/Hmbown/CodeWhale/issues/new" className="text-indigo hover:underline">开个 issue</a>。</div>
                 </>
               ) : (
                 <>
-                  <span className="font-display text-indigo font-semibold mr-1">Mission idea put in this version</span>
-                  Start with an accountable self — this terminal, this repo, this session. Add a constitution for conflict. Then make tools, approvals, rollback, and handoffs leave local evidence. The exact shape will keep iterating.
+                  <div><span className="text-jade font-mono text-xs mr-2">✓</span>Recommended right now: <span className="font-mono">GLM 5.2</span> on <span className="font-mono">high</span> reasoning — working very well in CodeWhale.</div>
+                  <div><span className="text-jade font-mono text-xs mr-2">✓</span>OpenAI Codex login is working.</div>
+                  <div><span className="text-ink-mute font-mono text-xs mr-2">✗</span>Kimi OAuth is temporarily broken; on the list.</div>
+                  <div className="pt-1 text-xs text-ink-mute">Don&apos;t see a model or endpoint you want? <a href="https://github.com/Hmbown/CodeWhale/issues/new" className="text-indigo hover:underline">Open an issue</a>.</div>
                 </>
               )}
             </div>
@@ -259,28 +184,28 @@ export default async function HomePage({ params }: { params: Promise<{ locale: s
                 href={isZh ? "/zh/install" : "/install"}
                 className="flex-1 sm:flex-none text-center px-5 py-3 bg-ink text-paper font-mono text-sm uppercase tracking-wider hover:bg-indigo transition-colors"
               >
-                {isZh ? "立即安装 →" : "Install →"}
-              </Link>
-              <Link
-                href="https://github.com/Hmbown/CodeWhale"
-                className="flex-1 sm:flex-none text-center px-5 py-3 hairline-t hairline-b hairline-l hairline-r font-mono text-sm uppercase tracking-wider hover:bg-paper-deep transition-colors"
-              >
-                ★ GitHub
+                {isZh ? "安装 →" : "Install →"}
               </Link>
               <Link
                 href={isZh ? "/zh/docs" : "/docs"}
+                className="flex-1 sm:flex-none text-center px-5 py-3 hairline-t hairline-b hairline-l hairline-r font-mono text-sm uppercase tracking-wider hover:bg-paper-deep transition-colors"
+              >
+                {isZh ? "文档 →" : "Docs →"}
+              </Link>
+              <Link
+                href="https://github.com/Hmbown/CodeWhale"
                 className="px-5 py-3 font-mono text-sm uppercase tracking-wider text-ink-mute hover:text-indigo transition-colors"
               >
-                {isZh ? "阅读文档" : "Docs"}
+                ★ GitHub
               </Link>
             </div>
 
             <div className="mt-6 flex items-center gap-4 text-xs font-mono text-ink-mute flex-wrap">
-              <span>{isZh ? "独立维护者 Hmbown" : "Maintained by Hmbown"}</span>
+              <span>{isZh ? "由 Hmbown 维护" : "Maintained by Hmbown"}</span>
               <span className="hidden sm:inline">·</span>
               <span>{facts.version ?? "v0.8.x"}</span>
               <span className="hidden sm:inline">·</span>
-              <span>{facts.providers.length} providers</span>
+              <span>{facts.providers.length} {isZh ? "个提供商" : "providers"}</span>
             </div>
           </div>
 
@@ -296,7 +221,7 @@ export default async function HomePage({ params }: { params: Promise<{ locale: s
                     <span className="prompt">$</span> npm install -g codewhale{"\n"}
                     <span className="prompt">$</span> codewhale{"\n"}
                     <br />
-                    <span className="comment"># Cargo / Homebrew / 直接下载请见</span>{"\n"}
+                    <span className="comment"># 其他方式（Cargo / Homebrew / 直接下载 / 国内镜像）：</span>{"\n"}
                     <span className="comment"># <span className="key">/install</span></span>
                   </>
                 ) : (
@@ -305,7 +230,7 @@ export default async function HomePage({ params }: { params: Promise<{ locale: s
                     <span className="prompt">$</span> npm install -g codewhale{"\n"}
                     <span className="prompt">$</span> codewhale{"\n"}
                     <br />
-                    <span className="comment"># Cargo / Homebrew / direct download:</span>{"\n"}
+                    <span className="comment"># other ways (Cargo / Homebrew / direct download / China mirrors):</span>{"\n"}
                     <span className="comment"># <span className="key">/install</span></span>
                   </>
                 )}
@@ -321,303 +246,81 @@ export default async function HomePage({ params }: { params: Promise<{ locale: s
 
       <StatGrid stats={stats} />
 
-      {/* LATEST RELEASE */}
-      <section id="latest" className="mx-auto max-w-[1400px] px-6 py-14">
-        <div className="grid lg:grid-cols-12 gap-10 items-start">
-          <div className="lg:col-span-4">
-            <div className="flex items-baseline gap-4 mb-5">
-              <Seal char="新" />
-              <div className="eyebrow">
-                {isZh ? `最新版本 · v${releaseVersion}` : `New in v${releaseVersion}`}
-              </div>
-            </div>
-            <h2 className="font-display text-3xl leading-tight">
-              {isZh ? "更可靠的长任务执行，更清楚的反馈入口。" : "Durable long-running work, clearer feedback paths."}
-            </h2>
-            <p className={`mt-5 text-ink-soft ${isZh ? "leading-[1.9] tracking-wide" : "leading-relaxed"}`}>
-              {isZh
-                ? "0.8.60 的主线是让 CodeWhale 更像一个可继承的维护者工具：fleet worker 真正运行，只读证据可以并行收集，workflow 可以用 JS/TS 声明式编写，终端交互和 provider trace 更稳定。"
-                : "0.8.60 is about making CodeWhale easier to hand off and verify: fleet workers actually run, read-only evidence can be gathered in parallel, workflows can be authored in JS/TS, and terminal/provider edges are less sticky."}
-            </p>
-            <div className="mt-6 flex flex-wrap gap-3">
-              <Link href="https://github.com/Hmbown/CodeWhale/blob/main/CHANGELOG.md#0860---2026-06-13" className="px-4 py-2 bg-ink text-paper font-mono text-sm uppercase tracking-wider hover:bg-indigo transition-colors">
-                {isZh ? "完整 changelog →" : "Full changelog →"}
-              </Link>
-              <Link href="#release-credits" className="px-4 py-2 font-mono text-sm uppercase tracking-wider text-ink-mute hover:text-indigo transition-colors">
-                {isZh ? "贡献者 →" : "Credits →"}
-              </Link>
-            </div>
-            <div className="mt-6 hairline-t pt-4">
-              <div className="eyebrow mb-3">{isZh ? "0.8.60 直接致谢" : "Direct 0.8.60 credits"}</div>
-              <div className="space-y-2">
-                {LATEST_RELEASE_CREDITS.map((credit) => (
-                  <Link
-                    key={credit.handle}
-                    href={`https://github.com/${credit.handle.slice(1)}`}
-                    className="block text-sm text-ink-soft hover:text-indigo"
-                  >
-                    <span className="font-mono text-xs text-indigo">{credit.handle}</span>
-                    <span className={isZh ? "ml-2 leading-[1.8]" : "ml-2"}>{isZh ? credit.zhNote : credit.note}</span>
-                  </Link>
-                ))}
-              </div>
-            </div>
-          </div>
-
-          <div className="lg:col-span-8 hairline-t hairline-b hairline-l hairline-r bg-paper">
-            <div className="grid md:grid-cols-2 gap-0 col-rule">
-              {RELEASE_FEATURES.map((feature) => (
-                <div key={feature.area} className="p-5">
-                  <div className="flex items-baseline justify-between gap-4 mb-3">
-                    <div className="eyebrow text-indigo">{feature.tag}</div>
-                    <Link
-                      href={releaseIssueHref(feature.area, feature.prompt)}
-                      className="font-mono text-[0.68rem] uppercase tracking-widest text-ink-mute hover:text-indigo"
-                    >
-                      {isZh ? "报告问题 →" : "Report →"}
-                    </Link>
-                  </div>
-                  <h3 className="font-display text-xl mb-2">
-                    {isZh ? feature.zhTitle : feature.title}
-                  </h3>
-                  <p className={`text-sm text-ink-soft ${isZh ? "leading-[1.9] tracking-wide" : "leading-relaxed"}`}>
-                    {isZh ? feature.zhBlurb : feature.blurb}
-                  </p>
-                </div>
-              ))}
-            </div>
-          </div>
-        </div>
-      </section>
- 
-      {/* SEE HOW IT DECIDES — real reasoning traces prove the constitution operates */}
-      <section className="bg-paper-deep hairline-t hairline-b">
-        <div className="mx-auto max-w-[1400px] px-6 py-20">
-        <div className="flex items-baseline gap-4 mb-3 hairline-b pb-4">
-          <Seal char="判" />
-          <h2 className="font-display">
-            {isZh ? "看它如何决策" : "See how it decides"}
-          </h2>
-        </div>
-        <p className={`mb-8 text-ink-soft max-w-2xl ${isZh ? "leading-[1.9] tracking-wide" : "text-sm leading-relaxed"}`}>
-          {isZh
-            ? "别的 Agent 声称自己「对齐」「可信」。CodeWhale 能证明——因为宪法会在模型的推理中现身：它决策时会援引「第 II 条」「第 V 条」。下面是真实会话中的推理摘录，以及它们所促成的决定。"
-            : "Every agent claims to be aligned and trustworthy. CodeWhale can prove it — the Constitution shows up in the model's reasoning, citing \"Article II\" and \"Article V\" as it decides. These are real traces from an actual session, paired with the decision each produced."}
-        </p>
-        <ThinkingTrace locale={locale} />
-        <div className="mt-6 text-[0.72rem] font-mono uppercase tracking-wider text-ink-mute">
-          {isZh
-            ? "这些是真实推理的忠实摘录，非杜撰。宪法不是墙上的口号，而是模型决策时真正遵循的顺序。"
-            : "Faithful excerpts from real reasoning — not invented. The constitution isn't a poster on the wall; it's the order the model actually follows when it decides."}
-        </div>
-        </div>
-      </section>
-
-      {/* WHAT IT IS — the core ideas behind the harness */}
-      <section className="mx-auto max-w-[1400px] px-6 py-12">
+      {/* GET STARTED — the two or three steps, with the real links */}
+      <section className="mx-auto max-w-[1400px] px-6 py-14">
         <div className="flex items-baseline gap-4 mb-2 hairline-b pb-4">
-          <Seal char="是" />
+          <Seal char="起" />
           <h2 className="font-display">
-            {isZh ? "判断栈" : "The judgment stack"}
+            {isZh ? "怎么开始" : "Get started"}
           </h2>
         </div>
         <p className={`mb-8 text-ink-soft max-w-2xl ${isZh ? "leading-[1.9] tracking-wide" : "text-sm leading-relaxed"}`}>
           {isZh
-            ? "模型会生成文本；Agent 会留下后果。CodeWhale 把后果需要的结构放在模型外面：自我、权威、证据、工具，各在其位。"
-            : "A model generates text; an agent leaves consequences. CodeWhale puts the structure for those consequences around the model: self, authority, evidence, and tools, each in its place."}
+            ? "三步：装好、配一个模型密钥、在项目里运行。每一步的细节都在安装指南里。"
+            : "Three steps: install it, point it at a model key, and run it in a project. The install guide walks through each one."}
         </p>
 
         <div className="grid md:grid-cols-3 gap-0 col-rule hairline-t hairline-b">
-          {isZh ? (
-            <>
-              <div className="p-6">
-                <div className="eyebrow mb-3">01 · 自我模型</div>
-                <h3 className="font-display text-xl mb-3">责任要有地址</h3>
-                <p className="text-sm text-ink-soft leading-[1.9]">
-                  Agent 不是模型卡片，也不是排行榜数字。它是这个终端、这个工作区、这个会话里的实例。先有地址，责任才有落点。
-                </p>
-              </div>
-              <div className="p-6 bg-paper-deep">
-                <div className="eyebrow mb-3">02 · 嵌套宪法</div>
-                <h3 className="font-display text-xl mb-3">冲突时有法律</h3>
-                <p className="text-sm text-ink-soft leading-[1.9]">
-                  全局 Constitution、当前用户请求、运行时规则、仓库本地 law、实时证据、记忆、个性和旧交接各有顺位。冲突时不靠感觉。
-                </p>
-              </div>
-              <div className="p-6">
-                <div className="eyebrow mb-3">03 · 本地执行</div>
-                <h3 className="font-display text-xl mb-3">证据留在本地</h3>
-                <p className="text-sm text-ink-soft leading-[1.9]">
-                  文件、Shell、Git、Web、MCP、子 Agent、回滚和诊断都由 runtime 管理。模型不需要假装验证；它必须留下证据。
-                </p>
-              </div>
-            </>
-          ) : (
-            <>
-              <div className="p-6">
-                <div className="eyebrow mb-3">01 · self-model</div>
-                <h3 className="font-display text-xl mb-3">Responsibility needs an address</h3>
-                <p className="text-sm text-ink-soft leading-relaxed">
-                  The agent is not a model card or leaderboard score. It is an instance in this terminal, this workspace, this session. Give it an address before you ask it to act.
-                </p>
-              </div>
-              <div className="p-6 bg-paper-deep">
-                <div className="eyebrow mb-3">02 · nested constitution</div>
-                <h3 className="font-display text-xl mb-3">Conflict has law</h3>
-                <p className="text-sm text-ink-soft leading-relaxed">
-                  Global Constitution, current user request, runtime statutes, repo-local law, live evidence, memory, personality, and old handoffs each have a rank. When they conflict, the agent has an order to follow.
-                </p>
-              </div>
-              <div className="p-6">
-                <div className="eyebrow mb-3">03 · local execution</div>
-                <h3 className="font-display text-xl mb-3">Evidence stays local</h3>
-                <p className="text-sm text-ink-soft leading-relaxed">
-                  Files, shell, git, web, MCP, sub-agents, rollback, and diagnostics are runtime surfaces. The model does not claim verification as a mood; it has to leave evidence.
-                </p>
-              </div>
-            </>
-          )}
-        </div>
-
-        <div className="mt-8 hairline-t pt-6 flex flex-wrap items-baseline gap-x-6 gap-y-3">
-          <div className="eyebrow shrink-0">{isZh ? "内建提供商" : "Built-in providers"}</div>
-          <div className="flex flex-wrap gap-2">
-            {facts.providers.map((p) => (
-              <span key={p.id} className="font-mono text-xs px-2 py-1 hairline-t hairline-b hairline-l hairline-r text-ink-soft">
-                {p.label}
-              </span>
-            ))}
-          </div>
+          {(isZh
+            ? [
+                { n: "01", t: "安装", d: "npm 一行装好，或用 Cargo / Homebrew / 直接下载二进制。中国大陆网络有 CNB 与清华 Tuna 镜像。", cta: "安装指南 →", href: isZh ? "/zh/install" : "/install" },
+                { n: "02", t: "配密钥", d: "codewhale auth set --provider deepseek（或 openrouter、anthropic、zai 等）。本地 vLLM / Ollama 无需密钥。", cta: "提供商列表 →", href: isZh ? "/zh/docs#providers" : "/docs#providers" },
+                { n: "03", t: "运行", d: "在项目目录里敲 codewhale。默认 Plan 只读调查；按 Tab 切到 Agent 执行。", cta: "文档 →", href: isZh ? "/zh/docs" : "/docs" },
+              ]
+            : [
+                { n: "01", t: "Install", d: "One npm line, or Cargo / Homebrew / a direct binary. On mainland China networks, the CNB and Tsinghua Tuna mirrors route around GitHub.", cta: "Install guide →", href: "/install" },
+                { n: "02", t: "Add a key", d: "codewhale auth set --provider deepseek (or openrouter, anthropic, zai, …). A local vLLM or Ollama box needs no key at all.", cta: "Provider list →", href: "/docs#providers" },
+                { n: "03", t: "Run it", d: "Type codewhale in a project. Plan mode is read-only by default; press Tab for Agent mode.", cta: "Docs →", href: "/docs" },
+              ]
+          ).map((item) => (
+            <Link key={item.n} href={item.href} className="block p-6 hover:bg-paper-deep transition-colors">
+              <div className="font-mono uppercase tracking-widest mb-2 text-[0.7rem] text-indigo">{item.n}</div>
+              <h3 className="font-display text-xl mb-2">{item.t}</h3>
+              <p className={`text-sm text-ink-soft mb-4 ${isZh ? "leading-[1.9] tracking-wide" : "leading-relaxed"}`}>
+                {item.d}
+              </p>
+              <span className="font-mono text-[0.7rem] uppercase tracking-widest text-indigo">{item.cta}</span>
+            </Link>
+          ))}
         </div>
       </section>
 
-      {/* MAINTAINER LOOP */}
+      {/* WHAT'S GOING ON — activity + dispatch */}
       <section className="bg-paper-deep hairline-t hairline-b">
         <div className="mx-auto max-w-[1400px] px-6 py-14">
-          <div className="grid lg:grid-cols-12 gap-10 items-start">
-            <div className="lg:col-span-5">
-              <div className="flex items-baseline gap-4 mb-4">
-                <Seal char="百" />
-                <div className="eyebrow">{isZh ? "维护者循环" : "maintainer loop"}</div>
-              </div>
-              <h2 className="font-display">
-                {isZh ? "长任务要能被继承" : "Long work has to be inheritable"}
-              </h2>
-              <p className={`mt-5 text-ink-soft ${isZh ? "leading-[1.9] tracking-wide" : "leading-relaxed"}`}>
-                {isZh
-                  ? "难点不是让模型一次做更多事，而是让用户意图、权威顺序、证据和贡献者上下文足够清楚，让下一个维护者可以接住。"
-                  : "The hard part is not making the model do more at once. It is keeping intent, authority, evidence, and contributor context clear enough for the next maintainer to inherit."}
-              </p>
-              <p className={`mt-4 text-sm text-ink-mute ${isZh ? "leading-[1.9] tracking-wide" : "leading-relaxed"}`}>
-                {isZh
-                  ? "好的 Agent 工作不是一团活动记录，而是一条可以复核的线：请求、调查、补丁、验证、署名。"
-                  : "Good agent work is not a pile of activity. It is a reviewable line: request, investigation, patch, verification, credit."}
-              </p>
-              <p className={`mt-4 text-sm text-ink-soft ${isZh ? "leading-[1.9] tracking-wide" : "leading-relaxed"}`}>
-                {isZh
-                  ? "框架承担了繁重工作：宪政提示、结构化信任、反馈循环、回滚和跨会话存活的交接。模型可以把注意力放在任务本身。"
-                  : "The harness carries the heavy parts: constitutional prompts, structured trust, feedback loops, rollback, and handoffs that survive the session. The model can keep its attention on the task itself."}
-              </p>
-              <div className="mt-6 flex flex-wrap gap-3">
-                <Link href={isZh ? "/zh/docs#constitution" : "/docs#constitution"} className="px-4 py-2 bg-ink text-paper font-mono text-sm uppercase tracking-wider hover:bg-indigo transition-colors">
-                  {isZh ? "阅读宪法 →" : "Read the docs →"}
-                </Link>
-                <Link href={isZh ? "/zh/contribute" : "/contribute"} className="px-4 py-2 font-mono text-sm uppercase tracking-wider text-ink-mute hover:text-indigo transition-colors">
-                  {isZh ? "贡献指南 →" : "Contribute →"}
-                </Link>
-              </div>
-            </div>
+          <div className="flex items-baseline gap-4 mb-8 hairline-b pb-4">
+            <Seal char="动" />
+            <h2 className="font-display">
+              {isZh ? "最近在发生什么" : "What's going on"}
+            </h2>
+          </div>
 
-            <div className="lg:col-span-7 hairline-t hairline-b hairline-l hairline-r bg-paper">
-              <div className="bg-ink text-paper px-4 py-3 flex items-center justify-between gap-4">
-                <div className="font-mono text-sm uppercase tracking-widest">CodeWhale / review loop</div>
-                <div className="font-cjk text-sm text-paper-deep/80">{isZh ? "维护者工作流" : "maintainer workflow"}</div>
-              </div>
-              <div className="grid sm:grid-cols-2 gap-0 col-rule">
-                {(isZh
-                  ? [
-                      { n: "01", t: "意图", d: "当前用户请求定义目标、约束和成功标准。" },
-                      { n: "02", t: "调查", d: "Agent 读取代码、调用工具、必要时分派子 Agent，并保留证据。" },
-                      { n: "03", t: "补丁", d: "输出保持小、可复现、可测试，并尊重现有分支和贡献者上下文。" },
-                      { n: "04", t: "审查", d: "维护者看到改变、验证结果、风险和应被感谢的人。" },
-                    ]
-                  : [
-                      { n: "01", t: "Intent", d: "The current user request defines the goal, constraints, and success bar." },
-                      { n: "02", t: "Investigation", d: "The agent reads code, uses tools, delegates when useful, and keeps the evidence visible." },
-                      { n: "03", t: "Patch", d: "The output stays small, reproducible, testable, and respectful of branch and contributor context." },
-                      { n: "04", t: "Review", d: "The maintainer sees what changed, what was verified, what risk remains, and who deserves credit." },
-                    ]
-                ).map((item) => (
-                  <div key={item.n} className="p-5">
-                    <div className={`font-mono uppercase tracking-widest mb-2 ${item.n === "01" ? "text-[0.6rem] text-indigo/60" : item.n === "04" ? "text-[0.82rem] text-indigo font-semibold" : "text-[0.7rem] text-indigo"}`}>{item.n}</div>
-                    <h3 className="font-display text-lg mb-2">{item.t}</h3>
-                    <p className={`text-sm text-ink-soft ${isZh ? "leading-[1.9] tracking-wide" : "leading-relaxed"}`}>
-                      {item.d}
-                    </p>
-                  </div>
+          {/* Recent activity from the repo */}
+          {feed.length > 0 && (
+            <div className="mb-10">
+              <div className="eyebrow mb-3">{isZh ? "仓库近期活动" : "Recent repo activity"}</div>
+              <ul className="space-y-2">
+                {feed.slice(0, 6).map((item) => (
+                  <li key={`${item.url}-${item.number}`} className="flex items-baseline gap-3 text-sm">
+                    <span className="font-mono text-[0.66rem] text-indigo uppercase tracking-widest w-10 shrink-0">
+                      {item.kind === "pull" ? "PR" : "ISS"}
+                    </span>
+                    <span className="font-mono text-xs text-ink-mute tabular shrink-0">#{item.number}</span>
+                    <a href={item.url} className="text-ink hover:text-indigo transition-colors">
+                      {item.title.slice(0, 90)}{item.title.length > 90 ? "…" : ""}
+                    </a>
+                  </li>
                 ))}
+              </ul>
+              <div className="mt-4">
+                <Link href={isZh ? "/zh/feed" : "/feed"} className="font-mono text-xs uppercase tracking-wider text-indigo hover:underline">
+                  {isZh ? "全部活动 →" : "All activity →"}
+                </Link>
               </div>
             </div>
-          </div>
-        </div>
-      </section>
+          )}
 
-      {/* HOW IT WORKS */}
-      <section className="mx-auto max-w-[1400px] px-6 py-12">
-        <div className="flex items-baseline gap-4 mb-8 hairline-b pb-4">
-          <Seal char="作" />
-          <h2 className="font-display">
-            {isZh ? "运作方式" : "How it works"}
-          </h2>
-        </div>
-
-        <div className="hairline-t hairline-b hairline-l hairline-r bg-paper p-4 sm:p-8">
-          <MermaidDiagram
-            label={isZh ? "CodeWhale 运作方式示意图" : "CodeWhale architecture diagram"}
-            chart={
-              isZh
-                ? `flowchart TD
-    A["用户输入<br/>(TUI · ratatui)"] -->|Op channel| B["Engine<br/>turn loop + tools"]
-    B -->|HTTPS / SSE| C["DeepSeek API<br/>V4 family"]
-    C -->|stream events| B
-    B -->|tool call| T["read_file · edit_file · grep<br/>apply_patch · exec_shell<br/>mcp_&lt;server&gt;_&lt;tool&gt;"]
-    T -->|approval Y/N| P["审批对话框<br/>approval dialog"]
-    P --> B
-    T -->|exec| S["沙箱<br/>seatbelt · landlock · win32"]
-    classDef accent fill:#e9eefe,stroke:#0e0e10,stroke-width:1px;
-    classDef api fill:#0e0e10,stroke:#0e0e10,color:#ffffff;
-    class C api;
-    class T,P,S accent;`
-                : `flowchart TD
-    A["You type<br/>(TUI · ratatui)"] -->|Op channel| B["Engine<br/>turn loop + tools"]
-    B -->|HTTPS / SSE| C["DeepSeek API<br/>V4 family"]
-    C -->|stream events| B
-    B -->|tool call| T["read_file · edit_file · grep<br/>apply_patch · exec_shell<br/>mcp_&lt;server&gt;_&lt;tool&gt;"]
-    T -->|approval Y/N| P["Approval<br/>dialog"]
-    P --> B
-    T -->|exec| S["Sandbox<br/>seatbelt · landlock · win32"]
-    classDef accent fill:#e9eefe,stroke:#0e0e10,stroke-width:1px;
-    classDef api fill:#0e0e10,stroke:#0e0e10,color:#ffffff;
-    class C api;
-    class T,P,S accent;`
-            }
-          />
-        </div>
-      </section>
-
-      {/* TODAY'S DISPATCH — slim editorial column */}
-      <section className="bg-paper-deep hairline-t hairline-b">
-        <div className="mx-auto max-w-[1400px] px-6 py-14">
-          <div className="flex items-end justify-between mb-6 hairline-b pb-4 flex-wrap gap-3">
-            <div>
-              <div className="eyebrow mb-2">{isZh ? "今日要闻" : "Today's Dispatch"}</div>
-              <div className="font-mono text-sm tabular text-ink-mute">
-                {new Date(dispatch.generatedAt).toISOString().slice(0, 10)}
-              </div>
-            </div>
-            <div className="font-mono text-xs text-ink-mute">DeepSeek V4-Flash · 6h cron</div>
-          </div>
-
+          {/* Today's dispatch */}
           <article className="grid lg:grid-cols-12 gap-x-10 gap-y-6 max-w-[1100px]">
             <h3 className="lg:col-span-12 font-display text-2xl sm:text-3xl leading-tight">
               {isZh && dispatch.headlineZh ? dispatch.headlineZh : dispatch.headline}
@@ -641,16 +344,60 @@ export default async function HomePage({ params }: { params: Promise<{ locale: s
               ))}
             </ul>
           </article>
-
-          <div className="mt-8 hairline-t pt-4">
-            <Link href={isZh ? "/zh/feed" : "/feed"} className="font-mono text-xs uppercase tracking-wider text-indigo hover:underline">
-              {isZh ? "全部活动 →" : "All activity →"}
-            </Link>
-          </div>
         </div>
       </section>
 
-      {/* RELEASE CREDITS */}
+      {/* GET HELP — where to look, especially for China network visitors */}
+      <section className="mx-auto max-w-[1400px] px-6 py-14">
+        <div className="flex items-baseline gap-4 mb-8 hairline-b pb-4">
+          <Seal char="助" />
+          <h2 className="font-display">
+            {isZh ? "需要帮助？" : "Need help?"}
+          </h2>
+        </div>
+
+        <div className="grid md:grid-cols-3 gap-0 col-rule hairline-t hairline-b">
+          {(isZh
+            ? [
+                { t: "安装与配置", d: "每种安装方式、密钥设置、沙箱、CNB / 清华 Tuna 国内镜像、常见报错排查。", cta: "安装指南 →", href: "/zh/install" },
+                { t: "常见问题", d: "模型、提供商、模式、MCP、技能、配置文件位置等高频问题。", cta: "FAQ →", href: "/zh/faq" },
+                { t: "提议题或 PR", d: "遇到 bug 或有想法，直接在 GitHub 开 issue 或 pull request。维护者会亲自看。", cta: "参与贡献 →", href: "/zh/contribute" },
+              ]
+            : [
+                { t: "Install & configure", d: "Every install path, key setup, sandboxing, the CNB / Tsinghua Tuna mirrors for mainland China, and troubleshooting.", cta: "Install guide →", href: "/install" },
+                { t: "FAQ", d: "High-frequency questions on models, providers, modes, MCP, skills, and where config lives.", cta: "FAQ →", href: "/faq" },
+                { t: "File an issue or PR", d: "Hit a bug or have an idea? Open an issue or pull request on GitHub — the maintainer reads everything personally.", cta: "Contribute →", href: "/contribute" },
+              ]
+          ).map((item) => (
+            <Link key={item.t} href={item.href} className="block p-6 hover:bg-paper-deep transition-colors">
+              <h3 className="font-display text-xl mb-2">{item.t}</h3>
+              <p className={`text-sm text-ink-soft mb-4 ${isZh ? "leading-[1.9] tracking-wide" : "leading-relaxed"}`}>
+                {item.d}
+              </p>
+              <span className="font-mono text-[0.7rem] uppercase tracking-widest text-indigo">{item.cta}</span>
+            </Link>
+          ))}
+        </div>
+
+        {/* Mirror strip — surfaced up where a stuck visitor will see it, not buried in the footer */}
+        {isZh && (
+          <div className="mt-8 hairline-t pt-6 flex flex-wrap items-baseline gap-x-6 gap-y-3">
+            <div className="eyebrow shrink-0">{isZh ? "国内镜像 / China mirrors" : "China mirrors"}</div>
+            <div className="flex flex-wrap gap-4 text-sm">
+              <a href="https://cnb.cool/codewhale.net/codewhale" className="text-indigo hover:underline" target="_blank" rel="noopener">CNB 镜像</a>
+              <a href="https://npmmirror.com/package/codewhale" className="text-indigo hover:underline" target="_blank" rel="noopener">npmmirror</a>
+              <a href="https://mirrors.tuna.tsinghua.edu.cn/help/crates.io-index.html" className="text-indigo hover:underline" target="_blank" rel="noopener">清华 Tuna crates.io</a>
+            </div>
+            <p className="w-full text-xs text-ink-mute leading-relaxed max-w-2xl">
+              {isZh
+                ? "npm 安装时可设 CODEWHALE_USE_CNB_MIRROR=1，wrapper 会改从 CNB 下载二进制。DeepSeek API（api.deepseek.com）国内直连，无需代理。"
+                : "Set CODEWHALE_USE_CNB_MIRROR=1 during npm install to fetch binaries from CNB. The DeepSeek API (api.deepseek.com) is reachable from mainland China without a proxy."}
+            </p>
+          </div>
+        )}
+      </section>
+
+      {/* RELEASE CREDITS — the community that built this release */}
       <section id="release-credits" className="mx-auto max-w-[1400px] px-6 py-14">
         <div className="flex items-baseline gap-4 mb-5 hairline-b pb-4">
           <Seal char="谢" />
@@ -668,7 +415,7 @@ export default async function HomePage({ params }: { params: Promise<{ locale: s
                 ? "这一版合并和吸收了来自社区的大量工作。完整条目在 CHANGELOG 中；这里保留最新发布的公开致谢入口。"
                 : "This release merged and harvested a large community tranche. The full notes live in the changelog; this keeps the latest public credit surface easy to find."}
             </p>
-            <Link href="https://github.com/Hmbown/CodeWhale/blob/main/CHANGELOG.md#0860---2026-06-13" className="inline-block mt-4 font-mono text-xs uppercase tracking-wider text-indigo hover:underline">
+            <Link href="https://github.com/Hmbown/CodeWhale/blob/main/CHANGELOG.md" className="inline-block mt-4 font-mono text-xs uppercase tracking-wider text-indigo hover:underline">
               {isZh ? "查看完整 changelog →" : "Full changelog →"}
             </Link>
           </div>
@@ -705,25 +452,41 @@ export default async function HomePage({ params }: { params: Promise<{ locale: s
         </div>
       </section>
 
-      {/* JOIN IN */}
+      {/* JOIN IN — the project is the point */}
       <section className="bg-ink text-paper">
         <div className="mx-auto max-w-[1400px] px-6 py-20 grid lg:grid-cols-12 gap-10 items-center">
           <div className="lg:col-span-8">
-            <div className="eyebrow text-paper-deep/70 mb-3">{isZh ? "加入" : "Join in"}</div>
+            <div className="eyebrow text-paper-deep/70 mb-3">{isZh ? "这个项目" : "The project"}</div>
             <h2 className="font-display text-paper text-4xl leading-tight">
-              {isZh ? "小项目。你的每个补丁都重要。" : "A small project. Your patch matters."}
+              {isZh ? "来自世界各地的开发者，把 CodeWhale 变成了今天的样子。" : "Developers from all over have made CodeWhale what it is."}
             </h2>
             <p className={`mt-5 text-paper-deep/80 max-w-2xl ${isZh ? "leading-[1.9]" : "leading-relaxed"}`}>
               {isZh
-                ? "无 CLA，无赞助商优先通道。维护者亲自阅读每一条内容，议题公开分类，版本从 main 分支发布。"
-                : "No CLA. No sponsor lockouts. The maintainer reads everything personally, issues are triaged in the open, and releases cut from main."}
+                ? "CodeWhale 起于一个人的 DeepSeek 业余项目，来自许多国家的贡献者把它塑造成了现在的样子——每一版发布上的贡献者名单就是证据。这里没有 CLA，没有赞助商优先通道，议题公开分类，版本从 main 分支发布。"
+                : "CodeWhale started as one person's DeepSeek side project, and contributors from many countries have shaped it into what it is — the contributor list on every release is the proof. No CLA, no sponsor lockouts, issues triaged in the open, releases cut from main."}
+            </p>
+            <blockquote className={`mt-6 pl-4 border-l-2 border-indigo text-paper-deep/90 max-w-2xl ${isZh ? "leading-[1.9]" : "leading-relaxed"}`}>
+              {isZh
+                ? "「所有反馈都是礼物。」——这是我教书时很早就学到的一句话，也是我维护 CodeWhale 的方式。每一个 issue、PR、bug 报告或想法，都是我理解真实使用场景、做出更好决策的方式。"
+                : "“All feedback is a gift.” Something I learned early in teaching, and the way I maintain CodeWhale. Every issue, PR, bug report, or idea is how I understand real use cases and make better decisions."}
+            </blockquote>
+            <p className={`mt-4 text-paper-deep/70 max-w-2xl text-sm ${isZh ? "leading-[1.9]" : "leading-relaxed"}`}>
+              {isZh
+                ? "如果你遇到用不了的地方，或者想要一个没列出来的模型——那是你能告诉这个项目的最有用的事。"
+                : "If you hit something that doesn't work, or want a model that isn't listed — that's the most useful thing you can tell the project."}
             </p>
             <div className="mt-6 flex flex-wrap items-center gap-3">
               <Link
                 href="https://github.com/Hmbown/CodeWhale"
                 className="px-4 py-2 hairline-t hairline-b hairline-l hairline-r border-white/20 text-paper font-mono text-sm hover:bg-white/10 transition-colors"
               >
-                ★ {isZh ? "Star on GitHub" : "Star on GitHub"}
+                ★ {isZh ? "在 GitHub 上 Star" : "Star on GitHub"}
+              </Link>
+              <Link
+                href="https://github.com/Hmbown/CodeWhale/issues/new"
+                className="px-4 py-2 bg-indigo text-paper font-mono text-sm hover:bg-indigo-deep transition-colors"
+              >
+                {isZh ? "开个 issue →" : "Open an issue →"}
               </Link>
               <Link
                 href={isZh ? "/zh/contribute" : "/contribute"}
