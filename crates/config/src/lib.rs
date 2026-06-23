@@ -4204,13 +4204,21 @@ impl EnvRuntimeOverrides {
                 .ok()
                 .filter(|v| !v.trim().is_empty()),
             qianfan_base_url: std::env::var("QIANFAN_BASE_URL")
-                .or_else(|_| std::env::var("BAIDU_QIANFAN_BASE_URL"))
                 .ok()
-                .filter(|v| !v.trim().is_empty()),
+                .filter(|v| !v.trim().is_empty())
+                .or_else(|| {
+                    std::env::var("BAIDU_QIANFAN_BASE_URL")
+                        .ok()
+                        .filter(|v| !v.trim().is_empty())
+                }),
             qianfan_model: std::env::var("QIANFAN_MODEL")
-                .or_else(|_| std::env::var("BAIDU_QIANFAN_MODEL"))
                 .ok()
-                .filter(|v| !v.trim().is_empty()),
+                .filter(|v| !v.trim().is_empty())
+                .or_else(|| {
+                    std::env::var("BAIDU_QIANFAN_MODEL")
+                        .ok()
+                        .filter(|v| !v.trim().is_empty())
+                }),
             openai_codex_base_url: std::env::var("OPENAI_CODEX_BASE_URL")
                 .or_else(|_| std::env::var("CODEX_BASE_URL"))
                 .ok()
