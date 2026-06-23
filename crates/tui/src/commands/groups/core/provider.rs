@@ -151,6 +151,7 @@ fn expand_model_alias_for_provider(provider: ApiProvider, name: &str) -> String 
     if matches!(provider, ApiProvider::XiaomiMimo) {
         return match lower.as_str() {
             "pro" | "mimo" => "mimo-v2.5-pro".to_string(),
+            "ultraspeed" | "pro-ultraspeed" => "mimo-v2.5-pro-ultraspeed".to_string(),
             "text" | "omni" | "v2.5-omni" => "mimo-v2.5".to_string(),
             "tts" | "speech" | "mimo-tts" => "mimo-v2.5-tts".to_string(),
             "voicedesign" | "voice-design" | "mimo-voice-design" => {
@@ -279,6 +280,8 @@ mod tests {
     fn switch_to_xiaomi_mimo_accepts_chat_shorthands() {
         let mut app = create_test_app();
         for (input, expected) in [
+            ("xiaomi-mimo pro-ultraspeed", "mimo-v2.5-pro-ultraspeed"),
+            ("xiaomi-mimo ultraspeed", "mimo-v2.5-pro-ultraspeed"),
             ("xiaomi-mimo omni", "mimo-v2.5"),
             ("xiaomi-mimo v2.5-omni", "mimo-v2.5"),
         ] {

@@ -180,6 +180,7 @@ const SEED_MODEL_IDS: &[(&str, ModelProvider)] = &[
     ("trinity-mini", ModelProvider::Arcee),
     // --- Xiaomi MiMo (config DEFAULT_XIAOMI_MIMO_MODEL) ---
     ("mimo-v2.5-pro", ModelProvider::XiaomiMimo),
+    ("mimo-v2.5-pro-ultraspeed", ModelProvider::XiaomiMimo),
     ("mimo-v2.5", ModelProvider::XiaomiMimo),
 ];
 
@@ -280,6 +281,8 @@ mod tests {
             ("trinity-large-thinking", Some(262_144)),
             ("trinity-mini", Some(128_000)),
             ("mimo-v2.5-pro", Some(1_000_000)),
+            ("mimo-v2.5-pro-ultraspeed", Some(1_000_000)),
+            ("mimo-v2.5", Some(1_000_000)),
         ];
         for (model, expected) in sample {
             let meta = lookup(model)

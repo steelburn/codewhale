@@ -313,9 +313,11 @@ fn known_context_window_for_model(model_lower: &str) -> Option<u32> {
         "nvidia/nemotron-3-ultra-550b-a55b" | "nvidia/nemotron-3-ultra-550b-a55b:free" => {
             Some(1_000_000)
         }
-        "xiaomi/mimo-v2.5-pro" | "xiaomi/mimo-v2.5" | "mimo-v2.5-pro" | "mimo-v2.5" => {
-            Some(1_000_000)
-        }
+        "xiaomi/mimo-v2.5-pro"
+        | "xiaomi/mimo-v2.5"
+        | "mimo-v2.5-pro"
+        | "mimo-v2.5-pro-ultraspeed"
+        | "mimo-v2.5" => Some(1_000_000),
         "mimo-v2.5-asr"
         | "mimo-v2.5-tts"
         | "mimo-v2.5-tts-voicedesign"
@@ -353,9 +355,11 @@ pub fn max_output_tokens_for_model(model: &str) -> Option<u32> {
         "qwen/qwen3.6-flash" | "qwen/qwen3.6-max-preview" | "qwen/qwen3.6-plus" => Some(65_536),
         "z-ai/glm-5.1" | "z-ai/glm-5.2" | "z-ai/glm-5-turbo" | "glm-5.1" | "glm-5.2"
         | "glm-5-turbo" => Some(131_072),
-        "xiaomi/mimo-v2.5-pro" | "xiaomi/mimo-v2.5" | "mimo-v2.5-pro" | "mimo-v2.5" => {
-            Some(131_072)
-        }
+        "xiaomi/mimo-v2.5-pro"
+        | "xiaomi/mimo-v2.5"
+        | "mimo-v2.5-pro"
+        | "mimo-v2.5-pro-ultraspeed"
+        | "mimo-v2.5" => Some(131_072),
         "mimo-v2.5-asr" => Some(2_048),
         "mimo-v2.5-tts"
         | "mimo-v2.5-tts-voicedesign"
@@ -425,6 +429,7 @@ pub fn model_supports_reasoning(model: &str) -> bool {
             | "xiaomi/mimo-v2.5-pro"
             | "xiaomi/mimo-v2.5"
             | "mimo-v2.5-pro"
+            | "mimo-v2.5-pro-ultraspeed"
             | "mimo-v2.5"
             | "z-ai/glm-5.1"
             | "z-ai/glm-5.2"
@@ -674,6 +679,7 @@ mod tests {
             (concat!("qwen/", "qwen3.6-plus"), 1_000_000),
             (concat!("xiaomi/", "mimo-v2.5-pro"), 1_000_000),
             ("mimo-v2.5-pro", 1_000_000),
+            ("mimo-v2.5-pro-ultraspeed", 1_000_000),
             ("mimo-v2.5", 1_000_000),
             ("minimax/minimax-m3", 1_000_000),
             ("minimax/minimax-2.7", 204_800),
@@ -817,6 +823,10 @@ mod tests {
             Some(131_072)
         );
         assert_eq!(max_output_tokens_for_model("mimo-v2.5-pro"), Some(131_072));
+        assert_eq!(
+            max_output_tokens_for_model("mimo-v2.5-pro-ultraspeed"),
+            Some(131_072)
+        );
         assert_eq!(max_output_tokens_for_model("mimo-v2.5"), Some(131_072));
         assert_eq!(
             max_output_tokens_for_model("minimax/minimax-m3"),

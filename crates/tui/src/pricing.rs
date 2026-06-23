@@ -1,7 +1,9 @@
 //! Cost estimation for API usage.
 //!
-//! Pricing is stored per million tokens. DeepSeek/Xiaomi MiMo rows include
-//! their published CNY rates; OpenRouter-curated rows are USD-only.
+//! Pricing is stored per million tokens. DeepSeek rows include their published
+//! CNY rates; OpenRouter-curated rows are USD-only. Direct Xiaomi MiMo Token
+//! Plan usage is credit/quota based and is intentionally left unknown until a
+//! reliable balance endpoint exists.
 
 #[cfg(test)]
 use chrono::TimeZone;
@@ -152,12 +154,6 @@ fn known_pricing_for_model(model_lower: &str) -> Option<ModelPricing> {
         ));
     }
     match model_lower {
-        "xiaomi/mimo-v2.5-pro" | "mimo-v2.5-pro" => Some(deepseek_v4_pro_pricing()),
-        "xiaomi/mimo-v2.5" | "mimo-v2.5" => Some(deepseek_v4_flash_pricing()),
-
-        // USD rows below mirror the curated OpenRouter catalog. Prices are
-        // sourced from OpenRouter's per-token API fields and multiplied to the
-        // per-million-token units this module uses.
         "moonshotai/kimi-k2.6" | "kimi-k2.6" => Some(usd_only_pricing(0.34, 0.68, 3.41)),
         "z-ai/glm-5.1" | "glm-5.1" => Some(usd_only_pricing(0.182, 0.98, 3.08)),
         "minimax/minimax-m3" | "minimax-m3" => Some(usd_only_pricing(0.06, 0.30, 1.20)),
@@ -524,26 +520,18 @@ mod tests {
     }
 
     #[test]
-    fn xiaomi_mimo_primary_models_use_matching_deepseek_v4_rates() {
+    fn xiaomi_mimo_token_plan_models_leave_cost_unknown() {
         let now = Utc.with_ymd_and_hms(2026, 6, 4, 0, 0, 0).single().unwrap();
 
-        let pro_pricing = pricing_for_model_at("mimo-v2.5-pro", now).unwrap();
-        assert_eq!(pro_pricing.usd.input_cache_hit_per_million, 0.003625);
-        assert_eq!(pro_pricing.usd.input_cache_miss_per_million, 0.435);
-        assert_eq!(pro_pricing.usd.output_per_million, 0.87);
-        let pro_cny = pro_pricing.cny.expect("MiMo pricing has CNY");
-        assert_eq!(pro_cny.input_cache_hit_per_million, 0.025);
-        assert_eq!(pro_cny.input_cache_miss_per_million, 3.0);
-        assert_eq!(pro_cny.output_per_million, 6.0);
-
-        let flash_pricing = pricing_for_model_at("xiaomi/mimo-v2.5", now).unwrap();
-        assert_eq!(flash_pricing.usd.input_cache_hit_per_million, 0.0028);
-        assert_eq!(flash_pricing.usd.input_cache_miss_per_million, 0.14);
-        assert_eq!(flash_pricing.usd.output_per_million, 0.28);
-        let flash_cny = flash_pricing.cny.expect("MiMo pricing has CNY");
-        assert_eq!(flash_cny.input_cache_hit_per_million, 0.02);
-        assert_eq!(flash_cny.input_cache_miss_per_million, 1.0);
-        assert_eq!(flash_cny.output_per_million, 2.0);
+        for model in [
+            "mimo-v2.5-pro",
+            "mimo-v2.5-pro-ultraspeed",
+            "mimo-v2.5",
+            "xiaomi/mimo-v2.5",
+        ] {
+            assert!(pricing_for_model_at(model, now).is_none());
+            assert!(!has_pricing_for_model(model));
+        }
     }
 
     #[test]
