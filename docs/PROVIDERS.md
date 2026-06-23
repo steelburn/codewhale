@@ -120,6 +120,37 @@ environment. Project-local config overlays intentionally cannot set those keys,
 so a repository cannot silently redirect prompts or credentials to another
 endpoint.
 
+## Credential Links
+
+Provider setup surfaces should link users to provider-owned credential pages
+instead of leaving them to search from a missing-key error. The runtime copy uses
+the same links where possible.
+
+| Provider ID | Credential or console link |
+| --- | --- |
+| `deepseek` | [DeepSeek API keys](https://platform.deepseek.com/api_keys) |
+| `nvidia-nim` | [NVIDIA NIM API keys](https://build.nvidia.com/settings/api-keys) |
+| `openai` | [OpenAI API keys](https://platform.openai.com/api-keys) |
+| `atlascloud` | [Atlas Cloud API keys](https://atlascloud.ai/docs/en/api-keys) |
+| `wanjie-ark` | [Wanjie MaaS APIKEY docs](https://docs.wanjiedata.com/maas/maas-openapi-v1.html) |
+| `volcengine` | [Volcengine Ark console](https://console.volcengine.com/ark) |
+| `openrouter` | [OpenRouter keys](https://openrouter.ai/settings/keys) |
+| `xiaomi-mimo` | [Xiaomi MiMo Token Plan](https://platform.xiaomimimo.com/token-plan) |
+| `novita` | [Novita quickstart](https://novita.ai/docs/guides/quickstart) |
+| `fireworks` | [Fireworks API keys](https://fireworks.ai/account/api-keys) |
+| `siliconflow`, `siliconflow-CN` | [SiliconFlow API keys](https://cloud.siliconflow.com/account/ak) |
+| `arcee` | [Arcee API key guide](https://docs.arcee.ai/other/create-your-first-api-key) |
+| `moonshot` | [Kimi Open Platform](https://platform.kimi.ai/) |
+| `zai` | [Z.ai model API](https://z.ai/model-api) |
+| `stepfun` | [StepFun Open Platform](https://platform.stepfun.ai/) |
+| `minimax` | [MiniMax prerequisites](https://platform.minimax.io/docs/guides/quickstart-preparation) |
+| `huggingface` | [Hugging Face tokens](https://huggingface.co/settings/tokens) |
+| `deepinfra` | [DeepInfra API keys](https://deepinfra.com/dash/api_keys) |
+| `together` | [Together API keys](https://api.together.ai/settings/api-keys) |
+| `anthropic` | [Anthropic API keys](https://console.anthropic.com/settings/keys) |
+| `openai-codex` | Reuses `codex login`; no CodeWhale API key is stored. |
+| `sglang`, `vllm`, `ollama` | Local OpenAI-compatible endpoints can run without an API key on localhost. |
+
 ## Shipped Providers
 
 | Provider ID | TOML table | Auth env | Base URL env and default | Default or static models | Notes |
@@ -131,7 +162,7 @@ endpoint.
 | `wanjie-ark` | `[providers.wanjie_ark]` | `WANJIE_ARK_API_KEY`, `WANJIE_API_KEY`, `WANJIE_MAAS_API_KEY` | `WANJIE_ARK_BASE_URL`, `WANJIE_BASE_URL`, `WANJIE_MAAS_BASE_URL`; default `https://maas-openapi.wanjiedata.com/api/v1` | `deepseek-reasoner` | OpenAI-compatible hosted route. `WANJIE_ARK_MODEL`, `WANJIE_MODEL`, and `WANJIE_MAAS_MODEL` are accepted. |
 | `volcengine` | `[providers.volcengine]` | `VOLCENGINE_API_KEY`, `VOLCENGINE_ARK_API_KEY`, `ARK_API_KEY` | `VOLCENGINE_BASE_URL`, `VOLCENGINE_ARK_BASE_URL`, `ARK_BASE_URL`; default `https://ark.cn-beijing.volces.com/api/coding/v3` | `DeepSeek-V4-Pro`, `DeepSeek-V4-Flash` | Volcengine/Volcano Engine Ark OpenAI-compatible coding endpoint. `VOLCENGINE_MODEL` and `VOLCENGINE_ARK_MODEL` are accepted. |
 | `openrouter` | `[providers.openrouter]` | `OPENROUTER_API_KEY` | `OPENROUTER_BASE_URL`; default `https://openrouter.ai/api/v1` | `deepseek/deepseek-v4-pro`, `deepseek/deepseek-v4-flash`; recent large IDs include `arcee-ai/trinity-large-thinking`, `minimax/minimax-m3`, `xiaomi/mimo-v2.5-pro`, `qwen/qwen3.6-flash`, `qwen/qwen3.6-35b-a3b`, `qwen/qwen3.6-max-preview`, `qwen/qwen3.6-27b`, `qwen/qwen3.6-plus`, `google/gemma-4-31b-it`, `z-ai/glm-5.1`, `z-ai/glm-5.2`, `moonshotai/kimi-k2.7-code`, `moonshotai/kimi-k2.6` | Additive open-model routing layer. It does not replace DeepSeek; it lets users route supported model IDs through OpenRouter when they choose it. |
-| `xiaomi-mimo` | `[providers.xiaomi_mimo]` | `XIAOMI_MIMO_TOKEN_PLAN_API_KEY`, `MIMO_TOKEN_PLAN_API_KEY`, `XIAOMI_MIMO_API_KEY`, `XIAOMI_API_KEY`, `MIMO_API_KEY` | `XIAOMI_MIMO_BASE_URL`, `MIMO_BASE_URL`, `XIAOMI_MIMO_MODE`, `MIMO_MODE`; default `https://token-plan-sgp.xiaomimimo.com/v1` | Chat: `mimo-v2.5-pro`, `mimo-v2.5`; speech/TTS: `mimo-v2.5-tts`, `mimo-v2.5-tts-voicedesign`, `mimo-v2.5-tts-voiceclone`, `mimo-v2-tts` | Xiaomi MiMo OpenAI-compatible chat completions route. Token Plan keys (`tp-...`) use `api-key` auth and the token-plan endpoint by default; pay-as-you-go mode uses standard API keys (`sk-...`) and `https://api.xiaomimimo.com/v1`. It sends `max_completion_tokens` and uses MiMo's `thinking` field for reasoning control. `codewhale speech` / `tts` uses the TTS models. |
+| `xiaomi-mimo` | `[providers.xiaomi_mimo]` | `XIAOMI_MIMO_TOKEN_PLAN_API_KEY`, `MIMO_TOKEN_PLAN_API_KEY`, `XIAOMI_MIMO_API_KEY`, `XIAOMI_API_KEY`, `MIMO_API_KEY` | `XIAOMI_MIMO_BASE_URL`, `MIMO_BASE_URL`, `XIAOMI_MIMO_MODE`, `MIMO_MODE`; default `https://token-plan-sgp.xiaomimimo.com/v1` | Chat: `mimo-v2.5-pro`, `mimo-v2.5-pro-ultraspeed`, `mimo-v2.5`; speech/TTS: `mimo-v2.5-tts`, `mimo-v2.5-tts-voicedesign`, `mimo-v2.5-tts-voiceclone`, `mimo-v2-tts` | Xiaomi MiMo OpenAI-compatible chat completions route. Token Plan keys (`tp-...`) use `api-key` auth and the token-plan endpoint by default; pay-as-you-go mode uses standard API keys (`sk-...`) and `https://api.xiaomimimo.com/v1`. It sends `max_completion_tokens` and uses MiMo's `thinking` field for reasoning control. Token Plan cost/usage is credit/quota based; CodeWhale shows it as unknown until Xiaomi exposes a reliable balance API. `codewhale speech` / `tts` uses the TTS models. |
 | `novita` | `[providers.novita]` | `NOVITA_API_KEY` | `NOVITA_BASE_URL`; default `https://api.novita.ai/openai/v1` | `deepseek/deepseek-v4-pro`, `deepseek/deepseek-v4-flash` | OpenAI-compatible hosted route for DeepSeek model IDs. Use config or `CODEWHALE_MODEL` / `DEEPSEEK_MODEL` for model overrides. |
 | `fireworks` | `[providers.fireworks]` | `FIREWORKS_API_KEY` | `FIREWORKS_BASE_URL`; default `https://api.fireworks.ai/inference/v1` | `accounts/fireworks/models/deepseek-v4-pro` | OpenAI-compatible hosted route. Use config or `CODEWHALE_MODEL` / `DEEPSEEK_MODEL` for model overrides. |
 | `siliconflow` | `[providers.siliconflow]` | `SILICONFLOW_API_KEY` | `SILICONFLOW_BASE_URL`; default `https://api.siliconflow.com/v1` | `deepseek-ai/DeepSeek-V4-Pro`, `deepseek-ai/DeepSeek-V4-Flash` | OpenAI-compatible hosted route. Official docs use the `.com` endpoint. `SILICONFLOW_MODEL` is accepted. Reasoning aliases `deepseek-reasoner` and `deepseek-r1` map to Pro; `deepseek-chat` and `deepseek-v3` map to Flash. |
@@ -171,8 +202,9 @@ upload to Hugging Face and does not perform direct Hugging Face Hub HTTP search.
 ### Xiaomi MiMo Notes
 
 `xiaomi-mimo` defaults to `mimo-v2.5-pro` for long-context reasoning and coding
-work. The chat picker also exposes the latest Omni model `mimo-v2.5`. Xiaomi MiMo
-TTS is available through `codewhale --provider xiaomi-mimo speech "text"
+work. The chat picker also exposes `mimo-v2.5-pro-ultraspeed` and the latest
+Omni model `mimo-v2.5`. Xiaomi MiMo TTS is available through
+`codewhale --provider xiaomi-mimo speech "text"
 --model tts` (or the `tts` alias) plus model-visible `speech` / `tts` tools in
 Agent/YOLO mode.
 
@@ -181,7 +213,13 @@ Token Plan keys default to the Singapore endpoint
 for the China region, set `base_url = "https://token-plan-cn.xiaomimimo.com/v1"`
 explicitly in `[providers.xiaomi_mimo]` or set `mode = "token-plan-cn"`. Europe
 Token Plan accounts can use `mode = "token-plan-ams"`; `mode = "pay-as-you-go"`
-selects the standard API endpoint and standard MiMo key family.
+selects the standard API endpoint and standard MiMo key family. Xiaomi Token
+Plan docs and console expose credit/quota semantics, but CodeWhale does not
+currently have a documented balance endpoint to poll, so cost display remains
+unknown rather than reusing token-price estimates from another provider.
+Evidence captured from Xiaomi's official docs on 2026-06-23 lives in
+[`docs/evidence/xiaomi-mimo-2026-06-23/`](evidence/xiaomi-mimo-2026-06-23/);
+those notes override the secondary workbook snapshot where they disagree.
 
 Voice-design and voice-clone shorthands map to `mimo-v2.5-tts-voicedesign` and
 `mimo-v2.5-tts-voiceclone`. Xiaomi's current
@@ -224,7 +262,7 @@ endpoint when the endpoint supports model listing.
 | `wanjie-ark` | `deepseek-reasoner` | yes | yes |
 | `volcengine` | `DeepSeek-V4-Pro`, `DeepSeek-V4-Flash` | yes | yes |
 | `openrouter` | `deepseek/deepseek-v4-pro`, `deepseek/deepseek-v4-flash`, `arcee-ai/trinity-large-thinking`, `minimax/minimax-m3`, `minimax/minimax-2.7`, `xiaomi/mimo-v2.5-pro`, `xiaomi/mimo-v2.5`, `qwen/qwen3.6-flash`, `qwen/qwen3.6-35b-a3b`, `qwen/qwen3.6-max-preview`, `qwen/qwen3.6-27b`, `qwen/qwen3.6-plus`, `qwen/qwen3.7-max`, `moonshotai/kimi-k2.7-code`, `moonshotai/kimi-k2.6`, `z-ai/glm-5.1`, `z-ai/glm-5.2`, `z-ai/glm-5-turbo`, `tencent/hy3-preview`, `google/gemma-4-31b-it`, `google/gemma-4-26b-a4b-it`, `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free`, `nvidia/nemotron-3-ultra-550b-a55b` | yes | yes |
-| `xiaomi-mimo` | `mimo-v2.5-pro`, `mimo-v2.5`; speech/TTS IDs are selected through `codewhale speech` / `tts` | yes | yes for chat models; no for speech/TTS models |
+| `xiaomi-mimo` | `mimo-v2.5-pro`, `mimo-v2.5-pro-ultraspeed`, `mimo-v2.5`; speech/TTS IDs are selected through `codewhale speech` / `tts` | yes | yes for chat models; no for speech/TTS models |
 | `novita` | `deepseek/deepseek-v4-pro`, `deepseek/deepseek-v4-flash` | yes | yes |
 | `fireworks` | `accounts/fireworks/models/deepseek-v4-pro` | yes | yes |
 | `siliconflow` | `deepseek-ai/DeepSeek-V4-Pro`, `deepseek-ai/DeepSeek-V4-Flash` | yes | yes |
@@ -265,7 +303,7 @@ Anthropic uses Messages, and `openai-codex` uses Responses.
 | NVIDIA NIM V4 registry models | 1,000,000 | 384,000 | yes | yes | not documented in code |
 | Volcengine Ark V4 model IDs | 1,000,000 | 384,000 | yes | yes | not documented in code |
 | OpenRouter, Novita, Fireworks, SiliconFlow, SGLang, and vLLM V4 model IDs | 1,000,000 | 384,000 | yes | no | not documented in code |
-| Xiaomi MiMo `mimo-v2.5-pro`, `mimo-v2.5` | 1,000,000 | 131,072 | yes | no | not documented in code |
+| Xiaomi MiMo `mimo-v2.5-pro`, `mimo-v2.5-pro-ultraspeed`, `mimo-v2.5` | 1,000,000 | 131,072 | yes | no | not documented in code |
 | OpenRouter Qwen 3.6 Flash / Plus | 1,000,000 | 65,536 | yes | no | not documented in code |
 | OpenRouter Qwen 3.6 35B / 27B | 262,144 | 262,140 | yes | no | not documented in code |
 | OpenRouter Qwen 3.6 Max Preview | 262,144 | 65,536 | yes | no | not documented in code |

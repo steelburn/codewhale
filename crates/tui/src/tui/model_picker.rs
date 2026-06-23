@@ -1044,7 +1044,7 @@ mod tests {
         let view = ModelPickerView::new(&app);
         let model_ids = view.visible_model_ids();
 
-        for expected in ["mimo-v2.5-pro", "mimo-v2.5"] {
+        for expected in ["mimo-v2.5-pro", "mimo-v2.5-pro-ultraspeed", "mimo-v2.5"] {
             assert!(model_ids.contains(&expected), "missing {expected}");
         }
         for deprecated in ["mimo-v2-pro", "mimo-v2-omni", "mimo-v2-flash"] {

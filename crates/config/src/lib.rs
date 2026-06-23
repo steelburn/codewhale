@@ -62,6 +62,7 @@ const OPENROUTER_TENCENT_HY3_PREVIEW_MODEL: &str = "tencent/hy3-preview";
 const OPENROUTER_XIAOMI_MIMO_V2_5_PRO_MODEL: &str = "xiaomi/mimo-v2.5-pro";
 const OPENROUTER_XIAOMI_MIMO_V2_5_MODEL: &str = "xiaomi/mimo-v2.5";
 const DEFAULT_XIAOMI_MIMO_MODEL: &str = "mimo-v2.5-pro";
+const XIAOMI_MIMO_V2_5_PRO_ULTRASPEED_MODEL: &str = "mimo-v2.5-pro-ultraspeed";
 const XIAOMI_MIMO_V2_5_OMNI_MODEL: &str = "mimo-v2.5";
 const XIAOMI_MIMO_ASR_MODEL: &str = "mimo-v2.5-asr";
 const XIAOMI_MIMO_TTS_MODEL: &str = "mimo-v2.5-tts";
@@ -2338,6 +2339,12 @@ fn canonical_xiaomi_mimo_model_id(model: &str) -> Option<&'static str> {
         | "mimo-v2-5-pro"
         | "xiaomi-mimo-v2.5-pro"
         | "xiaomi-mimo-v2-5-pro" => Some(DEFAULT_XIAOMI_MIMO_MODEL),
+        XIAOMI_MIMO_V2_5_PRO_ULTRASPEED_MODEL
+        | "mimo-v2-5-pro-ultraspeed"
+        | "xiaomi-mimo-v2.5-pro-ultraspeed"
+        | "xiaomi-mimo-v2-5-pro-ultraspeed"
+        | "ultraspeed"
+        | "pro-ultraspeed" => Some(XIAOMI_MIMO_V2_5_PRO_ULTRASPEED_MODEL),
         "omni"
         | "mimo-omni"
         | "v2.5-omni"

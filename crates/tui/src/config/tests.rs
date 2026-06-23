@@ -99,6 +99,7 @@ fn missing_provider_api_key_message_uses_provider_metadata() -> Result<()> {
     let message = missing_provider_api_key_message(ApiProvider::Zai)?;
 
     assert!(message.contains("Z.ai (GLM Coding) API key not found"));
+    assert!(message.contains("https://z.ai/model-api"));
     assert!(message.contains("ZAI_API_KEY / Z_AI_API_KEY"));
     assert!(message.contains("[providers.zai] api_key"));
 
@@ -6081,6 +6082,12 @@ fn provider_capability_xiaomi_mimo_has_thinking_no_cache() {
         cap.request_payload_mode,
         RequestPayloadMode::ChatCompletions
     );
+
+    let omni = provider_capability(ApiProvider::XiaomiMimo, XIAOMI_MIMO_V2_5_OMNI_MODEL);
+    assert_eq!(omni.context_window, 1_000_000);
+    assert_eq!(omni.max_output, 131_072);
+    assert!(omni.thinking_supported);
+    assert!(!omni.cache_telemetry_supported);
 }
 
 #[test]
@@ -6445,6 +6452,7 @@ fn huggingface_missing_key_error_mentions_env_fallbacks() -> Result<()> {
     let err = config.deepseek_api_key().expect_err("missing key");
     let message = err.to_string();
     assert!(message.contains("Hugging Face API key not found"));
+    assert!(message.contains("https://huggingface.co/settings/tokens"));
     assert!(message.contains("HUGGINGFACE_API_KEY"));
     assert!(message.contains("HF_TOKEN"));
     Ok(())

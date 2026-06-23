@@ -93,6 +93,24 @@
       "modalities": ["text", "image", "audio"],
       "supported_parameters": [],
       "provenance": "bundled"
+    },
+    "mimo-v2.5-pro-ultraspeed": {
+      "id": "mimo-v2.5-pro-ultraspeed",
+      "context_window": 1000000,
+      "max_output": 131072,
+      "supports_reasoning": true,
+      "modalities": ["text"],
+      "supported_parameters": [],
+      "provenance": "bundled"
+    },
+    "mimo-v2.5": {
+      "id": "mimo-v2.5",
+      "context_window": 1000000,
+      "max_output": 131072,
+      "supports_reasoning": true,
+      "modalities": ["text", "image"],
+      "supported_parameters": [],
+      "provenance": "bundled"
     }
   }
 }
