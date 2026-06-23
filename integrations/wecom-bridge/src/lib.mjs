@@ -1,31 +1,36 @@
 import { readFile, writeFile, mkdir, rename, chmod } from "node:fs/promises";
 import path from "node:path";
 
-export function parseList(raw) {
-  return String(raw || "")
-    .split(",")
-    .map((item) => item.trim())
-    .filter(Boolean);
-}
+import {
+  activeTurnBlock,
+  cleanEnvValue,
+  commandAction as coreCommandAction,
+  compactRuntimeError,
+  isPlaceholderValue,
+  latestRunningTurn,
+  parseApprovalDecisionArgs,
+  parseBool,
+  parseCommand,
+  parseList,
+  parseTextContent as coreParseTextContent,
+  preservedChatStateFields,
+  splitMessage,
+  stripGroupPrefix as coreStripGroupPrefix
+} from "../../bridge-core/src/lib.mjs";
 
-export function parseBool(raw, fallback = false) {
-  if (raw == null || raw === "") return fallback;
-  return ["1", "true", "yes", "on"].includes(String(raw).trim().toLowerCase());
-}
-
-export function cleanEnvValue(value) {
-  return String(value ?? "").trim();
-}
-
-export function isPlaceholderValue(value) {
-  const normalized = cleanEnvValue(value).toLowerCase();
-  return (
-    !normalized ||
-    normalized.includes("replace-with") ||
-    normalized.includes("xxxxxxxx") ||
-    normalized === "changeme"
-  );
-}
+export {
+  activeTurnBlock,
+  cleanEnvValue,
+  compactRuntimeError,
+  isPlaceholderValue,
+  latestRunningTurn,
+  parseApprovalDecisionArgs,
+  parseBool,
+  parseCommand,
+  parseList,
+  preservedChatStateFields,
+  splitMessage
+};
 
 export function requiredEnv(name) {
   const value = process.env[name];
@@ -36,14 +41,7 @@ export function requiredEnv(name) {
 }
 
 export function parseTextContent(content) {
-  if (typeof content !== "string") return "";
-  try {
-    const parsed = JSON.parse(content);
-    if (typeof parsed.text === "string") return parsed.text;
-  } catch {
-    return content;
-  }
-  return content;
+  return coreParseTextContent(content, ["text"]);
 }
 
 export function incomingIdentity(body) {
@@ -75,116 +73,16 @@ export function pairingRefusalText(identity) {
 }
 
 export function stripGroupPrefix(text, { chatType, requirePrefix, prefix }) {
-  const trimmed = String(text || "").trim();
-  if (!trimmed) return { accepted: false, text: "" };
-  if (!requirePrefix || chatType === "single") {
-    return { accepted: true, text: trimmed };
-  }
-  const marker = prefix || "/ds";
-  if (trimmed === marker) return { accepted: true, text: "/help" };
-  if (trimmed.startsWith(`${marker} `)) {
-    return { accepted: true, text: trimmed.slice(marker.length).trim() };
-  }
-  return { accepted: false, text: "" };
-}
-
-export function parseCommand(text) {
-  const trimmed = String(text || "").trim();
-  if (!trimmed.startsWith("/")) return { name: "prompt", args: trimmed };
-  const [head, ...rest] = trimmed.split(/\s+/);
-  return {
-    name: head.slice(1).toLowerCase(),
-    args: rest.join(" ").trim()
-  };
-}
-
-export function parseApprovalDecisionArgs(args) {
-  const parts = String(args || "")
-    .split(/\s+/)
-    .filter(Boolean);
-  return {
-    approvalId: parts[0] || "",
-    remember: parts.slice(1).includes("remember")
-  };
+  return coreStripGroupPrefix(text, {
+    chatType,
+    requirePrefix,
+    prefix: prefix || "/ds",
+    directChatTypes: ["single"]
+  });
 }
 
 export function commandAction(command) {
-  switch (command.name) {
-    case "help":
-      return { kind: "help" };
-    case "status":
-      return { kind: "status" };
-    case "threads":
-      return { kind: "threads" };
-    case "new":
-      return { kind: "new_thread" };
-    case "resume":
-      return { kind: "resume", threadId: command.args };
-    case "interrupt":
-      return { kind: "interrupt" };
-    case "compact":
-      return { kind: "compact" };
-    case "model":
-      return { kind: "set_model", modelName: command.args };
-    case "allow":
-      return { kind: "approval", decision: "allow", ...parseApprovalDecisionArgs(command.args) };
-    case "deny":
-      return { kind: "approval", decision: "deny", ...parseApprovalDecisionArgs(command.args) };
-    default:
-      return {
-        kind: "prompt",
-        prompt: `/${command.name}${command.args ? ` ${command.args}` : ""}`
-      };
-  }
-}
-
-export function preservedChatStateFields(state = {}) {
-  const preserved = {};
-  if (Object.prototype.hasOwnProperty.call(state || {}, "model")) {
-    preserved.model = state.model || null;
-  }
-  return preserved;
-}
-
-export function splitMessage(text, maxChars = 3500) {
-  const value = String(text || "");
-  const chars = Array.from(value);
-  if (chars.length <= maxChars) return value ? [value] : [];
-  const chunks = [];
-  let cursor = 0;
-  while (cursor < chars.length) {
-    chunks.push(chars.slice(cursor, cursor + maxChars).join(""));
-    cursor += maxChars;
-  }
-  return chunks;
-}
-
-export function compactRuntimeError(status, body) {
-  const message =
-    body?.error?.message ||
-    body?.message ||
-    (typeof body === "string" ? body : JSON.stringify(body));
-  return `Runtime API request failed (${status}): ${message}`;
-}
-
-export function latestRunningTurn(detail) {
-  const turns = Array.isArray(detail?.turns) ? detail.turns : [];
-  for (let index = turns.length - 1; index >= 0; index -= 1) {
-    const turn = turns[index];
-    if (["queued", "in_progress"].includes(turn?.status)) return turn;
-  }
-  return null;
-}
-
-export function activeTurnBlock(detail, state = {}) {
-  const runningTurn = latestRunningTurn(detail);
-  if (!runningTurn) return null;
-  return {
-    turnId: runningTurn.id || state.activeTurnId || "",
-    message: `Thread already has active turn ${
-      runningTurn.id || state.activeTurnId || "(unknown)"
-    }. Wait for it to finish or send /interrupt.`
-  };
+  return coreCommandAction(command);
 }
 
 export function helpText() {
