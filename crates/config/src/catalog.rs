@@ -252,6 +252,18 @@ impl CachedProviderCatalog {
     pub fn is_stale(&self, now_unix: u64) -> bool {
         self.age_secs(now_unix) >= self.ttl_secs
     }
+
+    /// Whether this entry may contribute live offerings at `now_unix`.
+    ///
+    /// An entry is fresh only when it is within its TTL **and** its last
+    /// recorded refresh succeeded. A `Failed` entry is never fresh even inside
+    /// its TTL window — its rows survive a failed refresh for explicit fallback
+    /// display via [`ProviderCatalogCache::get`], but they are not served as
+    /// current live data.
+    #[must_use]
+    pub fn is_fresh(&self, now_unix: u64) -> bool {
+        !self.is_stale(now_unix) && !matches!(self.status, CatalogStatus::Failed { .. })
+    }
 }
 
 /// A secret-free store of cached provider catalogs, keyed by provider + base-URL
@@ -398,7 +410,7 @@ impl ProviderCatalogCache {
         now_unix: u64,
     ) -> Vec<CatalogOffering> {
         match self.get(provider, base_url_fingerprint) {
-            Some(entry) if !entry.is_stale(now_unix) => entry.offerings.clone(),
+            Some(entry) if entry.is_fresh(now_unix) => entry.offerings.clone(),
             _ => Vec::new(),
         }
     }
@@ -408,7 +420,7 @@ impl ProviderCatalogCache {
     pub fn all_fresh_offerings(&self, now_unix: u64) -> Vec<CatalogOffering> {
         self.entries
             .values()
-            .filter(|entry| !entry.is_stale(now_unix))
+            .filter(|entry| entry.is_fresh(now_unix))
             .flat_map(|entry| entry.offerings.clone())
             .collect()
     }
@@ -524,17 +536,24 @@ fn normalize_base_url(base_url: &str) -> String {
     // Lowercase only the scheme://host authority; leave the path case-sensitive.
     if let Some(idx) = trimmed.find("://") {
         let (scheme, rest) = trimmed.split_at(idx);
+        let scheme = scheme.to_ascii_lowercase();
         let rest = &rest[3..];
         let (authority, path) = match rest.find('/') {
             Some(p) => (&rest[..p], &rest[p..]),
             None => (rest, ""),
         };
         let authority = authority.to_ascii_lowercase();
-        let authority = authority
-            .strip_suffix(":443")
-            .or_else(|| authority.strip_suffix(":80"))
+        // Strip only the scheme's own default port, so a non-default pairing
+        // such as `http://host:443` stays distinct from `http://host`.
+        let default_port = match scheme.as_str() {
+            "https" => Some(":443"),
+            "http" => Some(":80"),
+            _ => None,
+        };
+        let authority = default_port
+            .and_then(|port| authority.strip_suffix(port))
             .unwrap_or(&authority);
-        format!("{}://{}{}", scheme.to_ascii_lowercase(), authority, path)
+        format!("{scheme}://{authority}{path}")
     } else {
         trimmed.to_ascii_lowercase()
     }

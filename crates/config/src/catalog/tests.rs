@@ -253,6 +253,19 @@ fn fingerprint_folds_cosmetic_base_url_differences() {
         canonical,
         base_url_fingerprint("https://api.example.com/V1")
     );
+
+    // Port stripping is scheme-aware: :80 is http's default (folds away), but
+    // :443 on http is a non-default port and must stay distinct from bare http.
+    assert_eq!(
+        base_url_fingerprint("http://h.example.com:80/v1"),
+        base_url_fingerprint("http://h.example.com/v1"),
+        "http default port :80 must fold away"
+    );
+    assert_ne!(
+        base_url_fingerprint("http://h.example.com:443/v1"),
+        base_url_fingerprint("http://h.example.com/v1"),
+        ":443 is not http's default port and must not fold"
+    );
 }
 
 #[test]
@@ -347,6 +360,18 @@ fn refresh_failure_preserves_prior_rows_and_marks_failed() {
         assert_eq!(entry.status, CatalogStatus::Failed { reason });
         // fetched_at is NOT bumped by a failure.
         assert_eq!(entry.fetched_at, 1_000);
+        // ...but a Failed entry must NOT contribute to fresh offerings even
+        // while still within its TTL window (now=1_100, ttl=3_600). The rows
+        // are reachable only via get() for explicit fallback display.
+        assert!(
+            cache.fresh_offerings("acme", &fp, 1_100).is_empty(),
+            "{reason:?}: failed entry served fresh offerings within TTL"
+        );
+        assert!(cache.all_fresh_offerings(1_100).is_empty());
+        assert_eq!(
+            cache.status("acme", &fp, 1_100),
+            CatalogStatus::Failed { reason }
+        );
     }
 }
 
