@@ -11,9 +11,11 @@
 - `codewhale serve --http` 绑定于 `127.0.0.1`。
 - `/v1/*` runtime 调用使用 `CODEWHALE_RUNTIME_TOKEN`。
 - 企业微信用户必须加入白名单（`WECOM_CHAT_ALLOWLIST`），除非首次配对时设置 `WECOM_ALLOW_UNLISTED=true`。
-- 支持私聊和群聊（群聊需要前缀 `/ds`）。
+- 支持私聊和群聊（群聊需要前缀 `/cw`）。
 - 工具审批通过文本命令：`/allow <approval_id>` 或 `/deny <approval_id>`。
 - 长连接模式无需公网端口。
+- 企业微信只会看到 bridge 发送的提示、状态、线程摘要和审批消息；工作区、shell 和 runtime HTTP
+  监听仍留在本机，并由 `CODEWHALE_RUNTIME_TOKEN` 保护。
 
 ## 前提
 
@@ -49,7 +51,7 @@ node src/index.mjs
 | `/allow <approval_id> [remember]` | 批准待处理的工具调用 |
 | `/deny <approval_id>` | 拒绝待处理的工具调用 |
 
-其他所有内容均作为 CodeWhale 提示发送。群聊中需要在消息前加 `/ds` 前缀。
+其他所有内容均作为 CodeWhale 提示发送。群聊中需要在消息前加 `/cw` 前缀。
 
 ## 首次配对
 
