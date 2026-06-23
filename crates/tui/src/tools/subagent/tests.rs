@@ -3598,6 +3598,7 @@ fn stub_runtime() -> SubAgentRuntime {
         fork_context: None,
         mcp_pool: None,
         step_api_timeout: DEFAULT_STEP_API_TIMEOUT,
+        tool_timeout: DEFAULT_TOOL_TIMEOUT,
         speech_output_dir: None,
         todos: crate::tools::todo::new_shared_todo_list(),
     }
@@ -4204,6 +4205,21 @@ fn subagent_runtime_default_step_api_timeout_is_legacy_120s() {
 fn with_step_api_timeout_overrides_runtime_field() {
     let runtime = stub_runtime().with_step_api_timeout(std::time::Duration::from_secs(900));
     assert_eq!(runtime.step_api_timeout.as_secs(), 900);
+}
+
+#[test]
+fn tool_timeout_defaults_to_generous_budget_and_survives_spawn() {
+    // Track A raised the per-tool timeout from the old 30s (which killed long
+    // but legitimate tool runs) to a generous default, and that budget must
+    // survive the child/background spawn clone rather than reverting.
+    let parent = stub_runtime();
+    assert!(
+        parent.tool_timeout.as_secs() >= 300,
+        "per-tool timeout must be a generous (>=300s) budget, not the old 30s"
+    );
+    let expected = parent.tool_timeout;
+    assert_eq!(parent.child_runtime().tool_timeout, expected);
+    assert_eq!(parent.background_runtime().tool_timeout, expected);
 }
 
 #[test]

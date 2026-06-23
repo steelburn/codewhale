@@ -9,36 +9,6 @@ use super::*;
 use crate::core::ops::UserInputProvenance;
 use crate::prompt_zones::PinnedPrefix;
 
-fn loop_guard_block_tool_result(
-    tool_name: &str,
-    message: String,
-    kind: AttemptBlockKind,
-) -> ToolResult {
-    if loop_guard_block_is_guidance(tool_name) {
-        return ToolResult::success(message).with_metadata(json!({
-            "loop_guard": kind.as_str(),
-            "loop_guard_guidance": true,
-            "executed": false,
-        }));
-    }
-
-    ToolResult::error(message).with_metadata(json!({"loop_guard": kind.as_str()}))
-}
-
-fn loop_guard_block_is_guidance(tool_name: &str) -> bool {
-    let normalized = tool_name.to_ascii_lowercase();
-    matches!(
-        normalized.as_str(),
-        "grep_files"
-            | "file_search"
-            | "list_dir"
-            | "web_search"
-            | "fetch_url"
-            | "tool_search_tool_regex"
-            | "tool_search_tool_bm25"
-    ) || normalized.contains("search")
-}
-
 const MAX_APPROVAL_INTENT_SUMMARY_CHARS: usize = 2_000;
 
 fn approval_intent_summary(text: &str) -> Option<String> {
@@ -169,7 +139,6 @@ impl Engine {
             }
         }
         let mut active_tool_names = initial_active_tools(&tool_catalog);
-        let mut loop_guard = LoopGuard::default();
         let mut goal_continuations_this_turn = 0u32;
 
         // Outer stream-retry counter: when the chunked-transfer connection
@@ -1690,15 +1659,6 @@ impl Engine {
                     guard_result = Some(result);
                 }
 
-                if blocked_error.is_none()
-                    && guard_result.is_none()
-                    && let AttemptDecision::Block { kind, message } =
-                        loop_guard.record_attempt(&tool_name, &tool_input, read_only)
-                {
-                    crate::logging::warn(message.clone());
-                    guard_result = Some(loop_guard_block_tool_result(&tool_name, message, kind));
-                }
-
                 plans.push(ToolExecutionPlan {
                     index,
                     id: tool_id,
@@ -2243,7 +2203,6 @@ impl Engine {
             // denial that should not.
             let mut step_error_categories: Vec<ErrorCategory> = Vec::new();
             let mut stop_after_plan_tool = false;
-            let mut loop_guard_halt: Option<String> = None;
 
             for outcome in outcomes.into_iter().flatten() {
                 let tool_input = outcome.input.clone();
@@ -2253,16 +2212,6 @@ impl Engine {
 
                 match outcome.result {
                     Ok(output) => {
-                        match loop_guard.record_outcome(&outcome.name, output.success) {
-                            OutcomeDecision::Continue => {}
-                            OutcomeDecision::Warn(message) => {
-                                crate::logging::warn(message.clone());
-                                let _ = self.tx_event.send(Event::status(message)).await;
-                            }
-                            OutcomeDecision::Halt(message) => {
-                                loop_guard_halt.get_or_insert(message);
-                            }
-                        }
                         emit_tool_audit(json!({
                             "event": "tool.result",
                             "tool_id": outcome.id.clone(),
@@ -2317,16 +2266,6 @@ impl Engine {
                         .await;
                     }
                     Err(e) => {
-                        match loop_guard.record_outcome(&outcome.name, false) {
-                            OutcomeDecision::Continue => {}
-                            OutcomeDecision::Warn(message) => {
-                                crate::logging::warn(message.clone());
-                                let _ = self.tx_event.send(Event::status(message)).await;
-                            }
-                            OutcomeDecision::Halt(message) => {
-                                loop_guard_halt.get_or_insert(message);
-                            }
-                        }
                         let envelope: ErrorEnvelope = e.clone().into();
                         emit_tool_audit(json!({
                             "event": "tool.result",
@@ -2364,14 +2303,6 @@ impl Engine {
             }
 
             if stop_after_plan_tool {
-                break;
-            }
-
-            if let Some(message) = loop_guard_halt {
-                crate::logging::warn(message.clone());
-                let _ = self.tx_event.send(Event::status(message.clone())).await;
-                // 设置 turn_error 以确保最终返回 TurnOutcomeStatus::Failed 而非 Completed
-                turn_error = Some(message);
                 break;
             }
 
@@ -3114,57 +3045,6 @@ mod tests {
         assert!(
             current_tool_indices.is_empty(),
             "all entries must drain after their Stops"
-        );
-    }
-
-    #[test]
-    fn loop_guard_block_tool_result_counts_as_failure() {
-        let result = loop_guard_block_tool_result(
-            "edit_file",
-            "Blocked: repeated call".to_string(),
-            AttemptBlockKind::IdenticalToolCall,
-        );
-
-        assert!(
-            !result.success,
-            "LoopGuard blocks must count as tool failures so repeated blocked calls can trip halt handling"
-        );
-        assert_eq!(
-            result
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("loop_guard"))
-                .and_then(|v| v.as_str()),
-            Some("identical_tool_call")
-        );
-    }
-
-    #[test]
-    fn loop_guard_search_block_tool_result_is_guidance() {
-        let result = loop_guard_block_tool_result(
-            "grep_files",
-            "Stop calling `grep_files`; use current evidence.".to_string(),
-            AttemptBlockKind::NoProgressToolLoop,
-        );
-
-        assert!(
-            result.success,
-            "read-only search loop blocks should guide the model without feeding the failure loop"
-        );
-        let metadata = result.metadata.as_ref().expect("metadata");
-        assert_eq!(
-            metadata.get("loop_guard").and_then(|v| v.as_str()),
-            Some("no_progress_tool_loop")
-        );
-        assert_eq!(
-            metadata
-                .get("loop_guard_guidance")
-                .and_then(|v| v.as_bool()),
-            Some(true)
-        );
-        assert_eq!(
-            metadata.get("executed").and_then(|v| v.as_bool()),
-            Some(false)
         );
     }
 
