@@ -28,11 +28,15 @@ use ratatui::{
 
 use crate::config::{ApiProvider, Config, has_api_key_for, kimi_cli_credentials_present};
 use crate::palette;
+use crate::tui::app::ReasoningEffort;
 use crate::tui::views::{ModalKind, ModalView, ViewAction, ViewEvent};
+use codewhale_config::catalog::{CatalogOffering, CatalogSnapshot, CatalogSource};
 use codewhale_config::provider::WireFormat;
 use codewhale_config::route::{
     LogicalModelRef, PricingSku, RequestProtocol, RouteRequest, RouteResolver, bundled_offerings,
 };
+use serde_json::Value;
+use std::sync::OnceLock;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Stage {
@@ -60,6 +64,7 @@ pub struct ProviderDashboardRow {
     pub available_model_count: usize,
     pub default_route: ProviderDefaultRoute,
     pub usage_meter: String,
+    pub reasoning: ProviderReasoningSummary,
     pub readiness: ProviderReadiness,
     pub messages: Vec<String>,
     pub is_active: bool,
@@ -99,6 +104,30 @@ pub enum ProviderReadiness {
     Invalid,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderReasoningSummary {
+    pub support: ProviderReasoningSupport,
+    pub controls: Vec<String>,
+    pub stream_visibility: ProviderReasoningStreamVisibility,
+    pub selected_control: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderReasoningSupport {
+    Supported,
+    Unsupported,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderReasoningStreamVisibility {
+    StructuredThinking,
+    InlineTags,
+    SummaryOnly,
+    NotExposed,
+    Unknown,
+}
+
 impl ProviderDashboardRow {
     fn from_config(provider: ApiProvider, active: ApiProvider, config: &Config) -> Self {
         let has_key = has_api_key_for(config, provider);
@@ -134,6 +163,7 @@ impl ProviderDashboardRow {
                     wire_model: "legacy alias".to_string(),
                 },
                 usage_meter,
+                reasoning: ProviderReasoningSummary::unknown(provider, config),
                 readiness: ProviderReadiness::Legacy,
                 messages: vec![
                     "legacy DeepSeek China alias; routing maps through DeepSeek compatibility"
@@ -212,6 +242,7 @@ impl ProviderDashboardRow {
         }
 
         let readiness = readiness_for(provider, auth_status, route_ok);
+        let reasoning = ProviderReasoningSummary::for_route(provider, &default_route, config);
 
         Self {
             provider,
@@ -225,6 +256,7 @@ impl ProviderDashboardRow {
             available_model_count,
             default_route,
             usage_meter: resolved_pricing,
+            reasoning,
             readiness,
             messages,
             is_active: provider == active,
@@ -234,7 +266,7 @@ impl ProviderDashboardRow {
 
     fn compact_hint(&self) -> String {
         format!(
-            "{} | auth:{} | {} | {} | base:{} | route:{}{} | catalog:{}",
+            "{} | auth:{} | {} | {} | base:{} | route:{}{} | {} | catalog:{}",
             self.readiness.label(),
             self.auth_status.label(),
             self.usage_meter,
@@ -242,6 +274,7 @@ impl ProviderDashboardRow {
             compact_base_url(&self.base_url),
             self.default_route.logical_model,
             route_wire_suffix(&self.default_route),
+            self.reasoning.label(),
             self.catalog_label()
         )
     }
@@ -251,6 +284,82 @@ impl ProviderDashboardRow {
             ProviderCatalogStatus::Bundled => format!("{} bundled", self.available_model_count),
             ProviderCatalogStatus::DefaultOnly => "default-only".to_string(),
             ProviderCatalogStatus::Legacy => "legacy".to_string(),
+        }
+    }
+}
+
+impl ProviderReasoningSummary {
+    fn for_route(provider: ApiProvider, route: &ProviderDefaultRoute, config: &Config) -> Self {
+        if provider == ApiProvider::OpenaiCodex {
+            return Self {
+                support: ProviderReasoningSupport::Supported,
+                controls: codex_reasoning_controls(),
+                stream_visibility: ProviderReasoningStreamVisibility::StructuredThinking,
+                selected_control: selected_reasoning_control(provider, config),
+            };
+        }
+
+        if let Some(offering) = reasoning_catalog_offering(provider, route) {
+            let support = match offering.reasoning {
+                Some(true) => ProviderReasoningSupport::Supported,
+                Some(false) => ProviderReasoningSupport::Unsupported,
+                None => ProviderReasoningSupport::Unknown,
+            };
+            let controls = reasoning_controls_from_options(&offering.reasoning_options);
+            return Self {
+                support,
+                controls,
+                stream_visibility: configured_or_default_stream_visibility(
+                    provider, config, support,
+                ),
+                selected_control: selected_reasoning_control(provider, config),
+            };
+        }
+
+        Self::unknown(provider, config)
+    }
+
+    fn unknown(provider: ApiProvider, config: &Config) -> Self {
+        Self {
+            support: ProviderReasoningSupport::Unknown,
+            controls: Vec::new(),
+            stream_visibility: configured_or_default_stream_visibility(
+                provider,
+                config,
+                ProviderReasoningSupport::Unknown,
+            ),
+            selected_control: selected_reasoning_control(provider, config),
+        }
+    }
+
+    fn label(&self) -> String {
+        let support = match self.support {
+            ProviderReasoningSupport::Supported if !self.controls.is_empty() => {
+                format!("reasoning:{}", self.controls.join("/"))
+            }
+            ProviderReasoningSupport::Supported => "reasoning:yes".to_string(),
+            ProviderReasoningSupport::Unsupported => "reasoning:no".to_string(),
+            ProviderReasoningSupport::Unknown => "reasoning:unknown".to_string(),
+        };
+        let mut parts = vec![
+            support,
+            format!("stream:{}", self.stream_visibility.label()),
+        ];
+        if let Some(selected) = &self.selected_control {
+            parts.push(format!("ctrl:{selected}"));
+        }
+        parts.join(" ")
+    }
+}
+
+impl ProviderReasoningStreamVisibility {
+    fn label(self) -> &'static str {
+        match self {
+            Self::StructuredThinking => "structured",
+            Self::InlineTags => "inline-tags",
+            Self::SummaryOnly => "summary-only",
+            Self::NotExposed => "not-exposed",
+            Self::Unknown => "unknown",
         }
     }
 }
@@ -278,6 +387,159 @@ impl ProviderReadiness {
             Self::Legacy => "legacy",
             Self::Invalid => "invalid",
         }
+    }
+}
+
+fn reasoning_catalog_offering(
+    provider: ApiProvider,
+    route: &ProviderDefaultRoute,
+) -> Option<&'static CatalogOffering> {
+    let provider_id = provider.kind()?.as_str();
+    bundled_reasoning_catalog()
+        .offerings
+        .iter()
+        .find(|offering| {
+            offering.provider == provider_id
+                && offering
+                    .wire_model_id
+                    .eq_ignore_ascii_case(&route.wire_model)
+        })
+}
+
+fn bundled_reasoning_catalog() -> &'static CatalogSnapshot {
+    static CATALOG: OnceLock<CatalogSnapshot> = OnceLock::new();
+    CATALOG.get_or_init(|| CatalogSnapshot {
+        // Keep these rows in catalog shape and exact provider+wire scope; the
+        // full Models.dev snapshot can replace this seed without changing the
+        // TUI projection contract.
+        offerings: vec![CatalogOffering {
+            provider: "zai".to_string(),
+            wire_model_id: "glm-5.2".to_string(),
+            canonical_model: Some("zhipuai/glm-5.2".to_string()),
+            endpoint_key: "chat".to_string(),
+            default_for_provider: true,
+            family: Some("glm".to_string()),
+            limit: None,
+            cost: None,
+            reasoning: Some(true),
+            reasoning_options: vec![serde_json::json!({
+                "type": "effort",
+                "values": ["high", "max"],
+            })],
+            source: CatalogSource::Bundled,
+        }],
+    })
+}
+
+fn codex_reasoning_controls() -> Vec<String> {
+    [
+        ReasoningEffort::Low,
+        ReasoningEffort::Medium,
+        ReasoningEffort::High,
+        ReasoningEffort::Max,
+    ]
+    .iter()
+    .map(|effort| {
+        effort
+            .display_label_for_provider(ApiProvider::OpenaiCodex)
+            .to_string()
+    })
+    .collect()
+}
+
+fn reasoning_controls_from_options(options: &[Value]) -> Vec<String> {
+    let mut controls = Vec::new();
+    for option in options {
+        collect_reasoning_controls(option, &mut controls);
+    }
+    controls
+}
+
+fn collect_reasoning_controls(value: &Value, controls: &mut Vec<String>) {
+    match value {
+        Value::String(text) => push_reasoning_control(controls, text),
+        Value::Array(items) => {
+            for item in items {
+                collect_reasoning_controls(item, controls);
+            }
+        }
+        Value::Object(map) => {
+            if let Some(values) = map.get("values") {
+                collect_reasoning_controls(values, controls);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn push_reasoning_control(controls: &mut Vec<String>, value: &str) {
+    let normalized = value.trim();
+    if normalized.is_empty() || controls.iter().any(|item| item == normalized) {
+        return;
+    }
+    controls.push(normalized.to_string());
+}
+
+fn selected_reasoning_control(provider: ApiProvider, config: &Config) -> Option<String> {
+    let effort = ReasoningEffort::from_setting_for_provider(config.reasoning_effort()?, provider);
+    Some(effort.display_label_for_provider(provider).to_string())
+}
+
+fn configured_or_default_stream_visibility(
+    provider: ApiProvider,
+    config: &Config,
+    support: ProviderReasoningSupport,
+) -> ProviderReasoningStreamVisibility {
+    if let Some(configured) = config
+        .provider_config_for(provider)
+        .and_then(|entry| entry.reasoning_stream_style.as_deref())
+        && let Some(visibility) = parse_reasoning_stream_visibility(configured)
+    {
+        return visibility;
+    }
+
+    match support {
+        ProviderReasoningSupport::Unsupported => ProviderReasoningStreamVisibility::NotExposed,
+        ProviderReasoningSupport::Unknown => ProviderReasoningStreamVisibility::Unknown,
+        ProviderReasoningSupport::Supported => default_reasoning_stream_visibility(provider),
+    }
+}
+
+fn parse_reasoning_stream_visibility(value: &str) -> Option<ProviderReasoningStreamVisibility> {
+    match value.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+        "separate_field" | "separate" | "field" | "structured" | "structured_thinking" => {
+            Some(ProviderReasoningStreamVisibility::StructuredThinking)
+        }
+        "inline_tags" | "inline" | "think_tags" | "thinking_tags" => {
+            Some(ProviderReasoningStreamVisibility::InlineTags)
+        }
+        "summary" | "summary_only" => Some(ProviderReasoningStreamVisibility::SummaryOnly),
+        "none" | "text" | "disabled" | "off" | "not_exposed" => {
+            Some(ProviderReasoningStreamVisibility::NotExposed)
+        }
+        _ => None,
+    }
+}
+
+fn default_reasoning_stream_visibility(provider: ApiProvider) -> ProviderReasoningStreamVisibility {
+    match provider {
+        ApiProvider::OpenaiCodex
+        | ApiProvider::Deepseek
+        | ApiProvider::DeepseekCN
+        | ApiProvider::NvidiaNim
+        | ApiProvider::Openrouter
+        | ApiProvider::XiaomiMimo
+        | ApiProvider::Novita
+        | ApiProvider::Fireworks
+        | ApiProvider::Siliconflow
+        | ApiProvider::SiliconflowCn
+        | ApiProvider::Volcengine
+        | ApiProvider::Arcee
+        | ApiProvider::Minimax
+        | ApiProvider::Sglang
+        | ApiProvider::Zai
+        | ApiProvider::Moonshot => ProviderReasoningStreamVisibility::StructuredThinking,
+        _ => ProviderReasoningStreamVisibility::Unknown,
     }
 }
 
@@ -908,6 +1170,70 @@ mod tests {
         assert_eq!(row.usage_meter, "cost: local");
         assert!(row.base_url.contains("localhost:11434"));
         assert!(row.is_active);
+    }
+
+    #[test]
+    fn provider_dashboard_row_surfaces_glm_reasoning_controls() {
+        let config = Config {
+            reasoning_effort: Some("max".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                zai: crate::config::ProviderConfig {
+                    api_key: Some("zai-key".to_string()),
+                    model: Some("GLM-5.2".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Config::default()
+        };
+        let row = ProviderDashboardRow::from_config(ApiProvider::Zai, ApiProvider::Zai, &config);
+
+        assert_eq!(row.default_route.wire_model, "GLM-5.2");
+        assert_eq!(row.reasoning.support, ProviderReasoningSupport::Supported);
+        assert_eq!(
+            row.reasoning.controls,
+            vec!["high".to_string(), "max".to_string()]
+        );
+        assert_eq!(
+            row.reasoning.stream_visibility,
+            ProviderReasoningStreamVisibility::StructuredThinking
+        );
+        assert_eq!(row.reasoning.selected_control.as_deref(), Some("max"));
+        assert!(row.compact_hint().contains("reasoning:high/max"));
+        assert!(row.compact_hint().contains("stream:structured"));
+    }
+
+    #[test]
+    fn provider_dashboard_row_surfaces_codex_reasoning_scale() {
+        let config = Config {
+            reasoning_effort: Some("max".to_string()),
+            ..Config::default()
+        };
+        let row = ProviderDashboardRow::from_config(
+            ApiProvider::OpenaiCodex,
+            ApiProvider::OpenaiCodex,
+            &config,
+        );
+
+        assert_eq!(row.reasoning.support, ProviderReasoningSupport::Supported);
+        assert_eq!(
+            row.reasoning.controls,
+            vec![
+                "low".to_string(),
+                "medium".to_string(),
+                "high".to_string(),
+                "xhigh".to_string(),
+            ]
+        );
+        assert_eq!(
+            row.reasoning.stream_visibility,
+            ProviderReasoningStreamVisibility::StructuredThinking
+        );
+        assert_eq!(row.reasoning.selected_control.as_deref(), Some("xhigh"));
+        assert!(
+            row.compact_hint()
+                .contains("reasoning:low/medium/high/xhigh")
+        );
     }
 
     #[test]
