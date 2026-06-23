@@ -411,7 +411,12 @@ impl Default for EngineConfig {
             project_context_pack_enabled: true,
             translation_enabled: false,
             show_thinking: true,
-            max_steps: 100,
+            // High backstop rather than a working ceiling: the in-turn
+            // loop_guard that used to brake repetition is gone, so this only
+            // exists to terminate a pathological runaway turn via
+            // `at_max_steps()`. 1000 stays high enough to never gate real work
+            // while still guaranteeing the turn ends.
+            max_steps: 1000,
             max_subagents: DEFAULT_MAX_SUBAGENTS,
             max_admitted_subagents: DEFAULT_MAX_SUBAGENTS,
             launch_concurrency: DEFAULT_MAX_SUBAGENTS,
@@ -3637,7 +3642,6 @@ use context::{
     is_context_length_error_message, summarize_text,
 };
 mod dispatch;
-mod loop_guard;
 mod lsp_hooks;
 mod streaming;
 mod token_estimate_cache;
@@ -3676,7 +3680,6 @@ use self::dispatch::{
     mcp_tool_is_read_only, parse_parallel_tool_calls, parse_tool_input,
     plan_tool_execution_batches, should_force_update_plan_first, should_stop_after_plan_tool,
 };
-use self::loop_guard::{AttemptBlockKind, AttemptDecision, LoopGuard, OutcomeDecision};
 #[cfg(test)]
 use self::lsp_hooks::edited_paths_for_tool;
 #[cfg(test)]

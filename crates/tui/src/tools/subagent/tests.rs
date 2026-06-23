@@ -3598,6 +3598,7 @@ fn stub_runtime() -> SubAgentRuntime {
         fork_context: None,
         mcp_pool: None,
         step_api_timeout: DEFAULT_STEP_API_TIMEOUT,
+        tool_timeout: DEFAULT_TOOL_TIMEOUT,
         speech_output_dir: None,
         todos: crate::tools::todo::new_shared_todo_list(),
     }

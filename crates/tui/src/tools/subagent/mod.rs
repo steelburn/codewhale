@@ -75,7 +75,13 @@ fn release_resident_leases_for(agent_id: &str) {
 /// explicit budget. Callers that want a hard bound can override `max_steps` on
 /// the `SubAgentManager`.
 const DEFAULT_MAX_STEPS: u32 = u32::MAX;
-const TOOL_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default wall-clock budget for a single sub-agent tool execution. The active
+/// value travels on `SubAgentRuntime::tool_timeout` so a long-but-legitimate
+/// tool (a large build, a slow shell command, a deep search) is not killed
+/// mid-flight. Kept non-zero so `timeout(Duration::ZERO, ...)` can never fire
+/// immediately. The per-step API timeout, streaming watchdogs, and heartbeat
+/// floors remain the independent stall detectors.
+const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(300);
 const MIN_SUBAGENT_SPAWN_TOKEN_RESERVE: u64 = 1;
 
 /// Format a step counter for sub-agent progress messages.
@@ -1431,6 +1437,11 @@ pub struct SubAgentRuntime {
     /// false-timeout the child mid-thinking. `child_runtime()` and
     /// `background_runtime()` preserve the parent's value (#1806, #1808).
     pub step_api_timeout: Duration,
+    /// Wall-clock budget for a single tool execution within a sub-agent step.
+    /// Defaults to `DEFAULT_TOOL_TIMEOUT`; the engine may override it so a long
+    /// but legitimate tool run is not killed mid-flight. `child_runtime()`
+    /// preserves the parent's value.
+    pub tool_timeout: Duration,
     /// Default directory for Xiaomi MiMo speech/TTS tool outputs inherited by
     /// child registries. Keeps parent and sub-agent `speech` / `tts` tools on
     /// the same `[speech].output_dir` / env override.
@@ -1477,6 +1488,7 @@ impl SubAgentRuntime {
             fork_context: None,
             mcp_pool: None,
             step_api_timeout: DEFAULT_STEP_API_TIMEOUT,
+            tool_timeout: DEFAULT_TOOL_TIMEOUT,
             speech_output_dir: None,
             todos: crate::tools::todo::new_shared_todo_list(),
         }
@@ -1508,6 +1520,14 @@ impl SubAgentRuntime {
     #[must_use]
     pub fn with_step_api_timeout(mut self, timeout: Duration) -> Self {
         self.step_api_timeout = timeout;
+        self
+    }
+
+    /// Override the per-tool execution timeout (default `DEFAULT_TOOL_TIMEOUT`).
+    /// Lets the engine raise the budget for long but legitimate tool runs.
+    #[must_use]
+    pub fn with_tool_timeout(mut self, timeout: Duration) -> Self {
+        self.tool_timeout = timeout;
         self
     }
 
@@ -1641,6 +1661,7 @@ impl SubAgentRuntime {
             fork_context: self.fork_context.clone(),
             mcp_pool: self.mcp_pool.clone(),
             step_api_timeout: self.step_api_timeout,
+            tool_timeout: self.tool_timeout,
             speech_output_dir: self.speech_output_dir.clone(),
             todos: self.todos.clone(),
         }
@@ -4984,7 +5005,7 @@ async fn run_subagent(
                     step: steps,
                 });
             }
-            let result = match tokio::time::timeout(TOOL_TIMEOUT, async {
+            let result = match tokio::time::timeout(runtime.tool_timeout, async {
                 tool_registry
                     .execute(&agent_id, &tool_name, tool_input)
                     .await
