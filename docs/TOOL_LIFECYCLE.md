@@ -47,6 +47,26 @@ The lifecycle policy exists to **shrink and discipline the model-visible
 surface** without ever breaking the ability to replay an old transcript that
 referenced a now-retired name.
 
+### Canonical work-tracking surface for v0.8.65
+
+The model-visible progress surface is `checklist_*`:
+`checklist_write`, `checklist_add`, `checklist_update`, and `checklist_list`.
+Agents and Fleet workers use that surface for concrete Work progress under the
+active runtime thread or durable task.
+
+`task_*` and the Fleet/WhaleFlow ledger remain the durable lifecycle owners.
+Checklist metadata is the model-visible projection of progress:
+`task_updates.checklist` carries the current items, completion percentage, and
+in-progress item. `update_plan` is optional high-level strategy metadata for
+complex initiatives; it must not duplicate checklist items or become a parallel
+progress store.
+
+The legacy `todo_*` names are deprecated hidden compatibility aliases. They
+remain registered and dispatchable against the same checklist state so old
+transcripts replay without data loss, but they are not advertised to the model
+catalog and their result metadata points callers to the corresponding
+`checklist_*` tool.
+
 ---
 
 ## 2. The five lifecycle states

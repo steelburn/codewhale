@@ -7,6 +7,7 @@ use crate::models::SystemBlock;
 use crate::test_support::lock_test_env;
 use crate::tools::plan::{PlanItemArg, PlanSnapshot, StepStatus};
 use crate::tools::spec::ToolCapability;
+use crate::tools::todo::{TodoItem, TodoListSnapshot, TodoStatus};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
@@ -170,6 +171,46 @@ fn structured_state_block_includes_rich_plan_artifact() {
     assert!(block.contains("Verification plan: Run focused tests"));
     assert!(block.contains("Handoff packet: Next agent should inspect replay"));
     assert!(block.contains("- [~] Render rich artifact"));
+}
+
+#[test]
+fn structured_state_block_uses_checklist_as_work_surface() {
+    let state = StructuredState {
+        mode_label: "Agent".to_string(),
+        workspace: PathBuf::from("/workspace/codewhale"),
+        cwd: Some(PathBuf::from("/workspace/codewhale")),
+        working_set_summary: None,
+        todo_snapshot: Some(TodoListSnapshot {
+            items: vec![
+                TodoItem {
+                    id: 1,
+                    content: "Wire Fleet progress projection".to_string(),
+                    status: TodoStatus::InProgress,
+                },
+                TodoItem {
+                    id: 2,
+                    content: "Run focused gates".to_string(),
+                    status: TodoStatus::Pending,
+                },
+            ],
+            completion_pct: 0,
+            in_progress_id: Some(1),
+        }),
+        plan_snapshot: Some(PlanSnapshot {
+            objective: Some("Keep strategy separate".to_string()),
+            ..PlanSnapshot::default()
+        }),
+        subagent_snapshots: Vec::new(),
+    };
+
+    let block = state.to_system_block().expect("fork state block");
+
+    assert!(block.contains("### Work"));
+    assert!(block.contains("Checklist (0% complete)"));
+    assert!(block.contains("- [~] Wire Fleet progress projection"));
+    assert!(block.contains("Strategy metadata"));
+    assert!(block.contains("Objective: Keep strategy separate"));
+    assert!(!block.contains("Todo list"));
 }
 
 #[test]

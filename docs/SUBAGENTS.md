@@ -80,6 +80,12 @@ Use fresh sessions for independent exploration. Use forked sessions when the
 task depends on decisions, files, todos, or plan state already in the parent
 transcript.
 
+Forked state renders concrete Work progress through the canonical
+`checklist_*` surface. The durable task/Fleet ledger owns lifecycle state;
+checklist entries are the model-visible progress projection. Use `update_plan`
+only for strategy metadata that helps a parent or later worker understand the
+approach.
+
 ## Worktree isolation
 
 For parallel edit lanes, launch the child with `worktree: true`. CodeWhale
