@@ -415,13 +415,16 @@ fn route_wire_suffix(route: &ProviderDefaultRoute) -> String {
     }
 }
 
+/// Strip the scheme and trailing slash, then cap the length so one long base
+/// URL can't dominate (and overflow) the provider hint row. Capped values get
+/// an ellipsis; short URLs pass through unchanged.
 fn compact_base_url(base_url: &str) -> String {
-    base_url
+    let stripped = base_url
         .trim()
         .trim_start_matches("https://")
         .trim_start_matches("http://")
-        .trim_end_matches('/')
-        .to_string()
+        .trim_end_matches('/');
+    crate::tui::ui_text::truncate_line_to_width(stripped, 24)
 }
 
 impl ProviderPickerView {
@@ -908,6 +911,26 @@ mod tests {
         // `z` is unique to Z.ai among provider display names.
         picker.handle_key(key(KeyCode::Char('z')));
         assert_eq!(picker.selected_provider(), ApiProvider::Zai);
+    }
+
+    #[test]
+    fn compact_base_url_strips_scheme_and_caps_length() {
+        // Short URLs pass through unchanged (scheme + trailing slash stripped).
+        assert_eq!(
+            compact_base_url("https://api.deepseek.com/"),
+            "api.deepseek.com"
+        );
+        assert_eq!(
+            compact_base_url("http://localhost:9000/v1"),
+            "localhost:9000/v1"
+        );
+        // A long URL is capped so it can't dominate the hint row.
+        let long = compact_base_url("https://api-us-west-2.example-region.company.com/v1/openai");
+        assert!(long.ends_with("..."), "expected an ellipsis, got {long:?}");
+        assert!(
+            long.chars().count() <= 24,
+            "capped to 24 cols, got {long:?}"
+        );
     }
 
     #[test]
