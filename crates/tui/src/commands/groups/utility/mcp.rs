@@ -29,10 +29,21 @@ pub fn mcp(_app: &mut App, args: Option<&str>) -> CommandResult {
             Ok(name) => CommandResult::action(AppAction::Mcp(McpUiAction::Remove { name })),
             Err(msg) => CommandResult::error(msg),
         },
+        "login" => match parse_name(parts.next(), "Usage: /mcp login <name> [--scope scope]") {
+            Ok(name) => CommandResult::action(AppAction::Mcp(McpUiAction::Login {
+                name,
+                scopes: parse_scopes(parts.collect()),
+            })),
+            Err(msg) => CommandResult::error(msg),
+        },
+        "logout" => match parse_name(parts.next(), "Usage: /mcp logout <name>") {
+            Ok(name) => CommandResult::action(AppAction::Mcp(McpUiAction::Logout { name })),
+            Err(msg) => CommandResult::error(msg),
+        },
         "validate" => CommandResult::action(AppAction::Mcp(McpUiAction::Validate)),
         "reload" | "reconnect" => CommandResult::action(AppAction::Mcp(McpUiAction::Reload)),
         _ => CommandResult::error(
-            "Usage: /mcp [init|add stdio <name> <command> [args...]|add http <name> <url>|enable <name>|disable <name>|remove <name>|validate|reload]",
+            "Usage: /mcp [init|add stdio <name> <command> [args...]|add http <name> <url>|enable <name>|disable <name>|remove <name>|login <name>|logout <name>|validate|reload]",
         ),
     }
 }
@@ -70,6 +81,42 @@ fn parse_add(parts: Vec<&str>) -> CommandResult {
             "Usage: /mcp add stdio <name> <command> [args...] OR /mcp add http <name> <url>",
         ),
     }
+}
+
+fn parse_scopes(parts: Vec<&str>) -> Vec<String> {
+    let mut scopes = Vec::new();
+    let mut iter = parts.into_iter();
+    while let Some(part) = iter.next() {
+        if part == "--scope" {
+            let Some(value) = iter.next() else {
+                continue;
+            };
+            for scope in value.split(',') {
+                let scope = scope.trim();
+                if !scope.is_empty() {
+                    scopes.push(scope.to_string());
+                }
+            }
+            continue;
+        }
+        let value = part.strip_prefix("--scope=");
+        let Some(value) = value else {
+            for scope in part.split(',') {
+                let scope = scope.trim();
+                if !scope.is_empty() {
+                    scopes.push(scope.to_string());
+                }
+            }
+            continue;
+        };
+        for scope in value.split(',') {
+            let scope = scope.trim();
+            if !scope.is_empty() {
+                scopes.push(scope.to_string());
+            }
+        }
+    }
+    scopes
 }
 
 #[cfg(test)]
@@ -120,6 +167,17 @@ mod tests {
         assert!(matches!(
             validate.action,
             Some(AppAction::Mcp(McpUiAction::Validate))
+        ));
+
+        let login = mcp(
+            &mut app,
+            Some("login remote --scope tools/read,tools/write"),
+        );
+        assert!(matches!(
+            login.action,
+            Some(AppAction::Mcp(McpUiAction::Login { name, scopes }))
+                if name == "remote"
+                    && scopes == vec!["tools/read".to_string(), "tools/write".to_string()]
         ));
     }
 }

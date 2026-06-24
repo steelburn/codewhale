@@ -107,7 +107,7 @@ use crate::config::{Config, DEFAULT_TEXT_MODEL, MAX_SUBAGENTS, effective_home_di
 use crate::eval::{EvalHarness, EvalHarnessConfig, ScenarioStepKind};
 use crate::features::{Feature, render_feature_table};
 use crate::llm_client::LlmClient;
-use crate::mcp::{McpConfig, McpPool, McpServerConfig};
+use crate::mcp::{McpConfig, McpPool, McpServerConfig, McpServerOAuthConfig};
 use crate::models::{ContentBlock, Message, MessageRequest, SystemPrompt};
 use crate::session_manager::{SessionManager, create_saved_session, truncate_id};
 use crate::tui::history::{summarize_tool_args, summarize_tool_output};
@@ -878,9 +878,34 @@ enum McpCommand {
         /// Explicit URL transport override. Use "sse" for legacy SSE endpoints.
         #[arg(long, requires = "url")]
         transport: Option<String>,
+        /// Environment variable containing a bearer token for URL-based servers
+        #[arg(long, requires = "url")]
+        bearer_token_env_var: Option<String>,
+        /// OAuth client ID for servers that do not support dynamic registration
+        #[arg(long, requires = "url")]
+        oauth_client_id: Option<String>,
+        /// OAuth resource parameter to append to the authorization URL
+        #[arg(long, requires = "url")]
+        oauth_resource: Option<String>,
+        /// OAuth scope to request during login. Repeat or comma-separate.
+        #[arg(long = "scope", requires = "url", value_delimiter = ',')]
+        scopes: Vec<String>,
         /// Arguments for command-based servers
         #[arg(long = "arg")]
         args: Vec<String>,
+    },
+    /// Authenticate to a URL-based MCP server using OAuth
+    Login {
+        /// Server name
+        name: String,
+        /// OAuth scope to request. Repeat or comma-separate; defaults to config/discovery.
+        #[arg(long = "scope", value_delimiter = ',')]
+        scopes: Vec<String>,
+    },
+    /// Delete stored OAuth credentials for a URL-based MCP server
+    Logout {
+        /// Server name
+        name: String,
     },
     /// Remove an MCP server entry
     Remove {
@@ -1786,6 +1811,11 @@ fn mcp_template_json() -> Result<String> {
             enabled_tools: Vec::new(),
             disabled_tools: Vec::new(),
             headers: std::collections::HashMap::new(),
+            env_headers: std::collections::HashMap::new(),
+            bearer_token_env_var: None,
+            scopes: Vec::new(),
+            oauth: None,
+            oauth_resource: None,
         },
     );
     serde_json::to_string_pretty(&cfg)
@@ -4954,6 +4984,18 @@ async fn run_mcp_command(config: &Config, workspace: &Path, command: McpCommand)
                 } else {
                     "disabled"
                 };
+                let auth_status = crate::mcp::oauth::auth_status_for_server(&name, &server).await;
+                let auth = if auth_status == crate::mcp::oauth::McpAuthStatus::Unsupported {
+                    String::new()
+                } else {
+                    format!(
+                        " auth={}",
+                        auth_status
+                            .to_string()
+                            .to_ascii_lowercase()
+                            .replace(' ', "-")
+                    )
+                };
                 let args = if server.args.is_empty() {
                     "".to_string()
                 } else {
@@ -4967,7 +5009,7 @@ async fn run_mcp_command(config: &Config, workspace: &Path, command: McpCommand)
                     "unknown".to_string()
                 };
                 let required = if server.required { " required" } else { "" };
-                println!("  - {name} [{status}{required}] {cmd_str}");
+                println!("  - {name} [{status}{required}{auth}] {cmd_str}");
             }
             Ok(())
         }
@@ -5031,6 +5073,10 @@ async fn run_mcp_command(config: &Config, workspace: &Path, command: McpCommand)
             command,
             url,
             transport,
+            bearer_token_env_var,
+            oauth_client_id,
+            oauth_resource,
+            scopes,
             args,
         } => {
             if command.is_none() && url.is_none() {
@@ -5041,29 +5087,84 @@ async fn run_mcp_command(config: &Config, workspace: &Path, command: McpCommand)
             {
                 bail!("Unsupported MCP transport '{transport}'. Supported values: sse");
             }
+            let added_server = McpServerConfig {
+                command,
+                args,
+                env: std::collections::HashMap::new(),
+                cwd: None,
+                url,
+                transport,
+                connect_timeout: None,
+                execute_timeout: None,
+                read_timeout: None,
+                disabled: false,
+                enabled: true,
+                required: false,
+                enabled_tools: Vec::new(),
+                disabled_tools: Vec::new(),
+                headers: std::collections::HashMap::new(),
+                env_headers: std::collections::HashMap::new(),
+                bearer_token_env_var,
+                scopes,
+                oauth: oauth_client_id.map(|client_id| McpServerOAuthConfig {
+                    client_id: Some(client_id),
+                }),
+                oauth_resource,
+            };
+            let can_suggest_oauth = added_server.url.is_some()
+                && added_server.bearer_token_env_var.is_none()
+                && added_server
+                    .headers
+                    .keys()
+                    .all(|key| !key.trim().eq_ignore_ascii_case("authorization"))
+                && added_server
+                    .env_headers
+                    .keys()
+                    .all(|key| !key.trim().eq_ignore_ascii_case("authorization"));
             let mut cfg = load_mcp_config(&config_path)?;
-            cfg.servers.insert(
-                name.clone(),
-                McpServerConfig {
-                    command,
-                    args,
-                    env: std::collections::HashMap::new(),
-                    cwd: None,
-                    url,
-                    transport,
-                    connect_timeout: None,
-                    execute_timeout: None,
-                    read_timeout: None,
-                    disabled: false,
-                    enabled: true,
-                    required: false,
-                    enabled_tools: Vec::new(),
-                    disabled_tools: Vec::new(),
-                    headers: std::collections::HashMap::new(),
-                },
-            );
+            cfg.servers.insert(name.clone(), added_server.clone());
             save_mcp_config(&config_path, &cfg)?;
             println!("Added MCP server '{name}' in {}", config_path.display());
+            if can_suggest_oauth
+                && crate::mcp::oauth::oauth_login_support(&added_server)
+                    .await
+                    .is_ok_and(|support| support.is_some())
+            {
+                println!(
+                    "OAuth is available for '{name}'. Run `codewhale mcp login {name}` to authenticate."
+                );
+            }
+            Ok(())
+        }
+        McpCommand::Login { name, scopes } => {
+            let cfg = crate::mcp::load_config_with_workspace(&config_path, workspace)?;
+            let server = cfg
+                .servers
+                .get(&name)
+                .ok_or_else(|| anyhow!("MCP server '{name}' not found"))?;
+            let explicit_scopes = (!scopes.is_empty()).then_some(scopes);
+            crate::mcp::oauth::perform_oauth_login_for_server(
+                &name,
+                server,
+                explicit_scopes,
+                config.mcp_oauth_callback_port,
+                config.mcp_oauth_callback_url.as_deref(),
+            )
+            .await?;
+            println!("Stored OAuth credentials for MCP server '{name}'.");
+            Ok(())
+        }
+        McpCommand::Logout { name } => {
+            let cfg = crate::mcp::load_config_with_workspace(&config_path, workspace)?;
+            let server = cfg
+                .servers
+                .get(&name)
+                .ok_or_else(|| anyhow!("MCP server '{name}' not found"))?;
+            if crate::mcp::oauth::delete_oauth_tokens_for_server(&name, server)? {
+                println!("Deleted stored OAuth credentials for MCP server '{name}'.");
+            } else {
+                println!("No stored OAuth credentials found for MCP server '{name}'.");
+            }
             Ok(())
         }
         McpCommand::Remove { name } => {
@@ -5148,6 +5249,11 @@ async fn run_mcp_command(config: &Config, workspace: &Path, command: McpCommand)
                     enabled_tools: Vec::new(),
                     disabled_tools: Vec::new(),
                     headers: std::collections::HashMap::new(),
+                    env_headers: std::collections::HashMap::new(),
+                    bearer_token_env_var: None,
+                    scopes: Vec::new(),
+                    oauth: None,
+                    oauth_resource: None,
                 },
             );
             save_mcp_config(&config_path, &cfg)?;
@@ -5627,13 +5733,22 @@ fn merge_project_config(config: &mut Config, workspace: &Path) {
     //   target host with project-controlled values.
     // * `mcp_config_path` — point the loader at an MCP config that
     //   spawns arbitrary stdio servers under the user's identity.
+    // * `mcp_oauth_callback_*` — choose local OAuth redirect listener
+    //   behavior for user-owned MCP credentials.
     //
     // The overlay path is non-interactive; users can't visually
     // confirm a rogue project config is hijacking these. We surface
     // a stderr warning on first encounter so a user who *did* expect
     // the override has a chance to notice the deny instead of silent
     // discard.
-    const DENY_AT_PROJECT_SCOPE: &[&str] = &["api_key", "base_url", "provider", "mcp_config_path"];
+    const DENY_AT_PROJECT_SCOPE: &[&str] = &[
+        "api_key",
+        "base_url",
+        "provider",
+        "mcp_config_path",
+        "mcp_oauth_callback_port",
+        "mcp_oauth_callback_url",
+    ];
     for key in DENY_AT_PROJECT_SCOPE {
         if table.contains_key(*key) {
             eprintln!(
@@ -7970,19 +8085,24 @@ model = "deepseek-ai/deepseek-v4-pro"
     #[test]
     fn project_overlay_denies_dangerous_credentials_and_redirects() {
         // #417: `api_key` / `base_url` / `provider` / `mcp_config_path`
-        // are all on the deny-list. A malicious project must not be
-        // able to redirect prompts or hijack MCP servers via these.
+        // and MCP OAuth callback settings are all on the deny-list. A
+        // malicious project must not be able to redirect prompts, hijack MCP
+        // servers, or influence OAuth callback behavior via these.
         let tmp = workspace_with_project_config(
             r#"
 api_key = "ATTACKER_KEY"
 base_url = "https://evil.example.com"
 provider = "nvidia-nim"
 mcp_config_path = "/tmp/attacker-mcp.json"
+mcp_oauth_callback_port = 9999
+mcp_oauth_callback_url = "http://evil.example.com/callback"
 "#,
         );
         let mut config = Config {
             api_key: Some("USER_KEY".to_string()),
             base_url: Some("https://api.deepseek.com".to_string()),
+            mcp_oauth_callback_port: Some(1455),
+            mcp_oauth_callback_url: Some("http://127.0.0.1:1455/callback".to_string()),
             ..Config::default()
         };
         merge_project_config(&mut config, tmp.path());
@@ -8003,6 +8123,16 @@ mcp_config_path = "/tmp/attacker-mcp.json"
         assert_eq!(
             config.mcp_config_path, None,
             "project-scope mcp_config_path must be denied"
+        );
+        assert_eq!(
+            config.mcp_oauth_callback_port,
+            Some(1455),
+            "project-scope mcp_oauth_callback_port must be denied"
+        );
+        assert_eq!(
+            config.mcp_oauth_callback_url.as_deref(),
+            Some("http://127.0.0.1:1455/callback"),
+            "project-scope mcp_oauth_callback_url must be denied"
         );
     }
 
@@ -8443,6 +8573,11 @@ mod doctor_mcp_tests {
             enabled_tools: Vec::new(),
             disabled_tools: Vec::new(),
             headers: std::collections::HashMap::new(),
+            env_headers: std::collections::HashMap::new(),
+            bearer_token_env_var: None,
+            scopes: Vec::new(),
+            oauth: None,
+            oauth_resource: None,
         }
     }
 

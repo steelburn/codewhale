@@ -35,7 +35,7 @@ pub(super) fn with_default_mcp_http_headers(
 ///
 /// Returning `false` means "skip this header"; the rest of the
 /// request still goes out.
-pub(super) fn is_safe_custom_header(key: &str, value: &str) -> bool {
+pub(crate) fn is_safe_custom_header(key: &str, value: &str) -> bool {
     let trimmed = key.trim();
     if trimmed.is_empty() {
         return false;

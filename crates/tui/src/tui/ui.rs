@@ -7631,6 +7631,47 @@ async fn handle_mcp_ui_action(
             mcp::remove_server_config(&path, &name)
                 .map(|()| message = Some(format!("Removed MCP server '{name}'")))
         }
+        crate::tui::app::McpUiAction::Login { name, scopes } => {
+            let result = async {
+                let cfg = mcp::load_config_with_workspace(&path, &app.workspace)?;
+                let server = cfg
+                    .servers
+                    .get(&name)
+                    .ok_or_else(|| anyhow::anyhow!("MCP server '{name}' not found"))?;
+                let explicit_scopes = (!scopes.is_empty()).then_some(scopes);
+                mcp::oauth::perform_oauth_login_for_server(
+                    &name,
+                    server,
+                    explicit_scopes,
+                    config.mcp_oauth_callback_port,
+                    config.mcp_oauth_callback_url.as_deref(),
+                )
+                .await
+            }
+            .await;
+            result.map(|()| {
+                message = Some(format!(
+                    "Stored OAuth credentials for MCP server '{name}'. Restart if the server was already connected."
+                ));
+            })
+        }
+        crate::tui::app::McpUiAction::Logout { name } => {
+            let result = (|| {
+                let cfg = mcp::load_config_with_workspace(&path, &app.workspace)?;
+                let server = cfg
+                    .servers
+                    .get(&name)
+                    .ok_or_else(|| anyhow::anyhow!("MCP server '{name}' not found"))?;
+                mcp::oauth::delete_oauth_tokens_for_server(&name, server)
+            })();
+            result.map(|deleted| {
+                message = Some(if deleted {
+                    format!("Deleted stored OAuth credentials for MCP server '{name}'.")
+                } else {
+                    format!("No stored OAuth credentials found for MCP server '{name}'.")
+                });
+            })
+        }
         crate::tui::app::McpUiAction::Validate | crate::tui::app::McpUiAction::Reload => Ok(()),
     };
 
@@ -7690,6 +7731,8 @@ fn mcp_ui_action_refreshes_discovery(action: &crate::tui::app::McpUiAction) -> b
         crate::tui::app::McpUiAction::Show
             | crate::tui::app::McpUiAction::Validate
             | crate::tui::app::McpUiAction::Reload
+            | crate::tui::app::McpUiAction::Login { .. }
+            | crate::tui::app::McpUiAction::Logout { .. }
     )
 }
 

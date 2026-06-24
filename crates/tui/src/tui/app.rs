@@ -5717,6 +5717,13 @@ pub enum McpUiAction {
     Remove {
         name: String,
     },
+    Login {
+        name: String,
+        scopes: Vec<String>,
+    },
+    Logout {
+        name: String,
+    },
     Validate,
     Reload,
 }

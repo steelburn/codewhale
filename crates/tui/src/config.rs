@@ -2091,6 +2091,8 @@ pub struct Config {
     pub tools: Option<ToolsConfig>,
     pub skills_dir: Option<String>,
     pub mcp_config_path: Option<String>,
+    pub mcp_oauth_callback_port: Option<u16>,
+    pub mcp_oauth_callback_url: Option<String>,
     pub notes_path: Option<String>,
     pub memory_path: Option<String>,
     /// When true, set `tool_choice: "required"` and opt compatible function
@@ -5533,6 +5535,12 @@ fn merge_config(base: Config, override_cfg: Config) -> Config {
         tools: override_cfg.tools.or(base.tools),
         skills_dir: override_cfg.skills_dir.or(base.skills_dir),
         mcp_config_path: override_cfg.mcp_config_path.or(base.mcp_config_path),
+        mcp_oauth_callback_port: override_cfg
+            .mcp_oauth_callback_port
+            .or(base.mcp_oauth_callback_port),
+        mcp_oauth_callback_url: override_cfg
+            .mcp_oauth_callback_url
+            .or(base.mcp_oauth_callback_url),
         notes_path: override_cfg.notes_path.or(base.notes_path),
         memory_path: override_cfg.memory_path.or(base.memory_path),
         vision_model: override_cfg.vision_model.or(base.vision_model),

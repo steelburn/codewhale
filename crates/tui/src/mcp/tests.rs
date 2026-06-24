@@ -148,6 +148,42 @@ fn mcp_server_config_parses_custom_headers() {
 }
 
 #[test]
+fn mcp_server_config_parses_remote_auth_fields() {
+    let json = r#"{
+        "servers": {
+            "remote": {
+                "url": "https://example.invalid/mcp",
+                "env_http_headers": {
+                    "X-Api-Key": "REMOTE_MCP_KEY"
+                },
+                "bearer_token_env_var": "REMOTE_MCP_TOKEN",
+                "scopes": ["tools/read", "tools/write"],
+                "oauth": {
+                    "client_id": "client-123"
+                },
+                "oauth_resource": "https://example.invalid"
+            }
+        }
+    }"#;
+    let cfg: McpConfig = serde_json::from_str(json).unwrap();
+    let remote = cfg.servers.get("remote").expect("server present");
+    assert_eq!(
+        remote.env_headers.get("X-Api-Key"),
+        Some(&"REMOTE_MCP_KEY".to_string())
+    );
+    assert_eq!(
+        remote.bearer_token_env_var.as_deref(),
+        Some("REMOTE_MCP_TOKEN")
+    );
+    assert_eq!(remote.scopes, vec!["tools/read", "tools/write"]);
+    assert_eq!(remote.oauth_client_id(), Some("client-123"));
+    assert_eq!(
+        remote.oauth_resource.as_deref(),
+        Some("https://example.invalid")
+    );
+}
+
+#[test]
 fn mcp_server_config_omits_headers_when_empty() {
     // Empty headers map should not appear in the serialized output —
     // older mcp.json files written before v0.8.31 must round-trip
@@ -169,11 +205,61 @@ fn mcp_server_config_omits_headers_when_empty() {
         enabled_tools: Vec::new(),
         disabled_tools: Vec::new(),
         headers: HashMap::new(),
+        env_headers: HashMap::new(),
+        bearer_token_env_var: None,
+        scopes: Vec::new(),
+        oauth: None,
+        oauth_resource: None,
     };
     let serialized = serde_json::to_string(&cfg).unwrap();
     assert!(
         !serialized.contains("\"headers\""),
         "empty headers must be omitted: {serialized}"
+    );
+    assert!(
+        !serialized.contains("\"env_headers\""),
+        "empty env_headers must be omitted: {serialized}"
+    );
+    assert!(
+        !serialized.contains("\"scopes\""),
+        "empty scopes must be omitted: {serialized}"
+    );
+    assert!(
+        !serialized.contains("\"oauth\""),
+        "empty oauth config must be omitted: {serialized}"
+    );
+}
+
+#[tokio::test]
+async fn mcp_http_auth_prefers_static_authorization_over_bearer_env() {
+    let mut headers = HashMap::new();
+    headers.insert("Authorization".to_string(), "Bearer static".to_string());
+    let auth = McpHttpAuth {
+        headers,
+        bearer_token_env_var: Some("PATH".to_string()),
+        ..Default::default()
+    };
+
+    let resolved = auth.resolved_headers().await.unwrap();
+    assert_eq!(
+        resolved.get("Authorization"),
+        Some(&"Bearer static".to_string())
+    );
+}
+
+#[tokio::test]
+async fn mcp_http_auth_uses_bearer_env_when_no_authorization_header() {
+    let auth = McpHttpAuth {
+        bearer_token_env_var: Some("PATH".to_string()),
+        ..Default::default()
+    };
+
+    let resolved = auth.resolved_headers().await.unwrap();
+    assert!(
+        resolved
+            .get("Authorization")
+            .is_some_and(|value| value.starts_with("Bearer ") && value.len() > "Bearer ".len()),
+        "expected PATH-backed bearer header, got {resolved:?}"
     );
 }
 
@@ -260,9 +346,12 @@ fn streamable_http_transport_stores_headers() {
     let transport = StreamableHttpTransport::new(
         client,
         "https://example.invalid/mcp".to_string(),
-        headers.clone(),
+        McpHttpAuth {
+            headers: headers.clone(),
+            ..Default::default()
+        },
     );
-    assert_eq!(transport.headers, headers);
+    assert_eq!(transport.auth.headers, headers);
 }
 
 #[test]
@@ -832,6 +921,11 @@ fn test_server_effective_timeouts() {
         enabled_tools: Vec::new(),
         disabled_tools: Vec::new(),
         headers: HashMap::new(),
+        env_headers: HashMap::new(),
+        bearer_token_env_var: None,
+        scopes: Vec::new(),
+        oauth: None,
+        oauth_resource: None,
     };
 
     assert_eq!(server_with_override.effective_connect_timeout(&global), 20);
@@ -944,6 +1038,11 @@ fn test_server_config() -> McpServerConfig {
         enabled_tools: Vec::new(),
         disabled_tools: Vec::new(),
         headers: HashMap::new(),
+        env_headers: HashMap::new(),
+        bearer_token_env_var: None,
+        scopes: Vec::new(),
+        oauth: None,
+        oauth_resource: None,
     }
 }
 
@@ -1157,6 +1256,11 @@ fn hash_mcp_config_is_stable_and_change_sensitive() {
             enabled_tools: Vec::new(),
             disabled_tools: Vec::new(),
             headers: HashMap::new(),
+            env_headers: HashMap::new(),
+            bearer_token_env_var: None,
+            scopes: Vec::new(),
+            oauth: None,
+            oauth_resource: None,
         },
     );
     assert_ne!(
@@ -1690,6 +1794,11 @@ async fn mcp_connection_supports_streamable_http_event_stream_responses() {
         enabled_tools: Vec::new(),
         disabled_tools: Vec::new(),
         headers: HashMap::new(),
+        env_headers: HashMap::new(),
+        bearer_token_env_var: None,
+        scopes: Vec::new(),
+        oauth: None,
+        oauth_resource: None,
     };
 
     let conn = McpConnection::connect_with_policy(
@@ -1971,7 +2080,7 @@ async fn sse_connect_waits_for_endpoint_before_first_send() {
     let mut transport = SseTransport::connect(
         client,
         url,
-        HashMap::new(),
+        McpHttpAuth::default(),
         cancel_token.clone(),
         Duration::from_secs(2),
     )
@@ -2062,7 +2171,7 @@ async fn sse_connect_accepts_crlf_endpoint_events() {
     let mut transport = SseTransport::connect(
         client,
         url,
-        HashMap::new(),
+        McpHttpAuth::default(),
         cancel_token.clone(),
         Duration::from_secs(2),
     )
@@ -2164,7 +2273,10 @@ async fn sse_transport_applies_custom_headers_to_get_and_post() {
     let mut transport = SseTransport::connect(
         client,
         url,
-        headers,
+        McpHttpAuth {
+            headers,
+            ..Default::default()
+        },
         cancel_token.clone(),
         Duration::from_secs(2),
     )
@@ -2251,7 +2363,7 @@ async fn sse_post_error_includes_response_body_excerpt() {
     let mut transport = SseTransport::connect(
         client,
         url,
-        HashMap::new(),
+        McpHttpAuth::default(),
         cancel_token.clone(),
         Duration::from_secs(2),
     )
@@ -2437,6 +2549,11 @@ async fn streamable_http_stale_session_reconnects_and_retries_tool_call() {
             enabled_tools: Vec::new(),
             disabled_tools: Vec::new(),
             headers: HashMap::new(),
+            env_headers: HashMap::new(),
+            bearer_token_env_var: None,
+            scopes: Vec::new(),
+            oauth: None,
+            oauth_resource: None,
         },
     );
     let mut pool = McpPool::new(cfg);
@@ -2496,7 +2613,7 @@ async fn legacy_sse_session_expiry_is_marked_stale() {
     let mut transport = SseTransport {
         client: test_http_client(),
         base_url: format!("http://{addr}/sse"),
-        headers: HashMap::new(),
+        auth: McpHttpAuth::default(),
         endpoint_url: Some(format!("http://{addr}/messages")),
         receiver,
         pending_messages: VecDeque::new(),
@@ -2708,6 +2825,11 @@ async fn legacy_sse_closed_stream_reconnects_and_retries_tool_call() {
             enabled_tools: Vec::new(),
             disabled_tools: Vec::new(),
             headers: HashMap::new(),
+            env_headers: HashMap::new(),
+            bearer_token_env_var: None,
+            scopes: Vec::new(),
+            oauth: None,
+            oauth_resource: None,
         },
     );
     let mut pool = McpPool::new(cfg);
@@ -2733,7 +2855,7 @@ fn session_id_starts_none() {
     let transport = StreamableHttpTransport::new(
         test_http_client(),
         "https://example.invalid/mcp".to_string(),
-        HashMap::new(),
+        McpHttpAuth::default(),
     );
     assert!(transport.session_id.is_none());
 }
@@ -2782,7 +2904,7 @@ async fn session_id_captured_from_post_response_and_replayed() {
 
     let client = test_http_client();
     let url = format!("http://{addr}/mcp");
-    let mut transport = StreamableHttpTransport::new(client, url, HashMap::new());
+    let mut transport = StreamableHttpTransport::new(client, url, McpHttpAuth::default());
 
     // First send: server returns Mcp-Session-Id.
     transport
@@ -2853,7 +2975,10 @@ async fn custom_headers_applied_to_get_preflight() {
     let mut transport = HttpTransport::new(
         client,
         url,
-        headers,
+        McpHttpAuth {
+            headers,
+            ..Default::default()
+        },
         tokio_util::sync::CancellationToken::new(),
         Duration::from_secs(10),
     );

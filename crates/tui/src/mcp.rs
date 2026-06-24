@@ -22,6 +22,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::Mutex as TokioMutex;
 
 mod headers;
+pub mod oauth;
 
 use self::headers::{apply_safe_custom_headers, with_default_mcp_http_headers};
 use crate::child_env;
@@ -260,6 +261,36 @@ pub struct McpServerConfig {
     #[serde(default)]
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub headers: HashMap<String, String>,
+    /// HTTP headers whose values are read from environment variables at request
+    /// time. This keeps common bearer/API-token integrations out of mcp.json.
+    #[serde(default, alias = "env_http_headers")]
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    pub env_headers: HashMap<String, String>,
+    /// Environment variable containing a bearer token. When present and set,
+    /// CodeWhale sends `Authorization: Bearer <value>` for URL-based servers.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bearer_token_env_var: Option<String>,
+    /// OAuth scopes requested during `codewhale mcp login`.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub scopes: Vec<String>,
+    /// OAuth client override for MCP servers that require a pre-registered
+    /// public client instead of dynamic registration.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oauth: Option<McpServerOAuthConfig>,
+    /// Optional RFC 8707 resource parameter appended to the authorization URL.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oauth_resource: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct McpServerOAuthConfig {
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
 }
 
 fn default_enabled() -> bool {
@@ -527,7 +558,7 @@ impl Drop for StdioTransport {
 pub struct SseTransport {
     client: reqwest::Client,
     base_url: String,
-    headers: HashMap<String, String>,
+    auth: McpHttpAuth,
     endpoint_url: Option<String>,
     receiver: tokio::sync::mpsc::UnboundedReceiver<SseInbound>,
     pending_messages: VecDeque<Vec<u8>>,
@@ -544,7 +575,7 @@ struct HttpTransport {
     mode: HttpTransportMode,
     client: reqwest::Client,
     base_url: String,
-    headers: HashMap<String, String>,
+    auth: McpHttpAuth,
     cancel_token: tokio_util::sync::CancellationToken,
     endpoint_timeout: Duration,
 }
@@ -557,11 +588,8 @@ enum HttpTransportMode {
 struct StreamableHttpTransport {
     client: reqwest::Client,
     url: String,
-    /// Extra headers applied to every outbound POST. Populated from
-    /// [`McpServerConfig::headers`]; an empty map is the no-auth
-    /// default. See `apply_custom_headers` for the filtering pass that
-    /// runs before each request.
-    headers: HashMap<String, String>,
+    /// Request-time auth and custom header resolver for outbound POSTs.
+    auth: McpHttpAuth,
     pending_messages: VecDeque<Vec<u8>>,
     /// Per-spec MCP session identifier returned by the server in the
     /// first response (typically the `initialize` response). Attached
@@ -569,6 +597,58 @@ struct StreamableHttpTransport {
     /// request so the server can correlate messages within the same
     /// session.
     session_id: Option<String>,
+}
+
+#[derive(Clone, Default)]
+struct McpHttpAuth {
+    headers: HashMap<String, String>,
+    env_headers: HashMap<String, String>,
+    bearer_token_env_var: Option<String>,
+    oauth: Option<oauth::McpOAuthRuntime>,
+}
+
+impl McpHttpAuth {
+    fn from_config(config: &McpServerConfig, oauth: Option<oauth::McpOAuthRuntime>) -> Self {
+        Self {
+            headers: config.headers.clone(),
+            env_headers: config.env_headers.clone(),
+            bearer_token_env_var: config.bearer_token_env_var.clone(),
+            oauth,
+        }
+    }
+
+    async fn resolved_headers(&self) -> Result<HashMap<String, String>> {
+        let mut headers = self.headers.clone();
+        for (name, env_var) in &self.env_headers {
+            if let Ok(value) = std::env::var(env_var)
+                && !value.trim().is_empty()
+            {
+                headers.insert(name.clone(), value);
+            }
+        }
+        if !mcp_headers_have_authorization(&headers)
+            && let Some(env_var) = self.bearer_token_env_var.as_deref()
+            && let Ok(token) = std::env::var(env_var)
+        {
+            let token = token.trim();
+            if !token.is_empty() {
+                headers.insert("Authorization".to_string(), format!("Bearer {token}"));
+            }
+        }
+        if !mcp_headers_have_authorization(&headers)
+            && let Some(oauth) = &self.oauth
+            && let Some(value) = oauth.authorization_header().await?
+        {
+            headers.insert("Authorization".to_string(), value);
+        }
+        Ok(headers)
+    }
+}
+
+fn mcp_headers_have_authorization(headers: &HashMap<String, String>) -> bool {
+    headers
+        .keys()
+        .any(|key| key.trim().eq_ignore_ascii_case("authorization"))
 }
 
 #[derive(Debug)]
@@ -579,17 +659,17 @@ enum StreamableSendError {
 }
 
 impl SseTransport {
-    pub async fn connect(
+    async fn connect(
         client: reqwest::Client,
         url: String,
-        headers: HashMap<String, String>,
+        auth: McpHttpAuth,
         cancel_token: tokio_util::sync::CancellationToken,
         endpoint_timeout: Duration,
     ) -> Result<Self> {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let client_clone = client.clone();
         let url_clone = url.clone();
-        let headers_clone = headers.clone();
+        let auth_clone = auth.clone();
         let wait_cancel_token = cancel_token.clone();
 
         let sse_task = tokio::spawn(async move {
@@ -600,7 +680,7 @@ impl SseTransport {
             let result = std::panic::AssertUnwindSafe(Self::run_sse_loop(
                 client_clone,
                 url_clone,
-                headers_clone,
+                auth_clone,
                 tx,
                 cancel_token,
             ))
@@ -627,7 +707,7 @@ impl SseTransport {
         let mut transport = Self {
             client,
             base_url: url,
-            headers,
+            auth,
             endpoint_url: None,
             receiver: rx,
             pending_messages: VecDeque::new(),
@@ -642,10 +722,11 @@ impl SseTransport {
     async fn run_sse_loop(
         client: reqwest::Client,
         url: String,
-        headers: HashMap<String, String>,
+        auth: McpHttpAuth,
         tx: tokio::sync::mpsc::UnboundedSender<SseInbound>,
         cancel_token: tokio_util::sync::CancellationToken,
     ) -> Result<()> {
+        let headers = auth.resolved_headers().await?;
         let response = apply_safe_custom_headers(
             with_default_mcp_http_headers(client.get(&url), false),
             &headers,
@@ -779,7 +860,7 @@ impl HttpTransport {
     fn new(
         client: reqwest::Client,
         url: String,
-        headers: HashMap<String, String>,
+        auth: McpHttpAuth,
         cancel_token: tokio_util::sync::CancellationToken,
         endpoint_timeout: Duration,
     ) -> Self {
@@ -787,11 +868,11 @@ impl HttpTransport {
             mode: HttpTransportMode::Streamable(StreamableHttpTransport::new(
                 client.clone(),
                 url.clone(),
-                headers.clone(),
+                auth.clone(),
             )),
             client,
             base_url: url,
-            headers,
+            auth,
             cancel_token,
             endpoint_timeout,
         }
@@ -801,7 +882,7 @@ impl HttpTransport {
         let mut sse = SseTransport::connect(
             self.client.clone(),
             self.base_url.clone(),
-            self.headers.clone(),
+            self.auth.clone(),
             self.cancel_token.clone(),
             self.endpoint_timeout,
         )
@@ -842,9 +923,10 @@ impl HttpTransport {
             HttpTransportMode::Sse(_) => return Ok(()),
         };
 
+        let headers = transport.auth.resolved_headers().await?;
         let request = apply_safe_custom_headers(
             with_default_mcp_http_headers(transport.client.get(&transport.url), false),
-            &transport.headers,
+            &headers,
         );
         let response = tokio::time::timeout(Duration::from_secs(5), request.send())
             .await
@@ -923,11 +1005,11 @@ impl McpTransport for HttpTransport {
 }
 
 impl StreamableHttpTransport {
-    fn new(client: reqwest::Client, url: String, headers: HashMap<String, String>) -> Self {
+    fn new(client: reqwest::Client, url: String, auth: McpHttpAuth) -> Self {
         Self {
             client,
             url,
-            headers,
+            auth,
             pending_messages: VecDeque::new(),
             session_id: None,
         }
@@ -936,9 +1018,14 @@ impl StreamableHttpTransport {
     async fn send(&mut self, msg: Vec<u8>) -> std::result::Result<(), StreamableSendError> {
         // Apply user-configured custom headers after protocol framing so
         // reserved Accept / Content-Type overrides can be filtered out.
+        let headers = self
+            .auth
+            .resolved_headers()
+            .await
+            .map_err(StreamableSendError::Other)?;
         let mut request = apply_safe_custom_headers(
             with_default_mcp_http_headers(self.client.post(&self.url), true),
-            &self.headers,
+            &headers,
         );
         // Attach any previously captured session ID per the Streamable
         // HTTP spec so the server can correlate this request to the
@@ -1159,10 +1246,12 @@ impl McpTransport for SseTransport {
         let endpoint = self
             .endpoint_url
             .as_ref()
-            .context("SSE endpoint not yet discovered")?;
+            .context("SSE endpoint not yet discovered")?
+            .clone();
+        let headers = self.auth.resolved_headers().await?;
         let response = apply_safe_custom_headers(
-            with_default_mcp_http_headers(self.client.post(endpoint), true),
-            &self.headers,
+            with_default_mcp_http_headers(self.client.post(&endpoint), true),
+            &headers,
         )
         .body(msg)
         .send()
@@ -1170,7 +1259,7 @@ impl McpTransport for SseTransport {
         .with_context(|| {
             format!(
                 "MCP SSE POST send failed (transport=sse endpoint={})",
-                mask_url_secrets(endpoint)
+                mask_url_secrets(&endpoint)
             )
         })?;
         let status = response.status();
@@ -1179,14 +1268,14 @@ impl McpTransport for SseTransport {
             if is_mcp_stale_session_body(&body_excerpt) {
                 anyhow::bail!(
                     "MCP session expired (transport=sse endpoint={} status={}): {}",
-                    mask_url_secrets(endpoint),
+                    mask_url_secrets(&endpoint),
                     status,
                     body_excerpt
                 );
             }
             anyhow::bail!(
                 "MCP SSE POST rejected (transport=sse endpoint={} status={}): {}",
-                mask_url_secrets(endpoint),
+                mask_url_secrets(&endpoint),
                 status,
                 body_excerpt
             );
@@ -1304,12 +1393,45 @@ impl McpConnection {
                 }
             }
             let client = client_builder.build()?;
+            let oauth_runtime = match oauth::build_default_headers(
+                &config.headers,
+                &config.env_headers,
+            ) {
+                Ok(default_headers) => match oauth::McpOAuthRuntime::from_server_config(
+                    &name,
+                    &config,
+                    default_headers,
+                )
+                .await
+                {
+                    Ok(runtime) => runtime,
+                    Err(err) => {
+                        tracing::warn!(
+                            target: "mcp",
+                            server = %name,
+                            error = %err,
+                            "failed to prepare MCP OAuth runtime; continuing without stored OAuth token"
+                        );
+                        None
+                    }
+                },
+                Err(err) => {
+                    tracing::warn!(
+                        target: "mcp",
+                        server = %name,
+                        error = %err,
+                        "failed to prepare MCP OAuth default headers; continuing without stored OAuth token"
+                    );
+                    None
+                }
+            };
+            let http_auth = McpHttpAuth::from_config(&config, oauth_runtime);
             if is_legacy_sse_transport(&config) {
                 Box::new(
                     SseTransport::connect(
                         client,
                         url.clone(),
-                        config.headers.clone(),
+                        http_auth,
                         cancel_token.clone(),
                         Duration::from_secs(connect_timeout_secs),
                     )
@@ -1319,7 +1441,7 @@ impl McpConnection {
                 let mut http = HttpTransport::new(
                     client,
                     url.clone(),
-                    config.headers.clone(),
+                    http_auth,
                     cancel_token.clone(),
                     Duration::from_secs(connect_timeout_secs),
                 );
@@ -2840,6 +2962,11 @@ fn mcp_template_json() -> Result<String> {
             enabled_tools: Vec::new(),
             disabled_tools: Vec::new(),
             headers: HashMap::new(),
+            env_headers: HashMap::new(),
+            bearer_token_env_var: None,
+            scopes: Vec::new(),
+            oauth: None,
+            oauth_resource: None,
         },
     );
     serde_json::to_string_pretty(&cfg).context("Failed to render MCP template JSON")
@@ -2897,6 +3024,11 @@ pub fn add_server_config(
             enabled_tools: Vec::new(),
             disabled_tools: Vec::new(),
             headers: HashMap::new(),
+            env_headers: HashMap::new(),
+            bearer_token_env_var: None,
+            scopes: Vec::new(),
+            oauth: None,
+            oauth_resource: None,
         },
     );
     save_config(path, &cfg)
