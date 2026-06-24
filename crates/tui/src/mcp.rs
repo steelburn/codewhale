@@ -2539,6 +2539,7 @@ impl McpPool {
     }
 
     /// Get list of connected server names
+    #[allow(dead_code)] // Public API; the HTTP list endpoint no longer spawns a pool to call it (#3532)
     pub fn connected_servers(&self) -> Vec<&str> {
         self.connections
             .iter()

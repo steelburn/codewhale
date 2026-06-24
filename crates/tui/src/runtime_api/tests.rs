@@ -536,6 +536,7 @@ async fn spawn_test_server_with_root_token_mobile_workspace_and_subagents(
         cors_origins: Vec::new(),
         sessions_dir,
         mcp_config_path: root.join("mcp.json"),
+        mcp_pool: Arc::new(Mutex::new(None)),
         automations,
         sub_agent_manager,
         runtime_token,
