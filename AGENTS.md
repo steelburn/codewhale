@@ -93,7 +93,10 @@
   author where possible, add `Co-authored-by` using `.github/AUTHOR_MAP` or
   GitHub numeric noreply identity, and include `Harvested from PR #N by
   @handle` in the commit body so the auto-close workflow can close the PR with
-  credit after it reaches `main`.
+  credit after it reaches `main`. Merge a PR whose commit carries that line
+  with rebase or a merge commit, never squash: a squash can rewrite the body,
+  drop the `Harvested from PR` line, and silently lose both the
+  machine-readable credit and the auto-close.
 - Never add bot/tool `Co-authored-by` trailers (Claude, codex, cursor,
   `noreply@anthropic.com`): `scripts/check-coauthor-trailers.py` rejects them on
   harvest commits — contributor trailers are for humans. Also refresh the manual

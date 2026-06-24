@@ -162,7 +162,10 @@ dependent layers. For those changes, use this workflow:
    but leaves follow-up work.
 7. Structured commits are fine during review. Maintainers may squash or harvest
    at merge time, with contributor credit preserved through authorship,
-   co-author trailers, changelog entries, or PR/issue comments.
+   co-author trailers, changelog entries, or PR/issue comments. When the merge
+   commit itself carries a `Harvested from PR #N by @author` line, that PR is
+   merged with rebase or a merge commit rather than squashed, so the line
+   reaches `main` intact and the auto-close credit fires.
 
 Before asking for merge review on a layered PR, check that it is:
 
