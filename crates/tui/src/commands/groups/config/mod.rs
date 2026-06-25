@@ -37,7 +37,7 @@ static CONFIG_INFO: CommandInfo = CommandInfo {
     // /experiments is a discoverable entry to the same view: the Experimental
     // section exposes the WhaleFlow, goal, and sub-agent opt-ins (#3182).
     aliases: &["experiments", "experimental"],
-    usage: "/config",
+    usage: "/config [ask-rules|status|<key> [value]]",
     description_id: MessageId::CmdConfigDescription,
 };
 static SIDEBAR_INFO: CommandInfo = CommandInfo {

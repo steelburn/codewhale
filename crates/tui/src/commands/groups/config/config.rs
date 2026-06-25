@@ -23,6 +23,7 @@ use crate::tui::app::{
 use crate::tui::approval::ApprovalMode;
 use crate::tui::ui::{SidebarRenderState, sidebar_render_state};
 use anyhow::Result;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 /// Open the interactive config editor.
@@ -53,6 +54,7 @@ pub fn show_config(_app: &mut App, arg: Option<&str>) -> CommandResult {
 /// - `/config` (no args) — opens the schemaui-driven TUI editor.
 /// - `/config tui` / `/config web` / `/config native` — open a specific
 ///   editor mode (web requires the `web` build feature).
+/// - `/config ask-rules` — shows configured ask-only permission rules.
 /// - `/config <key>` — shows the current value of a setting.
 /// - `/config <key> <value>` — sets a runtime value (session only, add --save to persist).
 pub fn config_command(app: &mut App, arg: Option<&str>) -> CommandResult {
@@ -68,6 +70,10 @@ pub fn config_command(app: &mut App, arg: Option<&str>) -> CommandResult {
     }
     let mut raw_words = raw.splitn(2, char::is_whitespace);
     let first_word = raw_words.next();
+    if first_word.is_some_and(is_ask_rules_config_token) {
+        let rest = raw_words.next().unwrap_or("").trim();
+        return configured_ask_rules_command(app, rest);
+    }
     if first_word.is_some_and(|token| token.eq_ignore_ascii_case("subagents")) {
         let rest = raw_words.next().unwrap_or("").trim();
         return subagents_config_command(app, rest);
@@ -521,6 +527,112 @@ fn approval_mode_config_value(mode: ApprovalMode) -> &'static str {
         ApprovalMode::Auto => "auto",
         ApprovalMode::Suggest => "on-request",
         ApprovalMode::Never => "never",
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PermissionsFileStatus {
+    Missing,
+    Empty,
+    Present,
+}
+
+impl PermissionsFileStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::Empty => "empty",
+            Self::Present => "present",
+        }
+    }
+}
+
+fn is_ask_rules_config_token(token: &str) -> bool {
+    matches!(
+        token.to_ascii_lowercase().as_str(),
+        "ask-rules"
+            | "ask_rules"
+            | "askrules"
+            | "rules"
+            | "permission-rules"
+            | "permission_rules"
+            | "permissions"
+    )
+}
+
+fn configured_ask_rules_command(app: &App, raw: &str) -> CommandResult {
+    match raw.to_ascii_lowercase().as_str() {
+        "" | "list" | "status" => configured_ask_rules(app),
+        _ => CommandResult::error(
+            "Usage: /config ask-rules [list|status] (read-only; does not edit permissions.toml)",
+        ),
+    }
+}
+
+fn configured_ask_rules(app: &App) -> CommandResult {
+    let store = match codewhale_config::ConfigStore::load(app.config_path.clone()) {
+        Ok(store) => store,
+        Err(err) => return CommandResult::error(format!("Failed to load config: {err}")),
+    };
+    let permissions_path = store.permissions_path();
+    let status = match permissions_file_status(&permissions_path) {
+        Ok(status) => status,
+        Err(err) => return CommandResult::error(err),
+    };
+
+    CommandResult::message(format_configured_ask_rules(
+        &permissions_path,
+        status,
+        &store.permissions().rules,
+    ))
+}
+
+fn permissions_file_status(path: &Path) -> Result<PermissionsFileStatus, String> {
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.len() == 0 => Ok(PermissionsFileStatus::Empty),
+        Ok(_) => Ok(PermissionsFileStatus::Present),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(PermissionsFileStatus::Missing),
+        Err(err) => Err(format!(
+            "Failed to inspect permissions.toml at {}: {err}",
+            path.display()
+        )),
+    }
+}
+
+fn format_configured_ask_rules(
+    permissions_path: &Path,
+    status: PermissionsFileStatus,
+    rules: &[codewhale_config::ToolAskRule],
+) -> String {
+    let mut lines = Vec::new();
+    lines.push("Configured ask rules".to_string());
+    lines.push(format!("Permissions path: {}", permissions_path.display()));
+    lines.push(format!("File status: {}", status.label()));
+    lines.push(format!("Rule count: {}", rules.len()));
+
+    if rules.is_empty() {
+        lines.push("No ask rules configured.".to_string());
+        return lines.join("\n");
+    }
+
+    lines.push("# | tool | command | path".to_string());
+    for (index, rule) in rules.iter().enumerate() {
+        lines.push(format!(
+            "{} | {} | {} | {}",
+            index + 1,
+            format_rule_field(Some(&rule.tool)),
+            format_rule_field(rule.command.as_deref()),
+            format_rule_field(rule.path.as_deref())
+        ));
+    }
+    lines.join("\n")
+}
+
+fn format_rule_field(value: Option<&str>) -> String {
+    match value {
+        Some("") => "\"\"".to_string(),
+        Some(value) => value.replace('\n', "\\n").replace('\r', "\\r"),
+        None => "(any)".to_string(),
     }
 }
 
@@ -2039,6 +2151,105 @@ mod tests {
         app.api_provider = crate::config::ApiProvider::Deepseek;
         app.model_ids_passthrough = false;
         app
+    }
+
+    #[test]
+    fn config_command_ask_rules_reports_missing_permissions_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let permissions_path =
+            codewhale_config::resolve_permissions_path(Some(config_path.clone())).unwrap();
+        let mut app = create_test_app();
+        app.config_path = Some(config_path);
+
+        let result = config_command(&mut app, Some("ask-rules"));
+        let msg = result.message.unwrap();
+
+        assert!(!result.is_error);
+        assert!(msg.contains("Configured ask rules"));
+        assert!(msg.contains(&format!("Permissions path: {}", permissions_path.display())));
+        assert!(msg.contains("File status: missing"));
+        assert!(msg.contains("Rule count: 0"));
+        assert!(msg.contains("No ask rules configured."));
+    }
+
+    #[test]
+    fn config_command_ask_rules_reports_empty_permissions_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let permissions_path =
+            codewhale_config::resolve_permissions_path(Some(config_path.clone())).unwrap();
+        fs::write(&permissions_path, "").unwrap();
+        let mut app = create_test_app();
+        app.config_path = Some(config_path);
+
+        let result = config_command(&mut app, Some("ask_rules"));
+        let msg = result.message.unwrap();
+
+        assert!(!result.is_error);
+        assert!(msg.contains(&format!("Permissions path: {}", permissions_path.display())));
+        assert!(msg.contains("File status: empty"));
+        assert!(msg.contains("Rule count: 0"));
+        assert!(msg.contains("No ask rules configured."));
+    }
+
+    #[test]
+    fn config_command_ask_rules_lists_loaded_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let permissions_path =
+            codewhale_config::resolve_permissions_path(Some(config_path.clone())).unwrap();
+        fs::write(
+            &permissions_path,
+            r#"
+[[rules]]
+tool = "exec_shell"
+command = "cargo test"
+
+[[rules]]
+tool = "edit_file"
+path = "src/a.rs"
+"#,
+        )
+        .unwrap();
+        let mut app = create_test_app();
+        app.config_path = Some(config_path);
+
+        let result = config_command(&mut app, Some("permissions status"));
+        let msg = result.message.unwrap();
+
+        assert!(!result.is_error);
+        assert!(msg.contains(&format!("Permissions path: {}", permissions_path.display())));
+        assert!(msg.contains("File status: present"));
+        assert!(msg.contains("Rule count: 2"));
+        assert!(msg.contains("# | tool | command | path"));
+        assert!(msg.contains("1 | exec_shell | cargo test | (any)"));
+        assert!(msg.contains("2 | edit_file | (any) | src/a.rs"));
+    }
+
+    #[test]
+    fn config_command_ask_rules_output_format_is_stable() {
+        let rules = vec![
+            codewhale_config::ToolAskRule::exec_shell("cargo test"),
+            codewhale_config::ToolAskRule::file_path("edit_file", r"src\a.rs"),
+        ];
+
+        let output = format_configured_ask_rules(
+            Path::new("permissions.toml"),
+            PermissionsFileStatus::Present,
+            &rules,
+        );
+
+        assert_eq!(
+            output,
+            "Configured ask rules\n\
+Permissions path: permissions.toml\n\
+File status: present\n\
+Rule count: 2\n\
+# | tool | command | path\n\
+1 | exec_shell | cargo test | (any)\n\
+2 | edit_file | (any) | src\\a.rs"
+        );
     }
 
     #[test]
