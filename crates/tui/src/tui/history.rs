@@ -1357,7 +1357,8 @@ impl GenericToolCell {
                 ));
             }
         } else {
-            let show_args = matches!(self.status, ToolStatus::Running) || self.output.is_none();
+            let show_args = matches!(self.status, ToolStatus::Running | ToolStatus::Failed)
+                || self.output.is_none();
             if show_args && let Some(summary) = self.input_summary.as_ref() {
                 lines.extend(render_compact_kv(
                     "args",
@@ -1381,11 +1382,17 @@ impl GenericToolCell {
                 ));
                 lines.extend(diff_render::render_diff(output, width));
             } else {
+                let output_mode =
+                    if matches!(mode, RenderMode::Live) && self.status == ToolStatus::Failed {
+                        RenderMode::Transcript
+                    } else {
+                        mode
+                    };
                 lines.extend(render_tool_output_mode(
                     output,
                     width,
                     TOOL_OUTPUT_LINE_LIMIT,
-                    mode,
+                    output_mode,
                 ));
             }
 
