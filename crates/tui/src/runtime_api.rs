@@ -11,8 +11,10 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use async_stream::stream;
 use axum::extract::{Path, Query, Request, State};
-use axum::http::{HeaderValue, Method, StatusCode, header};
-use axum::middleware::{self, Next};
+#[cfg(test)]
+use axum::http::header;
+use axum::http::{HeaderValue, Method, StatusCode};
+use axum::middleware;
 use axum::response::Html;
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -64,6 +66,11 @@ use crate::tools::subagent::{
 use codewhale_protocol::fleet::{
     FleetArtifactKind, FleetRun, FleetRunId, FleetWorkerEventPayload, FleetWorkerStatus,
 };
+
+mod auth;
+#[cfg(test)]
+use self::auth::{ResolvedRuntimeAuth, token_from_cookie_header};
+use self::auth::{require_runtime_token, resolve_runtime_auth, runtime_auth_status_lines};
 
 #[derive(Clone)]
 pub struct RuntimeApiState {
@@ -125,63 +132,6 @@ impl Default for RuntimeApiOptions {
             show_qr: false,
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ResolvedRuntimeAuth {
-    token: Option<String>,
-    generated: bool,
-}
-
-fn resolve_runtime_auth(
-    cli_token: Option<String>,
-    env_token: Option<String>,
-    insecure_no_auth: bool,
-) -> ResolvedRuntimeAuth {
-    if let Some(token) = first_nonblank_token(cli_token).or_else(|| first_nonblank_token(env_token))
-    {
-        return ResolvedRuntimeAuth {
-            token: Some(token),
-            generated: false,
-        };
-    }
-    if insecure_no_auth {
-        return ResolvedRuntimeAuth {
-            token: None,
-            generated: false,
-        };
-    }
-    ResolvedRuntimeAuth {
-        token: Some(generate_runtime_token()),
-        generated: true,
-    }
-}
-
-fn runtime_auth_status_lines(auth: &ResolvedRuntimeAuth) -> Vec<String> {
-    if auth.generated {
-        return vec![
-            "Runtime API auth: generated bearer token for this process (not printed).".to_string(),
-            "  Set CODEWHALE_RUNTIME_TOKEN (or DEEPSEEK_RUNTIME_TOKEN as an alias) or pass --auth-token when another client needs to connect.".to_string(),
-        ];
-    }
-    if auth.token.is_some() {
-        return vec!["Runtime API auth: bearer token required for /v1/* routes.".to_string()];
-    }
-    vec!["Runtime API auth: disabled by explicit insecure mode.".to_string()]
-}
-
-fn first_nonblank_token(token: Option<String>) -> Option<String> {
-    token
-        .map(|token| token.trim().to_string())
-        .filter(|token| !token.is_empty())
-}
-
-fn generate_runtime_token() -> String {
-    format!(
-        "cwrt_{}{}",
-        uuid::Uuid::new_v4().simple(),
-        uuid::Uuid::new_v4().simple()
-    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -708,99 +658,6 @@ pub fn build_router(state: RuntimeApiState) -> Router {
         .merge(api_routes)
         .layer(cors_layer(&state.cors_origins))
         .with_state(state)
-}
-
-async fn require_runtime_token(
-    State(state): State<RuntimeApiState>,
-    req: Request,
-    next: Next,
-) -> Response {
-    let Some(expected) = state.runtime_token.as_deref() else {
-        return next.run(req).await;
-    };
-    let authorized = request_has_runtime_token(&req, expected);
-
-    if authorized {
-        next.run(req).await
-    } else {
-        runtime_token_required_response()
-    }
-}
-
-fn request_has_runtime_token(req: &Request, expected: &str) -> bool {
-    req.headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|raw| raw.strip_prefix("Bearer "))
-        .is_some_and(|token| token == expected)
-        || req
-            .headers()
-            .get("x-codewhale-runtime-token")
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|token| token == expected)
-        || req
-            .headers()
-            .get("x-deepseek-runtime-token")
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|token| token == expected)
-        || token_from_cookie_header(
-            req.headers()
-                .get(header::COOKIE)
-                .and_then(|value| value.to_str().ok()),
-        )
-        .is_some_and(|token| token == expected)
-}
-
-fn runtime_token_required_response() -> Response {
-    (
-        StatusCode::UNAUTHORIZED,
-        Json(json!({
-            "error": {
-                "message": "runtime API bearer token required",
-                "status": StatusCode::UNAUTHORIZED.as_u16(),
-            }
-        })),
-    )
-        .into_response()
-}
-
-fn token_from_cookie_header(cookie: Option<&str>) -> Option<String> {
-    cookie.and_then(|cookie| {
-        cookie.split(';').find_map(|pair| {
-            let pair = pair.trim();
-            let (key, value) = pair.split_once('=')?;
-            (key == RUNTIME_TOKEN_COOKIE)
-                .then(|| percent_decode_query_component(value.trim()))
-                .flatten()
-        })
-    })
-}
-
-fn percent_decode_query_component(value: &str) -> Option<String> {
-    let bytes = value.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        match bytes[index] {
-            b'%' => {
-                let hi = *bytes.get(index + 1)?;
-                let lo = *bytes.get(index + 2)?;
-                let hi = (hi as char).to_digit(16)? as u8;
-                let lo = (lo as char).to_digit(16)? as u8;
-                decoded.push((hi << 4) | lo);
-                index += 3;
-            }
-            b'+' => {
-                decoded.push(b' ');
-                index += 1;
-            }
-            byte => {
-                decoded.push(byte);
-                index += 1;
-            }
-        }
-    }
-    String::from_utf8(decoded).ok()
 }
 
 async fn mobile_page(State(state): State<RuntimeApiState>, req: Request) -> Response {
@@ -3360,7 +3217,6 @@ fn snapshot_entries_for_workspace(
 }
 
 const MOBILE_HTML: &str = include_str!("runtime_mobile.html");
-const RUNTIME_TOKEN_COOKIE: &str = "codewhale_runtime_token";
 
 /// Built-in dev origins always allowed by the runtime API (whalescale#255).
 const DEFAULT_CORS_ORIGINS: &[&str] = &[
