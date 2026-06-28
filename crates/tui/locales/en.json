@@ -101,7 +101,7 @@
     "CmdPluginDetailApproval": "Approval: {approval}",
     "CmdPluginDetailPath": "Path: {path}",
     "CmdMemoryDescription": "Inspect or manage the persistent user-memory file",
-    "CmdModeDescription": "Switch mode or open picker: /mode [agent|plan|yolo|1|2|3]",
+    "CmdModeDescription": "Switch mode or open picker: /mode [agent|plan|yolo|1|2|4]",
     "CmdModelDescription": "Switch or view current model",
     "CmdModelsDescription": "Toolbox: fetch live model IDs from the active API",
     "CmdModelDbDescription": "Reference: browse the bundled model database",

@@ -1394,8 +1394,8 @@ fn clear_todos_resets_plan_state() {
 fn app_mode_helpers_centralize_parse_labels_and_cycle_order() {
     assert_eq!(AppMode::parse("agent"), Some(AppMode::Agent));
     assert_eq!(AppMode::parse("2"), Some(AppMode::Plan));
-    assert_eq!(AppMode::parse("auto"), Some(AppMode::Auto));
-    assert_eq!(AppMode::parse("3"), Some(AppMode::Auto));
+    assert_eq!(AppMode::parse("auto"), Some(AppMode::Agent));
+    assert_eq!(AppMode::parse("3"), None);
     assert_eq!(AppMode::parse("YOLO"), Some(AppMode::Yolo));
     assert_eq!(AppMode::parse("4"), Some(AppMode::Yolo));
     assert_eq!(AppMode::parse("fast"), None);
@@ -1410,21 +1410,21 @@ fn app_mode_helpers_centralize_parse_labels_and_cycle_order() {
     assert_eq!(AppMode::Yolo.number(), '4');
     assert_eq!(
         AppMode::CHOICES,
-        [AppMode::Agent, AppMode::Plan, AppMode::Auto, AppMode::Yolo]
+        [AppMode::Agent, AppMode::Plan, AppMode::Yolo]
     );
     assert_eq!(
         AppMode::CYCLE,
-        [AppMode::Plan, AppMode::Agent, AppMode::Auto, AppMode::Yolo]
+        [AppMode::Plan, AppMode::Agent, AppMode::Yolo]
     );
 
     assert_eq!(AppMode::Plan.next(), AppMode::Agent);
-    assert_eq!(AppMode::Agent.next(), AppMode::Auto);
-    assert_eq!(AppMode::Auto.next(), AppMode::Yolo);
+    assert_eq!(AppMode::Agent.next(), AppMode::Yolo);
+    assert_eq!(AppMode::Auto.next(), AppMode::Agent);
     assert_eq!(AppMode::Yolo.next(), AppMode::Plan);
     assert_eq!(AppMode::Plan.previous(), AppMode::Yolo);
     assert_eq!(AppMode::Agent.previous(), AppMode::Plan);
     assert_eq!(AppMode::Auto.previous(), AppMode::Agent);
-    assert_eq!(AppMode::Yolo.previous(), AppMode::Auto);
+    assert_eq!(AppMode::Yolo.previous(), AppMode::Agent);
 }
 
 #[test]
@@ -1446,7 +1446,7 @@ fn test_cycle_mode_reverse_transitions() {
 
     app.mode = AppMode::Yolo;
     app.cycle_mode_reverse();
-    assert_eq!(app.mode, AppMode::Auto);
+    assert_eq!(app.mode, AppMode::Agent);
 
     app.mode = AppMode::Agent;
     app.cycle_mode_reverse();

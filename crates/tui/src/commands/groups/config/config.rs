@@ -1781,7 +1781,7 @@ pub fn mode(app: &mut App, arg: Option<&str>) -> CommandResult {
                 CommandResult::message(message)
             }
         }
-        None => CommandResult::error("Usage: /mode [agent|plan|yolo|1|2|3]"),
+        None => CommandResult::error("Usage: /mode [agent|plan|yolo|1|2|4]"),
     }
 }
 
@@ -2392,8 +2392,8 @@ Rule count: 2\n\
         assert_eq!(result.action, Some(AppAction::ModeChanged(AppMode::Plan)));
         assert_eq!(app.mode, AppMode::Plan);
         let result = mode(&mut app, Some("3"));
-        assert_eq!(result.action, Some(AppAction::ModeChanged(AppMode::Auto)));
-        assert_eq!(app.mode, AppMode::Auto);
+        assert!(result.is_error);
+        assert_eq!(app.mode, AppMode::Plan);
         let result = mode(&mut app, Some("4"));
         assert_eq!(result.action, Some(AppAction::ModeChanged(AppMode::Yolo)));
         assert_eq!(app.mode, AppMode::Yolo);

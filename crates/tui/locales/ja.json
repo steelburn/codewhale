@@ -91,7 +91,7 @@
     "CmdLogoutDescription": "API キーを消去してセットアップに戻る",
     "CmdMcpDescription": "MCP サーバを開く・管理する",
     "CmdMemoryDescription": "永続ユーザーメモリファイルを確認・管理",
-    "CmdModeDescription": "動作モードを切り替え、または選択画面を開く: /mode [agent|plan|yolo|1|2|3]",
+    "CmdModeDescription": "動作モードを切り替え、または選択画面を開く: /mode [agent|plan|yolo|1|2|4]",
     "CmdModelDescription": "現在のモデルを切り替え・確認",
     "CmdModelsDescription": "API から利用可能なモデルを一覧表示",
     "CmdModelDbDescription": "内蔵のモデルリファレンスデータベースを閲覧",

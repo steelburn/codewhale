@@ -194,12 +194,7 @@ mod tests {
     fn number_keys_select_modes() {
         let mut view = ModePickerView::new(AppMode::Agent, Locale::En);
         let action = view.handle_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
-        match action {
-            ViewAction::EmitAndClose(ViewEvent::ModeSelected { mode }) => {
-                assert_eq!(mode, AppMode::Auto);
-            }
-            other => panic!("expected ModeSelected, got {other:?}"),
-        }
+        assert!(matches!(action, ViewAction::None));
 
         let mut view = ModePickerView::new(AppMode::Agent, Locale::En);
         let action = view.handle_key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE));

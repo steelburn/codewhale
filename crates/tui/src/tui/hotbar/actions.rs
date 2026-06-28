@@ -510,13 +510,6 @@ impl HotbarActionSource for BuiltinHotbarActionSource {
             AppHotbarKind::Mode(AppMode::Agent),
         ));
         registry.register(AppHotbarAction::new(
-            "mode.auto",
-            "auto",
-            "Auto mode",
-            "Switch the conversation into Auto mode.",
-            AppHotbarKind::Mode(AppMode::Auto),
-        ));
-        registry.register(AppHotbarAction::new(
             "mode.yolo",
             "yolo",
             "YOLO mode",
@@ -1406,7 +1399,6 @@ mod tests {
             vec![
                 "filetree.toggle",
                 "mode.agent",
-                "mode.auto",
                 "mode.plan",
                 "mode.yolo",
                 "palette.open",
@@ -1512,7 +1504,6 @@ mod tests {
         let registry = HotbarActionRegistry::with_builtins();
         let plan = registry.get("mode.plan").expect("plan action");
         let agent = registry.get("mode.agent").expect("agent action");
-        let auto = registry.get("mode.auto").expect("auto action");
         let yolo = registry.get("mode.yolo").expect("yolo action");
         let mut app = test_app();
 
@@ -1526,14 +1517,6 @@ mod tests {
         assert_eq!(app.mode, AppMode::Plan);
         assert!(plan.is_active(&app));
         assert!(!agent.is_active(&app));
-
-        assert_eq!(
-            auto.dispatch(&mut app).expect("dispatch auto"),
-            HotbarDispatch::AppAction(AppAction::ModeChanged(AppMode::Auto))
-        );
-        assert!(app.allow_shell);
-        assert!(!app.trust_mode);
-        assert!(auto.is_active(&app));
 
         assert_eq!(
             yolo.dispatch(&mut app).expect("dispatch yolo"),

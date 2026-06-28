@@ -92,7 +92,7 @@
   "CmdLogoutDescription": "清除 API 密钥并返回设置",
   "CmdMcpDescription": "打开或管理 MCP 服务器",
   "CmdMemoryDescription": "查看或管理持久用户记忆文件",
-  "CmdModeDescription": "切换运行模式或打开选择器：/mode [agent|plan|yolo|1|2|3]",
+  "CmdModeDescription": "切换运行模式或打开选择器：/mode [agent|plan|yolo|1|2|4]",
   "CmdModelDescription": "切换或查看当前模型",
   "CmdModelsDescription": "列出 API 中可用的模型",
   "CmdModelDbDescription": "浏览内置的模型参考数据库",

@@ -903,18 +903,20 @@ const MAX_COMPOSER_DISPLAY_CHARS: usize = 4_000;
 const MAX_DRAFT_HISTORY: usize = 50;
 
 impl AppMode {
-    /// Keyboard cycle order: Plan -> Agent -> Auto -> YOLO -> Plan.
-    pub const CYCLE: [Self; 4] = [Self::Plan, Self::Agent, Self::Auto, Self::Yolo];
+    /// Keyboard cycle order: Plan -> Agent -> YOLO -> Plan.
+    ///
+    /// `Auto` remains an internal variant while the real implementation is
+    /// redesigned; do not expose it through user-facing mode selection (#3733).
+    pub const CYCLE: [Self; 3] = [Self::Plan, Self::Agent, Self::Yolo];
 
     /// User-facing picker / numeric command order.
-    pub const CHOICES: [Self; 4] = [Self::Agent, Self::Plan, Self::Auto, Self::Yolo];
+    pub const CHOICES: [Self; 3] = [Self::Agent, Self::Plan, Self::Yolo];
 
     #[must_use]
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "agent" | "1" => Some(Self::Agent),
+            "agent" | "auto" | "1" => Some(Self::Agent),
             "plan" | "2" => Some(Self::Plan),
-            "auto" | "3" => Some(Self::Auto),
             "yolo" | "4" | "bypass" | "bypass-permissions" | "bypasspermissions" => {
                 Some(Self::Yolo)
             }
@@ -1008,19 +1010,17 @@ impl AppMode {
 
     #[must_use]
     pub fn next(self) -> Self {
-        let index = Self::CYCLE
-            .iter()
-            .position(|mode| *mode == self)
-            .unwrap_or(0);
+        let Some(index) = Self::CYCLE.iter().position(|mode| *mode == self) else {
+            return Self::Agent;
+        };
         Self::CYCLE[(index + 1) % Self::CYCLE.len()]
     }
 
     #[must_use]
     pub fn previous(self) -> Self {
-        let index = Self::CYCLE
-            .iter()
-            .position(|mode| *mode == self)
-            .unwrap_or(0);
+        let Some(index) = Self::CYCLE.iter().position(|mode| *mode == self) else {
+            return Self::Agent;
+        };
         Self::CYCLE[(index + Self::CYCLE.len() - 1) % Self::CYCLE.len()]
     }
 }

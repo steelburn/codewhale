@@ -87,7 +87,7 @@
     "CmdLogoutDescription": "Limpar a chave de API e voltar à configuração",
     "CmdMcpDescription": "Abrir ou gerenciar servidores MCP",
     "CmdMemoryDescription": "Inspecionar ou gerenciar o arquivo persistente de memória do usuário",
-    "CmdModeDescription": "Alternar modo ou abrir seletor: /mode [agent|plan|yolo|1|2|3]",
+    "CmdModeDescription": "Alternar modo ou abrir seletor: /mode [agent|plan|yolo|1|2|4]",
     "CmdModelDescription": "Trocar ou exibir o modelo atual",
     "CmdModelsDescription": "Listar os modelos disponíveis pela API",
     "CmdModelDbDescription": "Navegar pelo banco de dados de referência de modelos integrado",

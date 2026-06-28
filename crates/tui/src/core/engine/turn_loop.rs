@@ -1750,6 +1750,15 @@ impl Engine {
                     read_only = true;
                 }
 
+                if blocked_error.is_none()
+                    && mode == AppMode::Plan
+                    && plan_mode_blocks_write_capable_tool(&tool_name, read_only)
+                {
+                    blocked_error = Some(ToolError::permission_denied(format!(
+                        "'{tool_name}' is not available in Plan mode - switch to Agent or YOLO mode to modify files or run write-capable tools."
+                    )));
+                }
+
                 // #3026: a hook `ask` decision forces the approval prompt even
                 // for tools the registry would auto-run. Must stay after the
                 // registry-based computation above, which assigns rather than
@@ -2783,6 +2792,11 @@ fn should_pre_tool_snapshot(
         && matches!(tool_name, "write_file" | "edit_file" | "apply_patch")
 }
 
+fn plan_mode_blocks_write_capable_tool(tool_name: &str, read_only: bool) -> bool {
+    matches!(tool_name, "write_file" | "edit_file" | "apply_patch")
+        || (McpPool::is_mcp_tool(tool_name) && !read_only)
+}
+
 /// Synthesize the tool result recorded for a tool call that never executed
 /// because the turn was cancelled mid-batch (#3216 / #2211).
 ///
@@ -2857,6 +2871,27 @@ mod pre_tool_snapshot_gate_tests {
                 "{tool} does not modify the workspace and must not be snapshotted"
             );
         }
+    }
+
+    #[test]
+    fn plan_mode_blocks_file_and_mcp_write_tools() {
+        for tool in ["write_file", "edit_file", "apply_patch"] {
+            assert!(plan_mode_blocks_write_capable_tool(tool, false));
+        }
+
+        assert!(plan_mode_blocks_write_capable_tool(
+            "mcp_filesystem_write",
+            false
+        ));
+        assert!(!plan_mode_blocks_write_capable_tool(
+            "mcp_filesystem_read",
+            true
+        ));
+        assert!(!plan_mode_blocks_write_capable_tool("read_file", true));
+        assert!(!plan_mode_blocks_write_capable_tool(
+            "request_user_input",
+            false
+        ));
     }
 }
 

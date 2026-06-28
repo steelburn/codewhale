@@ -42,6 +42,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Deferred Auto mode from the user-facing mode picker, cycle, hotbar, and
+  `/mode` command until it has a distinct prompt and auto-review behavior;
+  existing `auto` mode text now folds back to Agent instead of selecting a
+  hollow mode (#3730, #3733).
 - Clarified the Fleet setup surface and docs so Fleet is treated as the durable
   sub-agent configuration layer while WhaleFlow is the agent-authored
   orchestration plan that selects and monitors Fleet slots.
@@ -51,6 +55,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Added a turn-loop Plan-mode guard for file-writing tools and write-capable MCP
+  tools so Plan's "no writes" promise is enforced before approval or execution,
+  not only by the sandbox/catalog layer (#3734).
 - Preserved the durable review safety floor for publish-like shell actions in
   YOLO mode, so `cargo publish`, `npm publish`, and tag/release pushes force
   approval instead of silently auto-approving (#3735).

@@ -231,7 +231,6 @@ pub enum TranscriptSpacingValue {
 pub enum DefaultModeValue {
     Agent,
     Plan,
-    Auto,
     Yolo,
 }
 
@@ -842,7 +841,6 @@ impl DefaultModeValue {
         match self {
             Self::Agent => "agent",
             Self::Plan => "plan",
-            Self::Auto => "auto",
             Self::Yolo => "yolo",
         }
     }
@@ -955,7 +953,7 @@ impl From<&str> for DefaultModeValue {
         match AppMode::from_setting(value) {
             AppMode::Agent => Self::Agent,
             AppMode::Plan => Self::Plan,
-            AppMode::Auto => Self::Auto,
+            AppMode::Auto => Self::Agent,
             AppMode::Yolo => Self::Yolo,
         }
     }

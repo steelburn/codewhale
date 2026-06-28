@@ -96,7 +96,7 @@
     "CmdPluginDetailApproval": "Approval: {approval}",
     "CmdPluginDetailPath": "Path: {path}",
     "CmdMemoryDescription": "Inspeccionar o gestionar el archivo persistente de memoria del usuario",
-    "CmdModeDescription": "Alternar modo o abrir selector: /mode [agent|plan|yolo|1|2|3]",
+    "CmdModeDescription": "Alternar modo o abrir selector: /mode [agent|plan|yolo|1|2|4]",
     "CmdModelDescription": "Cambiar o mostrar el modelo actual",
     "CmdModelsDescription": "Listar los modelos disponibles por la API",
     "CmdModelDbDescription": "Explorar la base de datos de referencia de modelos integrada",

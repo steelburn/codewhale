@@ -91,7 +91,7 @@
     "CmdLogoutDescription": "Xóa khóa API và quay lại bước thiết lập",
     "CmdMcpDescription": "Mở hoặc quản lý các máy chủ MCP",
     "CmdMemoryDescription": "Kiểm tra hoặc quản lý tệp bộ nhớ người dùng liên tục",
-    "CmdModeDescription": "Chuyển đổi chế độ hoặc mở bảng chọn: /mode [agent|plan|yolo|1|2|3]",
+    "CmdModeDescription": "Chuyển đổi chế độ hoặc mở bảng chọn: /mode [agent|plan|yolo|1|2|4]",
     "CmdModelDescription": "Chuyển đổi hoặc xem mô hình AI hiện tại",
     "CmdModelsDescription": "Liệt kê các mô hình khả dụng từ API",
     "CmdModelDbDescription": "Duyệt cơ sở dữ liệu tham chiếu mô hình tích hợp",
