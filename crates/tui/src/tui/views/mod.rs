@@ -308,6 +308,17 @@ pub trait ModalView: std::any::Any {
         ViewAction::None
     }
     fn render(&self, area: Rect, buf: &mut Buffer);
+    /// The region this modal actually paints within the full frame `area`.
+    ///
+    /// Defaults to the whole frame, which is the legacy full-screen overlay
+    /// behaviour every picker/menu still relies on. Inline modals (the
+    /// approval prompt) override this to return a bottom-anchored band so the
+    /// backdrop only dims their strip and the transcript above stays visible.
+    /// The returned rect MUST match the region the modal renders into, or the
+    /// dim and the painted content will disagree.
+    fn occupied_region(&self, area: Rect) -> Rect {
+        area
+    }
     fn update_subagents(&mut self, _agents: &[SubAgentResult]) -> bool {
         false
     }
@@ -363,10 +374,14 @@ impl ViewStack {
     }
 
     pub fn render(&self, area: Rect, buf: &mut Buffer) {
-        if !self.views.is_empty() {
-            render_modal_backdrop(area, buf);
-        }
+        // Dim each view's own occupied region rather than the whole frame, so
+        // an inline modal (the approval prompt) leaves the transcript above it
+        // visible instead of blacking out the screen. Full-screen modals keep
+        // the default `occupied_region` of the entire frame, so their backdrop
+        // is unchanged.
         for view in &self.views {
+            let region = view.occupied_region(area);
+            render_modal_backdrop(region, buf);
             view.render(area, buf);
         }
     }
