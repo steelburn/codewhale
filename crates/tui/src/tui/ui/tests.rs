@@ -4186,7 +4186,12 @@ fn hotbar_alt_digit_is_blocked_while_decision_card_is_active() {
 #[test]
 fn hotbar_dispatches_bound_slot_and_ignores_empty_slot() {
     let mut app = create_test_app();
-    let config = Config::default();
+    // #3807: a fresh config has no bindings, so opt in with the default slots
+    // (slot 4 = mode.agent) to exercise dispatch of a bound slot.
+    let config = Config {
+        hotbar: Some(codewhale_config::default_hotbar_bindings_toml()),
+        ..Config::default()
+    };
     app.onboarding = OnboardingState::None;
     app.mode = AppMode::Plan;
     app.needs_redraw = false;

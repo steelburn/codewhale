@@ -9092,22 +9092,25 @@ fn disable_hotbar(app: &mut App, config: &mut Config) {
     app.needs_redraw = true;
 }
 
-/// Restore the default recommended Hotbar slots: remove the `hotbar` key so the
-/// resolver falls back to the built-in defaults. This is an explicit reset, so
-/// any custom bindings are replaced with the recommended set.
+/// Show the default recommended Hotbar slots. Since #3807 an absent `hotbar`
+/// key means "hidden", so `/hotbar on` persists the explicit default bindings
+/// rather than deleting the key. This is an explicit reset, so any custom
+/// bindings are replaced with the recommended set.
 fn restore_hotbar_defaults(app: &mut App, config: &mut Config) {
-    match crate::config_persistence::remove_hotbar_from_config(app.config_path.as_deref()) {
+    let defaults = codewhale_config::default_hotbar_bindings_toml();
+    match crate::config_persistence::persist_hotbar_bindings(app.config_path.as_deref(), &defaults)
+    {
         Ok(path) => {
-            config.hotbar = None;
+            config.hotbar = Some(defaults);
             app.status_message = Some(format!(
-                "Hotbar restored to default slots ({}). Customize with `/hotbar`.",
+                "Hotbar enabled with the default slots ({}). Customize with `/hotbar`.",
                 path.display()
             ));
         }
         Err(err) => {
-            app.status_message = Some(format!("Failed to restore Hotbar defaults: {err}"));
+            app.status_message = Some(format!("Failed to enable the Hotbar: {err}"));
             app.add_message(HistoryCell::System {
-                content: format!("Failed to restore Hotbar defaults: {err}"),
+                content: format!("Failed to enable the Hotbar: {err}"),
             });
         }
     }

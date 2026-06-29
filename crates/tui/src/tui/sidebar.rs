@@ -95,10 +95,12 @@ fn split_sidebar_hotbar_area(area: Rect, show_hotbar: bool) -> (Rect, Option<Rec
     (sections[0], Some(sections[1]))
 }
 
-/// The Hotbar is "disabled" only when the user persisted an explicit empty
-/// `hotbar = []`. A missing `hotbar` key (`None`) means "use built-in defaults",
-/// so it is *not* disabled. This keeps `/hotbar on` (remove key → defaults) and
-/// `/hotbar off` (empty array → hidden) distinct.
+/// The Hotbar is "disabled" when the user persisted an explicit empty
+/// `hotbar = []`. Since #3807 a missing `hotbar` key (`None`) also renders no
+/// panel — the Hotbar is hidden until the user opts in — but it resolves to
+/// zero bindings via [`hotbar_panel_enabled`] rather than the explicit-disabled
+/// state, which keeps `/hotbar on` (write default bindings) and `/hotbar off`
+/// (write `[]`) distinct on disk.
 fn is_hotbar_disabled(config: &Config) -> bool {
     config.hotbar.as_deref().is_some_and(<[_]>::is_empty)
 }
@@ -3480,25 +3482,23 @@ mod tests {
     }
 
     #[test]
-    fn hotbar_panel_slots_resolve_default_bindings_and_active_state() {
+    fn hotbar_panel_hidden_for_fresh_default_config() {
+        // #3807: a fresh config has no `hotbar` key, so the panel is hidden
+        // until the user opts in. Slot resolution + active state are covered by
+        // `hotbar_panel_slots_resolve_configured_bindings_and_active_state`.
         let mut app = create_test_app();
         app.mode = AppMode::Agent;
         app.sidebar_focus = SidebarFocus::Pinned;
 
-        assert!(hotbar_panel_enabled(&app, &Config::default()));
-
-        let slots = hotbar_panel_slots(&app, &Config::default());
-
-        assert_eq!(slots.len(), 8);
-        assert_eq!(slots[0].slot, 1);
-        assert_eq!(slots[0].label, "voice");
-        assert_eq!(slots[0].state, HotbarSlotState::Inactive);
-        assert_eq!(slots[3].label, "agent");
-        assert_eq!(slots[3].state, HotbarSlotState::Active);
-        let slot_4_chord = format!("{}4", crate::tui::widgets::key_hint::alt_prefix());
         assert!(
-            slots[3].full_text.contains(&slot_4_chord),
-            "hover text should expose the dispatch chord: {slots:?}"
+            !hotbar_panel_enabled(&app, &Config::default()),
+            "fresh config must not enable the Hotbar panel"
+        );
+        assert!(
+            hotbar_panel_slots(&app, &Config::default())
+                .iter()
+                .all(|slot| slot.state == HotbarSlotState::Empty),
+            "fresh config resolves to no bound slots"
         );
     }
 
@@ -3677,7 +3677,12 @@ mod tests {
         let mut app = create_test_app();
         app.sidebar_focus = SidebarFocus::Pinned;
         app.mode = AppMode::Agent;
-        let config = Config::default();
+        // #3807: the panel is hidden on a fresh config, so opt in explicitly
+        // with the default bindings to smoke-test the rendered panel.
+        let config = Config {
+            hotbar: Some(codewhale_config::default_hotbar_bindings_toml()),
+            ..Config::default()
+        };
 
         let backend = TestBackend::new(44, 12);
         let mut terminal = Terminal::new(backend).expect("terminal");

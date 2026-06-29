@@ -335,29 +335,30 @@ fn provider_auth_source_rejects_empty_command() {
 }
 
 #[test]
-fn hotbar_defaults_when_config_is_absent() {
+fn hotbar_hidden_when_config_is_absent() {
+    // #3807: an absent `hotbar` key resolves to no bindings, so the Hotbar is
+    // hidden until the user opts in. The default slots are still available
+    // explicitly via `default_hotbar_bindings_toml()` (what `/hotbar on` writes).
     let config = ConfigToml::default();
 
     let resolved = config.resolve_hotbar_bindings(&DEFAULT_HOTBAR_ACTIONS);
 
     assert_eq!(resolved.warnings, Vec::new());
-    assert_eq!(resolved.bindings, default_hotbar_bindings());
+    assert!(
+        resolved.bindings.is_empty(),
+        "fresh config must resolve to no hotbar bindings: {:?}",
+        resolved.bindings
+    );
+
+    // The explicit default set still expands to the eight recommended slots.
+    let mut explicit = ConfigToml::default();
+    explicit.hotbar = Some(default_hotbar_bindings_toml());
     assert_eq!(
-        resolved
-            .bindings
-            .iter()
-            .map(|binding| (binding.slot, binding.action.as_str()))
-            .collect::<Vec<_>>(),
-        vec![
-            (1, "voice.toggle"),
-            (2, "session.compact"),
-            (3, "mode.plan"),
-            (4, "mode.agent"),
-            (5, "mode.yolo"),
-            (6, "palette.open"),
-            (7, "sidebar.toggle"),
-            (8, "trust.toggle"),
-        ]
+        explicit
+            .resolve_hotbar_bindings(&DEFAULT_HOTBAR_ACTIONS)
+            .bindings,
+        default_hotbar_bindings(),
+        "an explicit default-bindings config still shows all eight slots"
     );
 }
 

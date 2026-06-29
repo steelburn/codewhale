@@ -625,7 +625,9 @@ mod tests {
         );
         assert_eq!(view.selected_source(), Some(HotbarActionCategory::App));
         assert!(view.recommended_action_ids().contains("mode.agent"));
-        assert!(view.checked_action_ids().contains("mode.plan"));
+        // #3807: a fresh config seeds no bindings, so the wizard opens with
+        // nothing checked until the user opts in.
+        assert!(view.checked_action_ids().is_empty());
     }
 
     #[test]
