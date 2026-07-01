@@ -151,6 +151,20 @@ fn format_status(app: &App) -> String {
     } else {
         out.push_str("- AGENTS/project instructions: not present\n");
     }
+    let whale_warnings = ignored_whale_warnings(&context.warnings);
+    if whale_warnings.is_empty() {
+        out.push_str("- Legacy WHALE.md: not present\n");
+    } else {
+        let _ = writeln!(
+            out,
+            "- Legacy WHALE.md: ignored; migration needed ({} location{})",
+            whale_warnings.len(),
+            if whale_warnings.len() == 1 { "" } else { "s" }
+        );
+        for warning in whale_warnings {
+            let _ = writeln!(out, "  - {warning}");
+        }
+    }
     let handoff_path = app.workspace.join(crate::prompts::HANDOFF_RELATIVE_PATH);
     let _ = writeln!(
         out,
@@ -461,6 +475,14 @@ fn posture_label(source: RuntimePostureSource) -> &'static str {
     }
 }
 
+fn ignored_whale_warnings(warnings: &[String]) -> Vec<&str> {
+    warnings
+        .iter()
+        .map(String::as_str)
+        .filter(|warning| warning.contains("WHALE.md is ignored"))
+        .collect()
+}
+
 fn help_text() -> String {
     "Usage: /constitution [status|preview|bundled|edit|review|repair|repo|explain|posture]"
         .to_string()
@@ -477,6 +499,8 @@ The user-global constitution is personal standing law. It is structured, rendere
 
 AGENTS.md and project instructions are implementation guidance. They can describe build commands, repository norms, and local workflows, but they should not replace constitution policy or raw full-prompt editing.
 
+WHALE.md is ignored. Move ordinary project instructions to AGENTS.md and CodeWhale-specific authority policy to .codewhale/constitution.json.
+
 Runtime posture is separate. A constitution can recommend autonomy, but it does not change approval policy, sandbox, shell, network, trust, MCP permissions, or default mode. Use /constitution posture to review those controls.";
 
 #[cfg(test)]
@@ -490,9 +514,13 @@ mod tests {
     use tempfile::tempdir;
 
     fn test_app() -> App {
+        test_app_with_workspace(PathBuf::from("."))
+    }
+
+    fn test_app_with_workspace(workspace: PathBuf) -> App {
         let options = TuiOptions {
             model: "deepseek-v4-pro".to_string(),
-            workspace: PathBuf::from("."),
+            workspace,
             config_path: None,
             config_profile: None,
             allow_shell: false,
@@ -532,6 +560,21 @@ mod tests {
         assert!(result.message.is_none());
         assert_eq!(app.view_stack.top_kind(), Some(ModalKind::Pager));
         assert!(pop_pager_body(&mut app).contains("Constitution Manager"));
+    }
+
+    #[test]
+    fn constitution_manager_marks_whale_md_ignored() {
+        let tmp = tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("WHALE.md"), "legacy instructions").expect("write whale");
+        let mut app = test_app_with_workspace(tmp.path().to_path_buf());
+
+        let result = ConstitutionCmd::execute(&mut app, None);
+
+        assert!(result.message.is_none());
+        let body = pop_pager_body(&mut app);
+        assert!(body.contains("Legacy WHALE.md: ignored"));
+        assert!(body.contains("WHALE.md is ignored"));
+        assert!(!body.contains("legacy instructions"));
     }
 
     #[test]

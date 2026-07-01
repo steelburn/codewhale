@@ -43,8 +43,8 @@ Each repo can carry two distinct, complementary files:
   ```
 
   All fields are optional. When present, the file is rendered into the system
-  prompt as concise prose in a higher-authority block and takes precedence over
-  a legacy `WHALE.md`.
+  prompt as concise prose in a higher-authority block. Legacy `WHALE.md` files
+  are ignored and reported as migration-only diagnostics.
 
   This is the **local-law** layer in CodeWhale's hierarchy: *base myth & global
   Constitution* (the model prompt in `prompts/constitution.md`, including the Brother
@@ -55,13 +55,11 @@ Each repo can carry two distinct, complementary files:
   current user request.
 
 > **`WHALE.md` is deprecated.** It overlapped confusingly with `AGENTS.md`.
-> CodeWhale still **reads** an existing `WHALE.md` (below `AGENTS.md`) so old
-> repos keep working, and emits a deprecation notice, but it is no longer
-> created or recommended and will be dropped from default discovery after a
-> deprecation window. Move ordinary instructions to `AGENTS.md` and
-> CodeWhale-specific authority policy to `.codewhale/constitution.json`. (The
-> global CodeWhale Constitution shipped in the model prompt is a separate thing
-> and is unaffected.)
+> CodeWhale no longer reads `WHALE.md` as project or global context. If one is
+> present, setup/context diagnostics report it as ignored so you can migrate it.
+> Move ordinary instructions to `AGENTS.md` and CodeWhale-specific authority
+> policy to `.codewhale/constitution.json`. (The global CodeWhale Constitution
+> shipped in the model prompt is a separate thing and is unaffected.)
 
 ### Overriding the global base prompt (#3638)
 

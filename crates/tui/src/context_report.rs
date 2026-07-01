@@ -859,6 +859,29 @@ mod tests {
     }
 
     #[test]
+    fn context_report_marks_whale_md_ignored_without_loading_body() {
+        let tmp = tempdir().expect("tempdir");
+        fs::write(tmp.path().join("WHALE.md"), "SECRET_LEGACY_WHALE_BODY").expect("write whale");
+
+        let report = build_headless_context_report(&Config::default(), tmp.path());
+        assert!(
+            report.entries.iter().any(|entry| {
+                entry.source_kind == SourceKind::ProjectContextWarning
+                    && entry
+                        .truncation_reason
+                        .as_deref()
+                        .is_some_and(|reason| reason.contains("WHALE.md is ignored"))
+            }),
+            "ignored WHALE.md should be visible as a migration warning: {:?}",
+            report.entries
+        );
+        assert!(
+            !context_report_json(&report).contains("SECRET_LEGACY_WHALE_BODY"),
+            "ignored WHALE.md body must not enter context report"
+        );
+    }
+
+    #[test]
     fn app_context_report_omits_legacy_memory_when_moraine_fallback_enabled() {
         let tmp = tempdir().expect("tempdir");
         let memory_path = tmp.path().join("memory.md");
