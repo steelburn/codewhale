@@ -337,7 +337,7 @@ fn load_repo_constitution_block(
     workspace: &Path,
 ) -> (Option<String>, Option<PathBuf>, Vec<String>) {
     let mut warnings = Vec::new();
-    let git_root = crate::project_doc::find_git_root(workspace);
+    let git_root = find_git_root(workspace);
     let mut current = workspace.to_path_buf();
     loop {
         let mut path = current.clone();
@@ -860,7 +860,7 @@ pub(crate) fn project_context_cache_candidate_paths(
 }
 
 fn repo_constitution_candidate_paths(workspace: &Path) -> Vec<PathBuf> {
-    let git_root = crate::project_doc::find_git_root(workspace);
+    let git_root = find_git_root(workspace);
     let mut current = workspace.to_path_buf();
     let mut paths = Vec::new();
     loop {
@@ -930,6 +930,21 @@ fn ignored_whale_warning_for_path(path: &Path) -> Option<String> {
 
 fn canonicalize_workspace_or_keep(workspace: &Path) -> PathBuf {
     fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf())
+}
+
+fn find_git_root(cwd: &Path) -> Option<PathBuf> {
+    let mut current = cwd.to_path_buf();
+    loop {
+        if current.join(".git").exists() {
+            return Some(current);
+        }
+        match current.parent() {
+            Some(parent) if parent != current => {
+                current = parent.to_path_buf();
+            }
+            _ => return None,
+        }
+    }
 }
 
 fn project_context_parent_search_stop_dir() -> Option<PathBuf> {
