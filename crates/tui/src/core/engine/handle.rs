@@ -20,6 +20,16 @@ impl EngineHandle {
         Ok(())
     }
 
+    /// Try to send an operation without blocking.
+    ///
+    /// Returns `Err` if the channel is full or closed.  Use this for
+    /// non-critical, refresh-type ops (e.g. `Op::ListSubAgents`) that can
+    /// safely be dropped and re-requested on the next drain cycle.
+    pub fn try_send(&self, op: Op) -> Result<()> {
+        self.tx_op.try_send(op)?;
+        Ok(())
+    }
+
     /// Cancel the current request (user-initiated path — keeps the
     /// public `cancel()` signature stable). Equivalent to
     /// `cancel_with_reason(CancelReason::User)`.
@@ -73,17 +83,6 @@ impl EngineHandle {
     pub async fn approve_tool_call(&self, id: impl Into<String>) -> Result<()> {
         self.tx_approval
             .send(ApprovalDecision::Approved { id: id.into() })
-            .await?;
-        Ok(())
-    }
-
-    /// Auto-approve a pending tool call on the active mode's authority (e.g.
-    /// YOLO), as opposed to an individual user decision. The result is stamped
-    /// as auto-approved-by-mode so the model is told the truth about why the
-    /// tool ran without a prompt (#3790).
-    pub async fn approve_tool_call_by_mode(&self, id: impl Into<String>) -> Result<()> {
-        self.tx_approval
-            .send(ApprovalDecision::ApprovedByMode { id: id.into() })
             .await?;
         Ok(())
     }

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.8.66] - 2026-06-29
+
 ### Added
 
 - Added `codewhale doctor` / `codewhale doctor --json` legacy-state
@@ -46,6 +50,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added a typed `[verifier]` config table for the verifier-preview lane, with
   `enabled` and the shipped `verdict_policy = "hunt"` mapping documented and
   validated (#2093).
+- Added Hotbar `Alt+1`–`Alt+8` quick-slot switching with decision-card key
+  disambiguation, plus an introductory card that explains and can dismiss the
+  Hotbar (#3796, #3788).
+- Release/docs hygiene: guarded public install/version snippets and the npm
+  `codewhaleBinaryVersion` pointer against drift, made `check-docs`/`check-facts`
+  fail on stale snippets or unmapped providers, and stopped `sync-changelog`
+  from dropping a release when only `[Unreleased]` exists (#3767, #3768, #3769,
+  #3770, #3771, #3772).
 
 ### Changed
 
@@ -60,6 +72,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Slimmed the default Constitution prompt while keeping its required structural
   anchors under regression coverage, reducing the static prompt footprint for
   cache-sensitive turns (#2953).
+- Made the approval prompt inline and bottom-anchored instead of a full-screen
+  takeover, so context and controls stay visible while a tool awaits a decision
+  (#3799).
+- The Hotbar is now hidden by default until explicit setup opt-in (#3807); the
+  interactive Agent shell also defaults to approval-gated on with a shared
+  baseline (#3756).
+- Mode authority now resolves approval prompts through a single authority
+  source instead of per-surface checks (#3795).
 
 ### Fixed
 
@@ -99,6 +119,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shell-only surface hides native tools from the model-visible catalog, and
   unknown `CODEWHALE_TOOL_SURFACE` values now warn instead of silently falling
   back to the full tool surface (#2954).
+- Sub-agent fanout and lock hot paths: preserved event-channel headroom for
+  progress events (#3783, thanks @cyq1017), let independent sub-agent starts
+  join a single parallel dispatch batch instead of serializing (#3801), rendered
+  the sub-agent sidebar/ListSubAgents from a read-only snapshot with bounded
+  cleanup (#3803), used nonblocking best-effort sends for ListSubAgents refresh
+  while still awaiting critical events (#3802), moved sub-agent state
+  persistence disk I/O off the manager write lock (#3805), and used `try_lock`
+  for shell-manager refresh in async UI paths (#3804).
+- Provenance: runtime continuations and `SubAgentHandoff` now inherit standing
+  YOLO authority, while `MemoryRecall`, `ImportedTranscript`, and
+  `AssistantGenerated` inputs remain guarded (#3817).
+- Approval honesty: labeled session-scoped approvals accurately instead of
+  "always", and surfaced approval decisions in tool results (#3766).
 
 ## [0.8.65] - 2026-06-24
 
@@ -1599,102 +1632,6 @@ Thanks to **@xyuai** (#2587), **@IcedOranges** (#2584), **@BH8GCJ** (#2588),
 **@AresNing** (#2578), **@caiyilian** (#2567), **@buko** (#2369),
 **@gordonlu**, **@encyc**, and **@simuusang** (#2603, #2620) for reports,
 patches, retesting, and release-stabilization signals that shaped this pass.
-
-## [0.8.51] - 2026-06-02
-
-### Added
-
-- **Arcee AI as a direct provider.** New `[providers.arcee]` config block and
-  `ARCEE_API_KEY` / `ARCEE_BASE_URL` / `ARCEE_MODEL` environment variables,
-  wired through CLI auth (`codewhale auth set --provider arcee`), the TUI
-  provider picker, and the model registry. The default direct-API model is
-  `trinity-large-thinking` (reasoning-capable, 262K context and 262K max
-  output); `trinity-large-preview` (262K context, non-reasoning) and
-  `trinity-mini` (128K context) are also selectable. OpenRouter's
-  `arcee-ai/trinity-large-thinking` route remains separate.
-- **Arcee Cloudflare-WAF compatibility.** The opening turn to the Arcee gateway
-  uses a benign read-only tool surface (`read_file`, `list_dir`, `file_search`,
-  `grep_files`, `git_status`, `git_diff`, `checklist_write`, `update_plan`) and
-  splits example payloads such as `python -c …` out of the system prompt, so the
-  WAF does not reject the first request; the full tool catalog stays reachable
-  through tool-search. `trinity-large-thinking`'s `reasoning_content` is
-  recognized and replayed on tool-call turns.
-- **Expanded model catalog.** Added context-window, max-output, and
-  reasoning-capability metadata for additional model IDs, including
-  `qwen/qwen3.6-flash`, `qwen/qwen3.6-plus`, `qwen/qwen3.6-max-preview`, and
-  Xiaomi MiMo v2.5 chat/ASR/TTS variants; `trinity-large-preview`'s context
-  window was corrected to 262K.
-- **Provider-aware model picker.** The picker groups models by provider, shows
-  per-model hints, and remembers a saved model per provider.
-
-### Changed
-
-- **Auto-compaction is now percentage- and model-aware.** The per-model
-  threshold helper is `compaction_threshold_for_model_at_percent(model,
-  percent)` (replacing the effort-based variant), and the default
-  `auto_compact_threshold_percent` is 80%. Auto-compaction defaults on for
-  models with a context window of 256K or smaller and stays opt-in for 1M-token
-  models (e.g. DeepSeek V4) to protect prefix-cache economics, unless the user
-  has explicitly set `auto_compact`.
-- **Clearer provider/gateway errors.** HTTP error bodies are sanitized before
-  display — HTML interstitials and Cloudflare "Access Denied" pages collapse to
-  a one-line reason (with the ray/error ID) instead of dumping raw markup into
-  the transcript — and 403s are split into authentication vs. authorization
-  (gateway/WAF block) categories.
-- The invalid-model error now names the active provider and lists Arcee among
-  the options.
-
-### Removed
-
-- **The session "cycle" / checkpoint-restart system.** Removed the `/cycles`,
-  `/cycle <n>`, and `/recall` commands, the `recall_archive` tool, the
-  cycle-handoff briefing prompt, the sidebar "cycles" lines, and the
-  `cycle_manager` engine plumbing (`EngineConfig.cycle`, `Event::CycleAdvanced`,
-  seam-manager cycle thresholds and flash briefings). Long sessions no longer
-  auto-reset their context at a fixed token boundary — reclaim budget with
-  `/compact` or model-aware auto-compaction instead. Existing on-disk cycle
-  archives are left untouched but are no longer read or written.
-
-### Fixed
-
-- Assistant turns no longer leave an orphaned role glyph (the stray "blue dot")
-  when a turn streams only whitespace between reasoning and a tool call.
-- Scrolling the mouse wheel over the right-hand sidebar no longer leaks into the
-  transcript scroll.
-- The sidebar hover tooltip now appears only for truncated lines, sits below the
-  cursor, and uses a neutral surface color instead of the warning-orange
-  highlight that overlapped neighbouring rows.
-- Corrected the README's description of the Constitution (Article VII is the
-  hierarchy itself; Article II's truth duty overrides even a user request) to
-  match `prompts/base.md`.
-- Repaired release-blocking unit and integration tests left failing by the
-  cycle-removal and compaction-threshold refactors (relay instruction,
-  model-reject message, compaction budget, mock-LLM threshold helper).
-- Fixed DEC private-mode CSI fragment leakage into composer text after
-  terminal resets, restoring clean prompt editing (#2592).
-- The engine now recovers from turn-level panics instead of killing the
-  main event loop, keeping the session alive through transient failures
-  (#2583, #1269).
-- Deeply nested files are now discoverable via @-mention and Ctrl+P file
-  picker; the default walk depth was relaxed to handle monorepo layouts (#2488).
-- Command-palette selection stays visible when scrolling through long lists
-  instead of scrolling off-screen (#2590).
-- exec_shell child processes now inherit .NET/NuGet and Windows app-data
-  environment variables, fixing toolchain resolution on Windows (#1857).
-- A warning is emitted when shell/sandbox config keys are nested under
-  unknown top-level sections instead of being silently ignored (#2589).
-- Diff-render now preserves leading whitespace in patch content lines,
-  fixing an extra-space regression in PR previews (#2591). Thanks @zlh124.
-- Model selection from the /model command now persists per-provider across
-  restarts, with a warning when persistence fails.
-
-### Community
-
-Thanks to **@zlh124** (#2591) and **@reidliu41** (#2601) for the fixes
-harvested into this release. Thanks also to **@idling11** (#2602),
-**@gordonlu** (#2585), **@cyq1017** (#2593), **@xyuai** (#2587, #2584),
-and **@IcedOranges** (#2584) for reports, drafts, and investigations
-that shaped this release cycle.
 
 ---
 

@@ -529,7 +529,7 @@ async fn spawn_test_server_with_root_token_mobile_workspace_subagents_and_config
     fs::create_dir_all(&workspace)?;
     let config = Config {
         mcp_config_path: Some(root.join("mcp.json").to_string_lossy().to_string()),
-        ..Default::default()
+        ..Config::default()
     };
     let manager = TaskManager::start_with_executor(
         TaskManagerConfig {

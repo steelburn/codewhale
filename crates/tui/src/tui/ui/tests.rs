@@ -1900,7 +1900,7 @@ fn forced_approval_prompt_bypasses_session_approval_shortcut() {
 }
 
 #[test]
-fn non_forced_approval_request_keeps_existing_auto_shortcuts() {
+fn approval_request_uses_session_cache_not_current_mode_shortcut() {
     let mut app = create_test_app();
     app.approval_mode = ApprovalMode::Auto;
     assert!(!should_auto_approve_approval_request(
@@ -1911,7 +1911,7 @@ fn non_forced_approval_request_keeps_existing_auto_shortcuts() {
     ));
 
     app.approval_mode = ApprovalMode::Bypass;
-    assert!(should_auto_approve_approval_request(
+    assert!(!should_auto_approve_approval_request(
         &app,
         "exec_shell",
         "shell:exec_shell:cargo test",
@@ -1919,6 +1919,15 @@ fn non_forced_approval_request_keeps_existing_auto_shortcuts() {
     ));
 
     app.approval_mode = ApprovalMode::Suggest;
+    app.mode = AppMode::Yolo;
+    assert!(!should_auto_approve_approval_request(
+        &app,
+        "exec_shell",
+        "shell:exec_shell:cargo test",
+        false,
+    ));
+
+    app.mode = AppMode::Agent;
     app.approval_session_approved
         .insert("shell:exec_shell:cargo test".to_string());
     assert!(should_auto_approve_approval_request(
@@ -2250,6 +2259,33 @@ async fn apply_loaded_session_resets_workspace_runtime_state() {
         session.metadata.workspace.as_path()
     );
     assert!(app.runtime_services.hook_executor.is_some());
+}
+
+#[test]
+fn shell_live_output_refresh_does_not_block_on_contended_lock() {
+    // #3804: the async UI loop must never block on the shell manager's
+    // std::sync Mutex. While the lock is held, the render-only live-output
+    // refresh must return immediately via try_lock — the previous blocking
+    // lock() would deadlock on this same thread, so reaching the assert at all
+    // proves the path no longer blocks under contention.
+    let mut app = create_test_app();
+    let shell_mgr = app
+        .runtime_services
+        .shell_manager
+        .as_ref()
+        .expect("shell manager")
+        .clone();
+
+    let guard = shell_mgr.lock().expect("hold shell lock");
+    let changed = refresh_shell_exec_live_output(&mut app);
+    assert!(
+        !changed,
+        "contended live-output refresh should skip this frame, not block or update"
+    );
+    drop(guard);
+
+    // With the lock free again the path runs normally (no jobs → no change).
+    assert!(!refresh_shell_exec_live_output(&mut app));
 }
 
 #[test]
@@ -4186,7 +4222,12 @@ fn hotbar_alt_digit_is_blocked_while_decision_card_is_active() {
 #[test]
 fn hotbar_dispatches_bound_slot_and_ignores_empty_slot() {
     let mut app = create_test_app();
-    let config = Config::default();
+    // #3807: a fresh config has no bindings, so opt in with the default slots
+    // (slot 4 = mode.agent) to exercise dispatch of a bound slot.
+    let config = Config {
+        hotbar: Some(codewhale_config::default_hotbar_bindings_toml()),
+        ..Config::default()
+    };
     app.onboarding = OnboardingState::None;
     app.mode = AppMode::Plan;
     app.needs_redraw = false;

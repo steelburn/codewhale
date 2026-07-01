@@ -83,6 +83,7 @@ const DEFAULT_MAX_STEPS: u32 = u32::MAX;
 /// floors remain the independent stall detectors.
 const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(300);
 const MIN_SUBAGENT_SPAWN_TOKEN_RESERVE: u64 = 1;
+const MIN_EVENT_CHANNEL_HEADROOM_FOR_ROUTINE_PROGRESS: usize = 32;
 
 /// Format a step counter for sub-agent progress messages.
 ///
@@ -129,6 +130,13 @@ const SUBAGENT_MODEL_WAIT_REASON: &str = "waiting for model response";
 /// write flushes the full in-memory fleet (including other agents' pending
 /// checkpoints) to disk.
 const SUBAGENT_PERSIST_DEBOUNCE: Duration = Duration::from_millis(1500);
+
+/// #3803: minimum interval between write-locked `cleanup` runs triggered by the
+/// sidebar refresh (`Op::ListSubAgents`). Cleanup auto-cancels stale agents
+/// (heartbeat timeout, default 300s) and drops old finished records, so a 2s
+/// floor keeps it responsive while preventing per-refresh write-lock contention
+/// during a high-fanout burst.
+pub const SUBAGENT_LIST_CLEANUP_MIN_INTERVAL: Duration = Duration::from_secs(2);
 
 /// #freeze: lightweight perf counters for the sub-agent persist hot path,
 /// gated behind `CODEWHALE_SUBAGENT_PERF_TRACE=1`. The atomic increments are
@@ -1805,6 +1813,11 @@ pub struct SubAgentManager {
     /// capture the most recent checkpoint.
     last_persist_at: Option<Instant>,
     persist_pending: bool,
+    /// #3803: last time `cleanup` ran. The sidebar refresh (`Op::ListSubAgents`)
+    /// renders from a read-only `list()` snapshot and only runs the
+    /// write-locked `cleanup` on a bounded cadence, so a UI refresh storm during
+    /// a sub-agent fanout no longer contends for the write lock on every request.
+    last_cleanup_at: Option<Instant>,
 }
 
 impl SubAgentManager {
@@ -1832,6 +1845,7 @@ impl SubAgentManager {
             launch_gate: Arc::new(Semaphore::new(max_agents.max(1))),
             last_persist_at: None,
             persist_pending: false,
+            last_cleanup_at: None,
         }
     }
 
@@ -1920,9 +1934,14 @@ impl SubAgentManager {
         }
     }
 
-    fn persist_state(&self) -> Result<()> {
+    /// Build the [`PersistedSubAgentState`] snapshot from the current fleet.
+    ///
+    /// This is a cheap clone operation that runs under the caller's lock.
+    /// The returned payload is fully owned and safe to move to a background
+    /// thread for disk I/O.
+    fn build_persist_payload(&self) -> Result<Option<(PathBuf, PersistedSubAgentState)>> {
         let Some(path) = self.state_path.as_ref() else {
-            return Ok(());
+            return Ok(None);
         };
         let path = checked_subagent_state_path(&self.workspace, path)?;
         let now_ms = epoch_millis_now();
@@ -1959,9 +1978,36 @@ impl SubAgentManager {
             agents,
             workers: self.sorted_worker_records(),
         };
-        write_json_atomic(&self.workspace, &path, &payload)
+        Ok(Some((path, payload)))
     }
 
+    /// Persist the current fleet state to disk.
+    ///
+    /// #freeze: JSON serialization runs cheaply under the caller's lock; the
+    /// expensive disk I/O (`write_json_atomic`) is spawned onto a background
+    /// thread so the caller's write lock is released before touching the
+    /// filesystem.
+    ///
+    /// Returns a [`std::thread::JoinHandle`] that resolves when the disk write
+    /// completes.  Callers may `.join()` for synchronous semantics or drop it
+    /// for fire-and-forget.
+    fn persist_state(&self) -> Result<std::thread::JoinHandle<()>> {
+        let Some((path, payload)) = self.build_persist_payload()? else {
+            // Nothing to persist — return a no-op handle.
+            return Ok(std::thread::spawn(|| {}));
+        };
+        let workspace = self.workspace.clone();
+        // Spawn disk I/O off the write-lock hot path.  `payload` is fully
+        // owned (cloned from `self.agents`) so it is `Send` and safe to move.
+        let handle = std::thread::spawn(move || {
+            if let Err(err) = write_json_atomic(&workspace, &path, &payload) {
+                tracing::warn!(target: "subagent", ?err, "failed to persist sub-agent state");
+            }
+        });
+        Ok(handle)
+    }
+
+    /// Fire-and-forget persist — logs errors, drops the join handle.
     fn persist_state_best_effort(&self) {
         if let Err(err) = self.persist_state() {
             // Must not be `eprintln!` — raw stderr inside the alt-screen
@@ -1969,6 +2015,8 @@ impl SubAgentManager {
             // regression (#1085). Routed through tracing so the
             // file-backed subscriber in `runtime_log` captures it.
             tracing::warn!(target: "subagent", ?err, "failed to persist sub-agent state");
+        } else {
+            // Join handle is dropped here — disk I/O proceeds in background.
         }
     }
 
@@ -2007,11 +2055,20 @@ impl SubAgentManager {
     /// #freeze: force a persist if a hot-path write was previously coalesced
     /// away. Call on graceful shutdown / session teardown so the most recent
     /// intermediate checkpoint is not lost.
+    ///
+    /// Unlike [`persist_state`], this performs disk I/O **synchronously** to
+    /// guarantee data is flushed before the process exits.
     pub fn flush_pending_persist(&mut self) {
         if self.persist_pending {
             self.last_persist_at = Some(Instant::now());
             self.persist_pending = false;
-            self.persist_state_best_effort();
+            // Synchronous disk I/O — safe because we are shutting down and no
+            // callers depend on releasing the write lock quickly.
+            if let Ok(Some((path, payload))) = self.build_persist_payload() {
+                if let Err(err) = write_json_atomic(&self.workspace, &path, &payload) {
+                    tracing::warn!(target: "subagent", ?err, "failed to flush pending sub-agent state");
+                }
+            }
         }
     }
 
@@ -2871,7 +2928,18 @@ impl SubAgentManager {
         if self.agents.len() != before || auto_cancelled > 0 {
             self.persist_state_best_effort();
         }
+        self.last_cleanup_at = Some(Instant::now());
         auto_cancelled
+    }
+
+    /// #3803: whether enough time has elapsed since the last `cleanup` that the
+    /// next sidebar refresh should run the write-locked cleanup again. Every
+    /// other refresh renders from the read-only `list()` snapshot, so a UI
+    /// refresh storm during a fanout does not take the write lock per request.
+    #[must_use]
+    pub fn cleanup_due(&self, min_interval: Duration) -> bool {
+        self.last_cleanup_at
+            .map_or(true, |last| last.elapsed() >= min_interval)
     }
 
     fn update_from_result(&mut self, agent_id: &str, result: SubAgentResult) {
@@ -3529,6 +3597,40 @@ impl ToolSpec for AgentTool {
 
     fn approval_requirement(&self) -> ApprovalRequirement {
         ApprovalRequirement::Required
+    }
+
+    /// #3801: status and peek are read-only queries — no approval needed.
+    fn approval_requirement_for(&self, input: &Value) -> ApprovalRequirement {
+        match parse_agent_tool_action(input) {
+            Ok(AgentToolAction::Status) | Ok(AgentToolAction::Peek) => ApprovalRequirement::Auto,
+            _ => ApprovalRequirement::Required,
+        }
+    }
+
+    /// #3801: `action=start` launches a background agent and returns immediately —
+    /// it is a detached start that should not hold the global tool-exec write
+    /// lock while the child spins up.  In auto-approved modes (YOLO) this lets
+    /// multiple independent `agent start` calls join a single parallel batch
+    /// instead of being serialized N ways.
+    fn starts_detached_for(&self, input: &Value) -> bool {
+        matches!(parse_agent_tool_action(input), Ok(AgentToolAction::Start))
+    }
+
+    /// #3801: Read-only `agent` actions (status, peek) can safely run in
+    /// parallel batches.
+    fn supports_parallel_for(&self, input: &Value) -> bool {
+        matches!(
+            parse_agent_tool_action(input),
+            Ok(AgentToolAction::Status) | Ok(AgentToolAction::Peek)
+        )
+    }
+
+    /// #3801: status/peek/cancel actions are read-only queries of manager state.
+    fn is_read_only_for(&self, input: &Value) -> bool {
+        matches!(
+            parse_agent_tool_action(input),
+            Ok(AgentToolAction::Status) | Ok(AgentToolAction::Peek)
+        )
     }
 
     async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
@@ -6155,6 +6257,12 @@ fn emit_agent_progress(
     spawn_depth: u32,
 ) {
     if let Some(event_tx) = event_tx {
+        if event_tx.max_capacity() > MIN_EVENT_CHANNEL_HEADROOM_FOR_ROUTINE_PROGRESS
+            && event_tx.capacity() <= MIN_EVENT_CHANNEL_HEADROOM_FOR_ROUTINE_PROGRESS
+            && routine_agent_progress_can_preserve_event_headroom(&status)
+        {
+            return;
+        }
         let _ = event_tx.try_send(Event::AgentProgress {
             id: agent_id.to_string(),
             status,
@@ -6162,6 +6270,13 @@ fn emit_agent_progress(
             spawn_depth,
         });
     }
+}
+
+fn routine_agent_progress_can_preserve_event_headroom(status: &str) -> bool {
+    matches!(
+        worker_progress_event_parts(status).0,
+        AgentWorkerStatus::Running | AgentWorkerStatus::ModelWait | AgentWorkerStatus::RunningTool
+    )
 }
 
 // === Tool Registry Helpers ===

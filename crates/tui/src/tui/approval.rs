@@ -1367,6 +1367,13 @@ impl ModalView for ApprovalView {
         approval_widget.render(area, buf);
     }
 
+    fn occupied_region(&self, area: ratatui::layout::Rect) -> ratatui::layout::Rect {
+        // The approval is an inline, bottom-anchored prompt: it only occupies
+        // a band at the bottom of the frame so the backdrop dims that band and
+        // the transcript above stays visible. Must match what `render` paints.
+        ApprovalWidget::new(&self.request, self).inline_region(area)
+    }
+
     fn tick(&mut self) -> ViewAction {
         if self.is_timed_out() {
             return self.emit_decision(ReviewDecision::Denied, true);

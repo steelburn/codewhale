@@ -5444,7 +5444,13 @@ async fn run_mcp_command(config: &Config, workspace: &Path, command: McpCommand)
         McpCommand::Connect { server } => {
             let mut pool = McpPool::from_config_path_with_workspace(&config_path, workspace)?;
             if let Some(name) = server {
-                pool.get_or_connect(&name).await?;
+                if let Err(err) = pool.get_or_connect(&name).await {
+                    if crate::mcp::oauth::error_looks_auth_required(&err) {
+                        let hint = crate::mcp::oauth::auth_required_login_hint(&name);
+                        return Err(err).context(hint);
+                    }
+                    return Err(err);
+                }
                 println!("Connected to MCP server: {name}");
             } else {
                 let errors = pool.connect_all().await;
@@ -5453,6 +5459,9 @@ async fn run_mcp_command(config: &Config, workspace: &Path, command: McpCommand)
                 } else {
                     for (name, err) in errors {
                         eprintln!("Failed to connect {name}: {err:#}");
+                        if crate::mcp::oauth::error_looks_auth_required(&err) {
+                            eprintln!("  {}", crate::mcp::oauth::auth_required_login_hint(&name));
+                        }
                     }
                 }
             }
@@ -5461,7 +5470,16 @@ async fn run_mcp_command(config: &Config, workspace: &Path, command: McpCommand)
         McpCommand::Tools { server } => {
             let mut pool = McpPool::from_config_path_with_workspace(&config_path, workspace)?;
             if let Some(name) = server {
-                let conn = pool.get_or_connect(&name).await?;
+                let conn = match pool.get_or_connect(&name).await {
+                    Ok(conn) => conn,
+                    Err(err) => {
+                        if crate::mcp::oauth::error_looks_auth_required(&err) {
+                            let hint = crate::mcp::oauth::auth_required_login_hint(&name);
+                            return Err(err).context(hint);
+                        }
+                        return Err(err);
+                    }
+                };
                 if conn.tools().is_empty() {
                     println!("No tools found for MCP server: {name}");
                 } else {
@@ -5477,7 +5495,13 @@ async fn run_mcp_command(config: &Config, workspace: &Path, command: McpCommand)
                     }
                 }
             } else {
-                let _ = pool.connect_all().await;
+                let errors = pool.connect_all().await;
+                for (name, err) in errors {
+                    eprintln!("Failed to connect {name}: {err:#}");
+                    if crate::mcp::oauth::error_looks_auth_required(&err) {
+                        eprintln!("  {}", crate::mcp::oauth::auth_required_login_hint(&name));
+                    }
+                }
                 let tools = pool.all_tools();
                 if tools.is_empty() {
                     println!("No MCP tools discovered.");
@@ -9533,6 +9557,18 @@ mod doctor_mcp_tests {
             McpServerDoctorStatus::Warning(detail) => {
                 panic!("Absolute path should not warn: {detail}")
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod mcp_auth_guidance_tests {
+        #[test]
+        fn mcp_auth_hint_is_actionable_for_connect_failures() {
+            let hint = crate::mcp::oauth::auth_required_login_hint("nordic-mcp");
+            assert_eq!(
+                hint,
+                "MCP server 'nordic-mcp' requires OAuth authentication. Run `codewhale mcp login nordic-mcp` to authenticate."
+            );
         }
     }
 

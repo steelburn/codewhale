@@ -1429,6 +1429,7 @@ fn compact_tool_result_for_wire(
          exit_status: {}\n\
          original_chars: {original_chars}\n\
          sha256: {sha}\n\
+         retrieve: retrieve_tool_result ref=sha:{sha}\n\
          first_chars:\n\
          {head}\n\n\
          [... truncated {omitted} chars from middle ...]\n\n\
@@ -4144,6 +4145,10 @@ mod stream_decoder_tests {
         assert!(sent.contains("command_or_query: cargo test"), "got: {sent}");
         assert!(sent.contains("original_chars: 14000"), "got: {sent}");
         assert!(sent.contains("sha256:"), "got: {sent}");
+        assert!(
+            sent.contains("retrieve: retrieve_tool_result ref=sha:"),
+            "got: {sent}"
+        );
         assert!(sent.contains(&"A".repeat(4_000)), "got: {sent}");
         assert!(sent.contains(&"Z".repeat(4_000)), "got: {sent}");
         assert!(
@@ -4151,6 +4156,45 @@ mod stream_decoder_tests {
             "got: {sent}"
         );
         assert_ne!(sent, long_output);
+    }
+
+    #[test]
+    fn request_builder_keeps_extreme_tool_output_bounded_and_retrievable() {
+        with_tool_result_sha_spillover_root(|| {
+            let huge_output = format!(
+                "{}{}{}",
+                "DIFF_HEAD\n".repeat(10_000),
+                "MIDDLE_POISON\n".repeat(10_000),
+                "DIFF_TAIL\n".repeat(10_000)
+            );
+            let sha = sha256_hex(huge_output.as_bytes());
+            let messages = vec![
+                tool_use_message("tool-huge", "exec_shell", json!({"command": "git diff"})),
+                tool_result_message("tool-huge", &huge_output),
+            ];
+
+            let built = build_chat_messages(None, &messages, "deepseek-v4-flash");
+            let sent = tool_message_content(&built, 0);
+
+            assert!(sent.contains("[TOOL_RESULT_TRUNCATED]"), "got: {sent}");
+            assert!(sent.contains("tool_name: exec_shell"), "got: {sent}");
+            assert!(sent.contains("command_or_query: git diff"), "got: {sent}");
+            assert!(sent.contains(&format!("sha256: {sha}")), "got: {sent}");
+            assert!(
+                sent.contains(&format!("retrieve: retrieve_tool_result ref=sha:{sha}")),
+                "got: {sent}"
+            );
+            assert!(
+                sent.chars().count() <= TOOL_RESULT_SENT_CHAR_BUDGET,
+                "truncated result should stay bounded, sent {} chars",
+                sent.chars().count()
+            );
+            assert!(
+                !sent.contains("MIDDLE_POISON"),
+                "omitted middle should not be sent to the next model turn"
+            );
+            assert_ne!(sent, huge_output);
+        });
     }
 
     #[test]
@@ -4312,6 +4356,10 @@ mod stream_decoder_tests {
         assert!(
             first.contains(&format!("sha256: {sha}")),
             "truncation block should advertise the recovery SHA, got: {first}"
+        );
+        assert!(
+            first.contains(&format!("retrieve: retrieve_tool_result ref=sha:{sha}")),
+            "truncation block should advertise the recovery command, got: {first}"
         );
 
         // (b) The full content was persisted to the SHA store and is

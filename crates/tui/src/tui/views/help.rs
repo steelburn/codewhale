@@ -20,7 +20,7 @@ use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Padding, Paragraph, Widget},
+    widgets::{Block, Borders, Padding, Paragraph, Widget},
 };
 use unicode_width::UnicodeWidthStr;
 
@@ -28,7 +28,10 @@ use crate::commands;
 use crate::localization::{Locale, MessageId, tr};
 use crate::palette;
 use crate::tui::keybindings::KEYBINDINGS;
-use crate::tui::views::{ModalKind, ModalView, ViewAction};
+use crate::tui::views::{
+    ActionHint, ModalKind, ModalView, ViewAction, centered_modal_area, render_modal_footer,
+    render_modal_surface,
+};
 
 /// Two top-level sections rendered in the overlay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -377,16 +380,34 @@ impl ModalView for HelpView {
     }
 
     fn render(&self, area: Rect, buf: &mut Buffer) {
-        let popup_width = 90.min(area.width.saturating_sub(4));
-        let popup_height = 28.min(area.height.saturating_sub(4));
-        let popup_area = Rect {
-            x: area.width.saturating_sub(popup_width) / 2,
-            y: area.height.saturating_sub(popup_height) / 2,
-            width: popup_width,
-            height: popup_height,
-        };
+        let popup_area = centered_modal_area(area, 90, 28, 44, 8);
 
-        Clear.render(popup_area, buf);
+        render_modal_surface(area, popup_area, buf);
+
+        let block = modal_block().title(Line::from(vec![Span::styled(
+            format!(" {} ", self.tr(MessageId::HelpTitle)),
+            Style::default()
+                .fg(palette::WHALE_ACCENT_PRIMARY)
+                .add_modifier(Modifier::BOLD),
+        )]));
+
+        let inner = block.inner(popup_area);
+        block.render(popup_area, buf);
+
+        // The action footer wraps inside the modal body (#3732) rather than the
+        // single-line border title that silently clipped hints at narrow
+        // widths; the list renders into the content area above it. Empty hint
+        // keys keep the existing localized footer phrases as plain labels.
+        let content = render_modal_footer(
+            inner,
+            buf,
+            &[
+                ActionHint::new("", self.tr(MessageId::HelpFooterTypeFilter)),
+                ActionHint::new("", self.tr(MessageId::HelpFooterMove)),
+                ActionHint::new("", self.tr(MessageId::HelpFooterJump)),
+                ActionHint::new("", self.tr(MessageId::HelpFooterClose)),
+            ],
+        );
 
         let mut lines: Vec<Line<'static>> = Vec::new();
 
@@ -426,17 +447,15 @@ impl ModalView for HelpView {
             // The chord/label column takes up to 28 cols on wide screens;
             // descriptions fill the remainder. Borders and padding eat 4
             // cells from each side (border 1 + padding 1) × 2.
-            let inner_width = popup_width.saturating_sub(4) as usize;
+            let inner_width = content.width as usize;
             let label_width = 28.min(inner_width.saturating_sub(8));
             let desc_capacity = inner_width.saturating_sub(label_width + 4);
 
-            // The block uses a one-cell border plus one-cell padding, so the
-            // real paragraph body is four rows shorter than the outer popup.
-            // Budget against that body height so selected rows are not clipped
-            // by the bottom border/padding.
+            // `content` is the body area above the wrapping footer (the block's
+            // border, padding, and footer rows already removed), so budgeting
+            // against its height keeps selected rows clear of the footer.
             let header_lines = lines.len();
-            let visible_budget = (popup_height as usize)
-                .saturating_sub(4)
+            let visible_budget = (content.height as usize)
                 .saturating_sub(header_lines)
                 .max(1);
 
@@ -479,33 +498,7 @@ impl ModalView for HelpView {
             }
         }
 
-        let block = modal_block()
-            .title(Line::from(vec![Span::styled(
-                format!(" {} ", self.tr(MessageId::HelpTitle)),
-                Style::default()
-                    .fg(palette::WHALE_ACCENT_PRIMARY)
-                    .add_modifier(Modifier::BOLD),
-            )]))
-            .title_bottom(Line::from(vec![
-                Span::styled(
-                    self.tr(MessageId::HelpFooterTypeFilter),
-                    Style::default().fg(palette::TEXT_MUTED),
-                ),
-                Span::styled(
-                    self.tr(MessageId::HelpFooterMove),
-                    Style::default().fg(palette::TEXT_MUTED),
-                ),
-                Span::styled(
-                    self.tr(MessageId::HelpFooterJump),
-                    Style::default().fg(palette::TEXT_MUTED),
-                ),
-                Span::styled(
-                    self.tr(MessageId::HelpFooterClose),
-                    Style::default().fg(palette::TEXT_MUTED),
-                ),
-            ]));
-
-        Paragraph::new(lines).block(block).render(popup_area, buf);
+        Paragraph::new(lines).render(content, buf);
     }
 }
 
@@ -838,6 +831,60 @@ mod tests {
                 "keybinding description not localized: {}",
                 entry.description
             );
+        }
+    }
+
+    /// The four terminal sizes the v0.8.66 modal blocker (#3732) requires
+    /// every overlay to remain readable and fully operable at.
+    const BLOCKER_SIZES: [(u16, u16); 4] = [(80, 24), (100, 30), (120, 32), (160, 40)];
+
+    #[test]
+    fn help_is_usable_and_opaque_at_blocker_sizes() {
+        use crate::tui::views::ViewStack;
+        for (w, h) in BLOCKER_SIZES {
+            let area = Rect::new(0, 0, w, h);
+            let mut buf = Buffer::empty(area);
+            for y in 0..h {
+                for x in 0..w {
+                    buf[(x, y)].set_symbol("X");
+                }
+            }
+            let mut stack = ViewStack::new();
+            stack.push(HelpView::new_for_locale(Locale::En));
+            stack.render(area, &mut buf);
+
+            let rows: Vec<String> = (0..h)
+                .map(|y| {
+                    (0..w)
+                        .map(|x| buf[(x, y)].symbol().to_string())
+                        .collect::<String>()
+                })
+                .collect();
+            let text = rows.join("\n");
+
+            for label in [
+                "type to filter",
+                "Up/Down move",
+                "PgUp/PgDn jump",
+                "Esc close",
+            ] {
+                assert!(text.contains(label), "{w}x{h}: missing footer '{label}'");
+            }
+            assert!(
+                !text.contains('X'),
+                "{w}x{h}: background bleed-through into modal surface"
+            );
+            assert_eq!(
+                buf[(w / 2, h / 2)].bg,
+                palette::DEEPSEEK_INK,
+                "{w}x{h}: modal interior must be opaque"
+            );
+            for (y, row) in rows.iter().enumerate() {
+                assert!(
+                    UnicodeWidthStr::width(row.trim_end()) <= w as usize,
+                    "{w}x{h}: row {y} overflows width: {row:?}"
+                );
+            }
         }
     }
 

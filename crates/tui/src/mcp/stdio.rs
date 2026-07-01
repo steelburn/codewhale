@@ -66,6 +66,7 @@ impl StdioTransport {
         config: &McpServerConfig,
     ) -> Result<Self> {
         let mut cmd = tokio::process::Command::new(command);
+        crate::utils::suppress_tokio_console_window(&mut cmd);
         cmd.args(&config.args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -75,15 +76,22 @@ impl StdioTransport {
             cmd.current_dir(cwd);
         }
 
+        // Expand `${NAME}` placeholders so secret env values can be sourced
+        // from the process environment instead of being stored in cleartext
+        // in the MCP config. The child env is allowlist-sanitized below, so
+        // these vars would not otherwise be inherited by the child.
+        let expanded_env = super::expand_env_placeholders_map(&config.env, "env")
+            .with_context(|| format!("MCP server '{server_name}' env expansion failed"))?;
+
         // MCP stdio servers are user-configured integrations. Use the
         // wider MCP allowlist so common Node/Python/proxy/CA-bundle
         // bootstrap variables (NVM_DIR, NODE_OPTIONS, NPM_CONFIG_*,
         // HTTP(S)_PROXY, …) reach the child. See `sanitized_mcp_env`
         // and #1244 for context.
-        child_env::apply_to_tokio_command_mcp(&mut cmd, child_env::string_map_env(&config.env));
+        child_env::apply_to_tokio_command_mcp(&mut cmd, child_env::string_map_env(&expanded_env));
 
         let mut child = cmd.spawn().with_context(|| {
-            let env_keys: Vec<&str> = config.env.keys().map(String::as_str).collect();
+            let env_keys: Vec<&str> = expanded_env.keys().map(String::as_str).collect();
             format!(
                 "MCP stdio spawn failed (transport=stdio server={server_name} cmd={command:?} args={:?} env_keys={env_keys:?})",
                 config.args,

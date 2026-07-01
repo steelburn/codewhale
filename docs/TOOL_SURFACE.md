@@ -56,6 +56,12 @@ enables shell access automatically. Plan mode keeps shell execution off.
 | `task_shell_start` | Start a long-running command in the background and return immediately. Preferred over foreground shell for diagnostics, tests, searches, and servers that may run for minutes. |
 | `task_shell_wait` | Poll a background command. If `gate` is supplied after completion, record structured gate evidence on the active durable task. |
 
+`allow_shell = true` exposes shell tools; it does not disable built-in shell
+safety validation. Direct multiline `exec_shell` commands, including heredocs
+and embedded scripts such as multiline `python -c`, are blocked. Use one-line
+commands, write the script/content to a file first and execute it, or start
+long/manual flows with `task_shell_start` or background shell and poll them.
+
 When a foreground shell command times out, the process is not continued
 silently. The tool result tells the model to rerun long work with
 `task_shell_start` or `exec_shell` with `background = true`, then poll with

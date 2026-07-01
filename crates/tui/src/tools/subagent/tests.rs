@@ -310,6 +310,71 @@ fn subagent_progress_displays_shell_tools_as_bash() {
 }
 
 #[test]
+fn agent_progress_preserves_event_channel_headroom_under_load() {
+    let (tx, mut rx) = mpsc::channel(40);
+    for _ in 0..8 {
+        tx.try_send(Event::status("filler")).expect("fill channel");
+    }
+    assert_eq!(tx.capacity(), 32);
+
+    emit_agent_progress(
+        Some(&tx),
+        "agent_busy",
+        "step 1: requesting model response".to_string(),
+        None,
+        1,
+    );
+    assert_eq!(
+        tx.capacity(),
+        32,
+        "routine progress should preserve reserved event-channel headroom"
+    );
+
+    emit_agent_progress(
+        Some(&tx),
+        "agent_waiting",
+        "waiting for user input".to_string(),
+        None,
+        1,
+    );
+    assert_eq!(
+        tx.capacity(),
+        31,
+        "high-value progress should still reach the UI when headroom is reserved"
+    );
+
+    for _ in 0..8 {
+        assert!(matches!(rx.try_recv(), Ok(Event::Status { .. })));
+    }
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(Event::AgentProgress { id, status, .. })
+            if id == "agent_waiting" && status == "waiting for user input"
+    ));
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
+fn agent_progress_uses_small_event_channels_without_headroom_reservation() {
+    let (tx, mut rx) = mpsc::channel(8);
+
+    emit_agent_progress(
+        Some(&tx),
+        "agent_small_channel",
+        "step 1: requesting model response".to_string(),
+        None,
+        1,
+    );
+
+    assert_eq!(tx.capacity(), 7);
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(Event::AgentProgress { id, status, .. })
+            if id == "agent_small_channel" && status == "step 1: requesting model response"
+    ));
+}
+
+#[test]
 fn headless_worker_records_persist_with_subagent_state() {
     let tmp = tempdir().expect("tempdir");
     let state_path = tmp.path().join("subagents.v1.json");
@@ -325,7 +390,11 @@ fn headless_worker_records_persist_with_subagent_state() {
     result.name = "agent_persisted".to_string();
     result.steps_taken = 3;
     manager.complete_worker_from_result("agent_persisted", &result);
-    manager.persist_state().expect("persist state");
+    manager
+        .persist_state()
+        .expect("persist state")
+        .join()
+        .expect("persist thread");
 
     let mut loaded = SubAgentManager::new(tmp.path().to_path_buf(), 4).with_state_path(state_path);
     loaded.load_state().expect("load state");
@@ -2581,7 +2650,11 @@ fn test_persist_and_reload_marks_running_agent_as_interrupted() {
     );
     let running_id = running.id.clone();
     manager.agents.insert(running_id.clone(), running);
-    manager.persist_state().expect("persist state");
+    manager
+        .persist_state()
+        .expect("persist state")
+        .join()
+        .expect("persist thread");
 
     let mut reloaded = SubAgentManager::new(workspace, 2)
         .with_state_path(default_state_path(tmp.path()).expect("default state path"));
@@ -2626,7 +2699,11 @@ fn persist_and_reload_preserves_checkpoint_for_interrupted_running_agent() {
     ));
     let running_id = running.id.clone();
     manager.agents.insert(running_id.clone(), running);
-    manager.persist_state().expect("persist state");
+    manager
+        .persist_state()
+        .expect("persist state")
+        .join()
+        .expect("persist thread");
 
     let mut reloaded = SubAgentManager::new(workspace, 2)
         .with_state_path(default_state_path(tmp.path()).expect("default state path"));
@@ -3958,7 +4035,9 @@ fn persist_round_trip_preserves_session_boot_id() {
         );
         writer
             .persist_state()
-            .expect("persist round-trip should write");
+            .expect("persist round-trip should write")
+            .join()
+            .expect("persist thread");
     }
 
     // A fresh manager comes up with a *different* boot id and reloads
@@ -4639,6 +4718,10 @@ async fn launch_gate_queues_extra_direct_children() {
     runtime.mailbox = Some(mailbox);
 
     let gate = Arc::new(Semaphore::new(1));
+    let held_launch_permit = Arc::clone(&gate)
+        .acquire_owned()
+        .await
+        .expect("test holds the single launch permit");
     let spawn = |agent_id: &str, gate: Option<Arc<Semaphore>>| {
         let (input_tx, input_rx) = mpsc::unbounded_channel();
         let agent = SubAgent::new(
@@ -4671,39 +4754,66 @@ async fn launch_gate_queues_extra_direct_children() {
         (agent, task)
     };
 
-    let (agent_a, task_a) = spawn("agent_gate_a", Some(Arc::clone(&gate)));
     let (agent_b, task_b) = spawn("agent_gate_b", Some(Arc::clone(&gate)));
     {
         let mut mgr = manager.write().await;
-        mgr.agents.insert(agent_a.id.clone(), agent_a);
         mgr.agents.insert(agent_b.id.clone(), agent_b);
     }
 
-    tokio::spawn(run_subagent_task(task_a));
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while gate.available_permits() != 0 {
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-    })
-    .await
-    .expect("first child should acquire the launch gate");
+    // Holding the permit models another direct child occupying the launch
+    // gate without relying on wall-clock timing or scheduler fairness.
     tokio::spawn(run_subagent_task(task_b));
 
     let mut messages = Vec::new();
-    let collected = tokio::time::timeout(Duration::from_secs(5), async {
-        let mut completed = 0;
-        while completed < 2 {
+    let queued = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
             let Some(envelope) = mailbox_rx.recv().await else {
                 break;
             };
-            if matches!(envelope.message, MailboxMessage::Completed { .. }) {
-                completed += 1;
+            let message = envelope.message;
+            let queued_b = matches!(
+                &message,
+                MailboxMessage::Progress { agent_id, status }
+                    if agent_id == "agent_gate_b" && status.contains("queued")
+            );
+            let started_b = matches!(
+                &message,
+                MailboxMessage::Started { agent_id, .. } if agent_id == "agent_gate_b"
+            );
+            messages.push(message);
+            assert!(
+                !started_b,
+                "queued child must not start while the launch permit is held: {messages:?}"
+            );
+            if queued_b {
+                break;
             }
-            messages.push(envelope.message);
         }
     })
     .await;
-    assert!(collected.is_ok(), "both gated children should complete");
+    assert!(
+        queued.is_ok(),
+        "second child must publish a visible queued reason: {messages:?}"
+    );
+    drop(held_launch_permit);
+
+    let collected = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let Some(envelope) = mailbox_rx.recv().await else {
+                break;
+            };
+            let completed_b = matches!(
+                &envelope.message,
+                MailboxMessage::Completed { agent_id, .. } if agent_id == "agent_gate_b"
+            );
+            messages.push(envelope.message);
+            if completed_b {
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(collected.is_ok(), "queued child should complete");
 
     let queued_b = messages.iter().position(|m| {
         matches!(
@@ -4716,13 +4826,14 @@ async fn launch_gate_queues_extra_direct_children() {
         queued_b.is_some(),
         "second child must publish a visible queued reason: {messages:?}"
     );
+    let queued_b = queued_b.expect("queued progress exists");
 
-    let completed_a = messages
+    let completed_b = messages
         .iter()
         .position(
-            |m| matches!(m, MailboxMessage::Completed { agent_id, .. } if agent_id == "agent_gate_a"),
+            |m| matches!(m, MailboxMessage::Completed { agent_id, .. } if agent_id == "agent_gate_b"),
         )
-        .expect("first child completes");
+        .expect("queued child completes");
     let started_b = messages
         .iter()
         .position(
@@ -4730,8 +4841,8 @@ async fn launch_gate_queues_extra_direct_children() {
         )
         .expect("second child eventually starts");
     assert!(
-        started_b > completed_a,
-        "queued child must not start until a permit frees: {messages:?}"
+        started_b > queued_b && completed_b > started_b,
+        "queued child must start only after queuing, then complete: {messages:?}"
     );
 }
 
@@ -4953,5 +5064,30 @@ async fn per_worker_token_budget_does_not_double_count_scope_accounting() {
         Some(100),
         "scope accounting must equal the single turn's tokens, not double-count: {:?}",
         worker_record.usage
+    );
+}
+
+#[test]
+fn cleanup_due_gates_write_locked_cleanup_to_a_bounded_cadence() {
+    // #3803: a fresh manager is always due (never cleaned); right after a
+    // cleanup it is not due again until the interval elapses, so the sidebar
+    // refresh (Op::ListSubAgents) renders from the read-only snapshot in
+    // between instead of taking the write lock on every request.
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = SubAgentManager::new(tmp.path().to_path_buf(), 4);
+
+    assert!(
+        manager.cleanup_due(Duration::from_secs(2)),
+        "a never-cleaned manager should be due"
+    );
+
+    manager.cleanup(Duration::from_secs(3600));
+    assert!(
+        !manager.cleanup_due(Duration::from_secs(3600)),
+        "immediately after cleanup it should not be due again within the interval"
+    );
+    assert!(
+        manager.cleanup_due(Duration::from_secs(0)),
+        "a zero interval is always due"
     );
 }

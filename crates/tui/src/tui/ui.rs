@@ -221,9 +221,7 @@ fn should_auto_approve_approval_request(
     grouping_key: &str,
     approval_force_prompt: bool,
 ) -> bool {
-    !approval_force_prompt
-        && (is_session_approved_for_tool(app, tool_name, grouping_key)
-            || app_auto_approve_enabled(app))
+    !approval_force_prompt && is_session_approved_for_tool(app, tool_name, grouping_key)
 }
 
 fn app_auto_approve_enabled(app: &App) -> bool {
@@ -1429,26 +1427,42 @@ async fn refresh_active_task_panel(app: &mut App, task_manager: &SharedTaskManag
     entries.extend(active_reasoning_task_entries(app));
     entries.extend(active_rlm_task_entries(app));
 
-    if let Some(shell_mgr) = app.runtime_services.shell_manager.as_ref()
-        && let Ok(mut mgr) = shell_mgr.lock()
-    {
-        for job in mgr.list_jobs() {
-            if !matches!(job.status, crate::tools::shell::ShellStatus::Running) {
-                continue;
-            }
-            entries.push(TaskPanelEntry {
-                id: job.id,
-                status: "running".to_string(),
-                prompt_summary: format!("shell: {}", job.command),
-                duration_ms: Some(job.elapsed_ms),
-                kind: TaskPanelEntryKind::Background,
-                stale: job.stale,
-                elapsed_since_output_ms: job.elapsed_since_output_ms,
-                owner_agent_id: job.owner_agent_id,
-                owner_agent_name: job.owner_agent_name,
-            });
-        }
-    }
+    // #3804: this is a render-only read of shell jobs and must not block the
+    // async UI loop on the shell manager's std::sync Mutex. Use try_lock; on
+    // contention, retain the previous frame's background shell entries so
+    // running shells don't flicker out of the Work panel. Shell ownership,
+    // cancellation, approval state, and output capture never depend on this
+    // refresh succeeding.
+    let prev_shell_entries: Vec<TaskPanelEntry> = app
+        .task_panel
+        .iter()
+        .filter(|entry| matches!(entry.kind, TaskPanelEntryKind::Background))
+        .cloned()
+        .collect();
+    let shell_entries: Vec<TaskPanelEntry> = match app.runtime_services.shell_manager.as_ref() {
+        Some(shell_mgr) => match shell_mgr.try_lock() {
+            Ok(mut mgr) => mgr
+                .list_jobs()
+                .into_iter()
+                .filter(|job| matches!(job.status, crate::tools::shell::ShellStatus::Running))
+                .map(|job| TaskPanelEntry {
+                    id: job.id,
+                    status: "running".to_string(),
+                    prompt_summary: format!("shell: {}", job.command),
+                    duration_ms: Some(job.elapsed_ms),
+                    kind: TaskPanelEntryKind::Background,
+                    stale: job.stale,
+                    elapsed_since_output_ms: job.elapsed_since_output_ms,
+                    owner_agent_id: job.owner_agent_id,
+                    owner_agent_name: job.owner_agent_name,
+                })
+                .collect(),
+            // Contended: keep the last known snapshot rather than blocking.
+            Err(_) => prev_shell_entries,
+        },
+        None => Vec::new(),
+    };
+    entries.extend(shell_entries);
 
     app.task_panel = entries;
 }
@@ -1457,8 +1471,11 @@ fn refresh_shell_exec_live_output(app: &mut App) -> bool {
     let Some(shell_mgr) = app.runtime_services.shell_manager.as_ref().cloned() else {
         return false;
     };
+    // #3804: render-only read — try_lock so a contended shell Mutex can never
+    // block the async UI loop; skip this frame's live-output update on
+    // contention (the next refresh picks it up).
     let jobs = {
-        let Ok(mut mgr) = shell_mgr.lock() else {
+        let Ok(mut mgr) = shell_mgr.try_lock() else {
             return false;
         };
         mgr.list_jobs()
@@ -2959,17 +2976,8 @@ async fn run_event_loop(
                             &approval_grouping_key,
                             approval_force_prompt,
                         ) {
-                            // #3790: distinguish a mode auto-approval (e.g. YOLO)
-                            // from re-using an earlier in-session user approval, so
-                            // the engine stamps the tool result honestly instead of
-                            // always claiming the user approved it.
-                            let by_mode = app_auto_approve_enabled(app);
                             log_sensitive_event(
-                                if by_mode {
-                                    "tool.approval.auto_approve_mode"
-                                } else {
-                                    "tool.approval.auto_approve_session"
-                                },
+                                "tool.approval.auto_approve_session",
                                 serde_json::json!({
                                     "tool_name": tool_name,
                                     "approval_key": approval_key,
@@ -2977,11 +2985,7 @@ async fn run_event_loop(
                                     "mode": app.mode.label(),
                                 }),
                             );
-                            if by_mode {
-                                let _ = engine_handle.approve_tool_call_by_mode(id.clone()).await;
-                            } else {
-                                let _ = engine_handle.approve_tool_call(id.clone()).await;
-                            }
+                            let _ = engine_handle.approve_tool_call(id.clone()).await;
                         } else if app.approval_mode == ApprovalMode::Never {
                             log_sensitive_event(
                                 "tool.approval.auto_deny",
@@ -3168,8 +3172,11 @@ async fn run_event_loop(
         }
         // #freeze: one trailing-edge sub-agent list refresh per drain, no
         // matter how many spawn/complete/mailbox events arrived this batch.
+        // #3802: non-blocking send — ListSubAgents is a refresh op that can
+        // be dropped when the op channel is full; the next drain cycle
+        // will re-request.
         if subagent_list_refresh_requested {
-            let _ = engine_handle.send(Op::ListSubAgents).await;
+            let _ = engine_handle.try_send(Op::ListSubAgents);
         }
 
         if let Some(next) = queued_to_send {
@@ -7322,7 +7329,8 @@ async fn apply_command_result(
                 }
             }
             AppAction::ListSubAgents => {
-                let _ = engine_handle.send(Op::ListSubAgents).await;
+                // #3802: non-blocking send — refresh op, safe to drop.
+                let _ = engine_handle.try_send(Op::ListSubAgents);
             }
             AppAction::FetchModels => {
                 app.status_message = Some("Fetching models...".to_string());
@@ -7521,7 +7529,7 @@ async fn apply_command_result(
             AppAction::OpenModelPicker => {
                 if app.view_stack.top_kind() != Some(ModalKind::ModelPicker) {
                     app.view_stack
-                        .push(crate::tui::model_picker::ModelPickerView::new(app));
+                        .push(crate::tui::model_picker::ModelPickerView::new(app, config));
                 }
             }
             AppAction::OpenProviderPicker => {
@@ -9032,10 +9040,14 @@ fn toggle_live_transcript_overlay(app: &mut App) {
 /// the standard "open model picker" path and seed its query by replaying the
 /// provider's display name as character input through the public view-stack
 /// key path — no model-picker internals are touched.
-fn open_model_picker_for_provider(app: &mut App, provider: crate::config::ApiProvider) {
+fn open_model_picker_for_provider(
+    app: &mut App,
+    config: &Config,
+    provider: crate::config::ApiProvider,
+) {
     if app.view_stack.top_kind() != Some(ModalKind::ModelPicker) {
         app.view_stack
-            .push(crate::tui::model_picker::ModelPickerView::new(app));
+            .push(crate::tui::model_picker::ModelPickerView::new(app, config));
     }
     for ch in provider.display_name().chars() {
         // Char input updates the query and never emits a ViewEvent, so the
@@ -9092,22 +9104,25 @@ fn disable_hotbar(app: &mut App, config: &mut Config) {
     app.needs_redraw = true;
 }
 
-/// Restore the default recommended Hotbar slots: remove the `hotbar` key so the
-/// resolver falls back to the built-in defaults. This is an explicit reset, so
-/// any custom bindings are replaced with the recommended set.
+/// Show the default recommended Hotbar slots. Since #3807 an absent `hotbar`
+/// key means "hidden", so `/hotbar on` persists the explicit default bindings
+/// rather than deleting the key. This is an explicit reset, so any custom
+/// bindings are replaced with the recommended set.
 fn restore_hotbar_defaults(app: &mut App, config: &mut Config) {
-    match crate::config_persistence::remove_hotbar_from_config(app.config_path.as_deref()) {
+    let defaults = codewhale_config::default_hotbar_bindings_toml();
+    match crate::config_persistence::persist_hotbar_bindings(app.config_path.as_deref(), &defaults)
+    {
         Ok(path) => {
-            config.hotbar = None;
+            config.hotbar = Some(defaults);
             app.status_message = Some(format!(
-                "Hotbar restored to default slots ({}). Customize with `/hotbar`.",
+                "Hotbar enabled with the default slots ({}). Customize with `/hotbar`.",
                 path.display()
             ));
         }
         Err(err) => {
-            app.status_message = Some(format!("Failed to restore Hotbar defaults: {err}"));
+            app.status_message = Some(format!("Failed to enable the Hotbar: {err}"));
             app.add_message(HistoryCell::System {
-                content: format!("Failed to restore Hotbar defaults: {err}"),
+                content: format!("Failed to enable the Hotbar: {err}"),
             });
         }
     }
@@ -9409,7 +9424,8 @@ async fn handle_view_events(
             }
             ViewEvent::SubAgentsRefresh => {
                 app.status_message = Some("Refreshing sub-agents...".to_string());
-                let _ = engine_handle.send(Op::ListSubAgents).await;
+                // #3802: non-blocking send — refresh op, safe to drop.
+                let _ = engine_handle.try_send(Op::ListSubAgents);
             }
             ViewEvent::FilePickerSelected { path } => {
                 // Insert `@<path>` at the composer's cursor with surrounding
@@ -9469,7 +9485,7 @@ async fn handle_view_events(
                 .await;
             }
             ViewEvent::ProviderPickerOpenModels { provider } => {
-                open_model_picker_for_provider(app, provider);
+                open_model_picker_for_provider(app, config, provider);
             }
             ViewEvent::ModeSelected { mode } => {
                 let prior_mode = app.mode;

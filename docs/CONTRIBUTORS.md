@@ -28,11 +28,18 @@ notes, and relevant issue/PR comments.
 ## Contributors by time
 
 <details open>
-<summary><strong>v0.8.67 — cleanup lane in progress</strong></summary>
+<summary><strong>v0.8.66 — release readiness, provider intake &amp; UI hardening</strong></summary>
+
+The v0.8.66 release prepared the 0.8.66 package lane, hardened provider/model
+routing and modal surfaces, advanced Hotbar/sub-agent UI reliability, and pulled
+in several community provider and bridge contributions with release credit.
 
 - **[lerugray](https://github.com/lerugray)** — Sakana AI Fugu provider
   support across config, CLI, TUI provider picker, docs, and model completions
   (#3748, harvested)
+- **[greyfreedom](https://github.com/greyfreedom)** — read-only `/config
+  ask-rules` view for resolved ask-rule paths, status, and configured
+  tool/command/path rules (#3569, merged)
 - **[noaft](https://github.com/noaft)** — `/links` provider docs fallback
   update, including the current CodeWhale docs URL and a Baidu Qianfan docs
   link (#3621, harvested)
@@ -42,6 +49,10 @@ notes, and relevant issue/PR comments.
 - **[pkeging](https://github.com/pkeging)** — WeCom Bridge deployment and
   security documentation, including the approval-timeout configuration surface
   (#3640, harvested)
+- **[buko](https://github.com/buko)** — precise Ctrl+O external-editor freeze
+  reproduction that shaped the terminal input-pump fix (#3657)
+- **[cyq1017](https://github.com/cyq1017)** — sub-agent progress-event
+  headroom report that shaped the fanout reliability hardening (#3783)
 
 </details>
 

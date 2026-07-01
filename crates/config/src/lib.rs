@@ -780,6 +780,23 @@ pub fn default_hotbar_bindings() -> Vec<HotbarBinding> {
         .collect()
 }
 
+/// The default hotbar slots in on-disk (`[[hotbar]]`) form. Since #3807 an
+/// absent `hotbar` key means "hidden", so `/hotbar on` persists these explicit
+/// bindings rather than deleting the key. Kept in terms of
+/// [`default_hotbar_bindings`] so `DEFAULT_HOTBAR_ACTIONS` stays the single
+/// source of truth.
+#[must_use]
+pub fn default_hotbar_bindings_toml() -> Vec<HotbarBindingToml> {
+    default_hotbar_bindings()
+        .into_iter()
+        .map(|binding| HotbarBindingToml {
+            slot: binding.slot,
+            action: binding.action,
+            label: binding.label,
+        })
+        .collect()
+}
+
 #[must_use]
 pub fn resolve_hotbar_bindings(
     configured: Option<&[HotbarBindingToml]>,
@@ -797,7 +814,10 @@ pub fn resolve_hotbar_bindings(
                 label: binding.label.clone(),
             })
             .collect::<Vec<_>>(),
-        None => default_hotbar_bindings(),
+        // #3807: an absent `hotbar` key means the Hotbar is hidden until the
+        // user opts in (via the setup wizard or `/hotbar on`). Only an explicit
+        // `[[hotbar]]` config produces bindings. `Some([])` stays "disabled".
+        None => Vec::new(),
     };
 
     let mut by_slot: BTreeMap<u8, HotbarBinding> = BTreeMap::new();

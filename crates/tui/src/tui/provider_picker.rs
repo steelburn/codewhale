@@ -23,15 +23,21 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Widget},
+    widgets::{Block, Borders, Paragraph, Widget},
 };
 
-use crate::config::{ApiProvider, Config, has_api_key_for, kimi_cli_credentials_present};
+use crate::config::{
+    ApiProvider, Config, base_url_uses_local_host, has_api_key_for, kimi_cli_credentials_present,
+    provider_is_configured,
+};
 use crate::core::ops::ProviderRuntimeStatus;
 use crate::model_profile::{SupportState, resolved_capability_profile};
 use crate::palette;
 use crate::tui::app::ReasoningEffort;
-use crate::tui::views::{ModalKind, ModalView, ViewAction, ViewEvent};
+use crate::tui::views::{
+    ActionHint, ModalKind, ModalView, ViewAction, ViewEvent, centered_modal_area,
+    render_modal_footer, render_modal_surface,
+};
 use codewhale_config::catalog::{CatalogOffering, CatalogSnapshot};
 use codewhale_config::provider::WireFormat;
 use codewhale_config::route::{
@@ -46,10 +52,20 @@ enum Stage {
     KeyEntry,
 }
 
+/// Which subset of `rows` the list stage shows (#3830). `Configured` is the
+/// default; `A` toggles to `Catalog` to add a new provider or look at one
+/// that hasn't been set up yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderListView {
+    Configured,
+    Catalog,
+}
+
 pub struct ProviderPickerView {
     rows: Vec<ProviderDashboardRow>,
     selected_idx: usize,
     stage: Stage,
+    view: ProviderListView,
     api_key_input: String,
 }
 
@@ -75,6 +91,15 @@ pub struct ProviderDashboardRow {
     pub messages: Vec<String>,
     pub is_active: bool,
     has_key: bool,
+    /// Whether this provider should appear in the default `/provider`
+    /// manager view (#3830) without the user explicitly browsing the full
+    /// catalog: the active provider, one with working credentials/OAuth, a
+    /// custom provider entry, or any provider with a non-default
+    /// `[providers.<name>]` table entry. A self-hosted provider type
+    /// (Ollama/Sglang/Vllm) does *not* auto-qualify just because its auth is
+    /// optional — that would clutter the default view with every untouched
+    /// local-provider slot.
+    pub is_configured: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -380,6 +405,13 @@ impl ProviderDashboardRow {
                 ],
                 is_active,
                 has_key,
+                is_configured: provider_is_configured(
+                    provider,
+                    is_active,
+                    has_key,
+                    configured,
+                    provider == ApiProvider::Custom && provider_id_override.is_some(),
+                ),
             };
         };
 
@@ -479,6 +511,13 @@ impl ProviderDashboardRow {
             messages,
             is_active,
             has_key,
+            is_configured: provider_is_configured(
+                provider,
+                is_active,
+                has_key,
+                configured,
+                provider == ApiProvider::Custom && provider_id_override.is_some(),
+            ),
         }
     }
 
@@ -916,29 +955,6 @@ fn auth_mode_disables_api_key(mode: &str) -> bool {
     )
 }
 
-fn base_url_uses_local_host(base_url: &str) -> bool {
-    let without_scheme = base_url
-        .split_once("://")
-        .map_or(base_url, |(_, rest)| rest);
-    let authority = without_scheme.split('/').next().unwrap_or_default();
-    let host = authority
-        .rsplit('@')
-        .next()
-        .unwrap_or(authority)
-        .trim_start_matches('[')
-        .split(']')
-        .next()
-        .unwrap_or(authority)
-        .split(':')
-        .next()
-        .unwrap_or(authority)
-        .to_ascii_lowercase();
-    matches!(host.as_str(), "localhost" | "0.0.0.0")
-        || host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|addr| addr.is_loopback() || addr.is_unspecified())
-}
-
 fn missing_auth_message(
     provider: ApiProvider,
     configured: Option<&crate::config::ProviderConfig>,
@@ -1088,39 +1104,83 @@ impl ProviderPickerView {
             .position(|row| row.is_active)
             .or_else(|| rows.iter().position(|row| row.provider == active))
             .unwrap_or(0);
+        // Default to the configured-only view (#3830); if nothing is
+        // configured yet (a fresh install), open straight on the full
+        // catalog instead of an empty list with no obvious next step.
+        let view = if rows.iter().any(|row| row.is_configured) {
+            ProviderListView::Configured
+        } else {
+            ProviderListView::Catalog
+        };
         Self {
             rows,
             selected_idx,
             stage: Stage::List,
+            view,
             api_key_input: String::new(),
         }
     }
 
-    fn move_up(&mut self) {
-        if self.rows.is_empty() {
+    fn row_visible(&self, idx: usize) -> bool {
+        match self.view {
+            ProviderListView::Catalog => true,
+            ProviderListView::Configured => self.rows[idx].is_configured,
+        }
+    }
+
+    fn visible_row_count(&self) -> usize {
+        (0..self.rows.len())
+            .filter(|idx| self.row_visible(*idx))
+            .count()
+    }
+
+    /// Toggle between the configured-only and full-catalog views (#3830),
+    /// keeping the current selection if it stays visible and otherwise
+    /// jumping to the first visible row (`rows` is sorted alphabetically by
+    /// display name, so this lands on the alphabetically-first match, not
+    /// necessarily the row positionally nearest the old selection).
+    fn toggle_view(&mut self) {
+        self.view = match self.view {
+            ProviderListView::Configured => ProviderListView::Catalog,
+            ProviderListView::Catalog => ProviderListView::Configured,
+        };
+        if !self.rows.is_empty() && !self.row_visible(self.selected_idx) {
+            self.selected_idx = (0..self.rows.len())
+                .find(|idx| self.row_visible(*idx))
+                .unwrap_or(0);
+        }
+    }
+
+    /// Move the selection one visible row forward (`step = 1`) or backward
+    /// (`step = -1`), skipping rows hidden by the current `view` filter
+    /// (#3830) and wrapping at the ends.
+    fn move_selection(&mut self, step: i64) {
+        let count = self.rows.len();
+        if count == 0 || self.visible_row_count() == 0 {
             return;
         }
-        if self.selected_idx == 0 {
-            self.selected_idx = self.rows.len() - 1;
-        } else {
-            self.selected_idx -= 1;
+        let mut idx = self.selected_idx;
+        loop {
+            idx = ((idx as i64 + step).rem_euclid(count as i64)) as usize;
+            if self.row_visible(idx) {
+                self.selected_idx = idx;
+                return;
+            }
         }
+    }
+
+    fn move_up(&mut self) {
+        self.move_selection(-1);
     }
 
     fn move_down(&mut self) {
-        if self.rows.is_empty() {
-            return;
-        }
-        if self.selected_idx + 1 == self.rows.len() {
-            self.selected_idx = 0;
-        } else {
-            self.selected_idx += 1;
-        }
+        self.move_selection(1);
     }
 
-    /// Type-ahead: move the selection to the next provider whose display name
-    /// starts with the given character (case-insensitive), wrapping so repeated
-    /// presses cycle through matches — e.g. pressing `z` jumps to "Z.ai".
+    /// Type-ahead: move the selection to the next visible provider whose
+    /// display name starts with the given character (case-insensitive),
+    /// wrapping so repeated presses cycle through matches — e.g. pressing
+    /// `z` jumps to "Z.ai".
     fn jump_to_letter(&mut self, c: char) {
         let count = self.rows.len();
         if count == 0 {
@@ -1129,10 +1189,11 @@ impl ProviderPickerView {
         let target = c.to_ascii_lowercase();
         for offset in 1..=count {
             let idx = (self.selected_idx + offset) % count;
-            if self.rows[idx]
-                .display_name
-                .to_ascii_lowercase()
-                .starts_with(target)
+            if self.row_visible(idx)
+                && self.rows[idx]
+                    .display_name
+                    .to_ascii_lowercase()
+                    .starts_with(target)
             {
                 self.selected_idx = idx;
                 return;
@@ -1174,12 +1235,23 @@ impl ProviderPickerView {
         Self::env_var_for(row.provider)
     }
 
-    fn visible_start(&self, visible_rows: usize) -> usize {
+    /// Rows visible under the current `view` filter (#3830), as
+    /// `(original_index, row)` pairs so callers can still compare against
+    /// `self.selected_idx`.
+    fn filtered_rows(&self) -> Vec<(usize, &ProviderDashboardRow)> {
+        self.rows
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| self.row_visible(*idx))
+            .collect()
+    }
+
+    fn visible_start(selected_pos: usize, total: usize, visible_rows: usize) -> usize {
         if visible_rows == 0 {
             return 0;
         }
-        let max_start = self.rows.len().saturating_sub(visible_rows);
-        self.selected_idx
+        let max_start = total.saturating_sub(visible_rows);
+        selected_pos
             .saturating_add(1)
             .saturating_sub(visible_rows)
             .min(max_start)
@@ -1202,44 +1274,74 @@ impl ProviderPickerView {
         } else {
             "set key"
         };
+        let title = match self.view {
+            ProviderListView::Configured => " Provider ".to_string(),
+            ProviderListView::Catalog => " Provider · all ".to_string(),
+        };
         let outer = Block::default()
             .title(Line::from(Span::styled(
-                " Provider ",
+                title,
                 Style::default()
                     .fg(palette::DEEPSEEK_SKY)
                     .add_modifier(Modifier::BOLD),
             )))
-            .title_bottom(Line::from(vec![
-                Span::styled(" ↑↓ ", Style::default().fg(palette::TEXT_MUTED)),
-                Span::raw("move "),
-                Span::styled(" a-z ", Style::default().fg(palette::TEXT_MUTED)),
-                Span::raw("jump "),
-                Span::styled(" Enter ", Style::default().fg(palette::TEXT_MUTED)),
-                Span::raw(format!("{enter_action} ")),
-                Span::styled(" R ", Style::default().fg(palette::TEXT_MUTED)),
-                Span::raw("edit key "),
-                Span::styled(" M ", Style::default().fg(palette::TEXT_MUTED)),
-                Span::raw("models "),
-                Span::styled(" Esc ", Style::default().fg(palette::TEXT_MUTED)),
-                Span::raw("cancel "),
-            ]))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(palette::BORDER_COLOR))
-            .style(Style::default());
+            .style(Style::default().bg(palette::DEEPSEEK_INK));
         let inner = outer.inner(area);
         outer.render(area, buf);
 
-        let visible_rows = usize::from(inner.height);
-        let visible_start = self.visible_start(visible_rows);
+        let view_action = match self.view {
+            ProviderListView::Configured => "browse all",
+            ProviderListView::Catalog => "configured",
+        };
+        // The action footer moves into the body so it wraps instead of clipping
+        // at narrow widths (#3732); the provider list renders above it.
+        let content = render_modal_footer(
+            inner,
+            buf,
+            &[
+                ActionHint::new("↑↓", "move"),
+                ActionHint::new("a-z", "jump"),
+                ActionHint::new("Enter", enter_action),
+                ActionHint::new("A", view_action),
+                ActionHint::new("R", "edit key"),
+                ActionHint::new("M", "models"),
+                ActionHint::new("Esc", "cancel"),
+            ],
+        );
+
+        let filtered = self.filtered_rows();
+        if filtered.is_empty() {
+            Paragraph::new(vec![
+                Line::from(Span::styled(
+                    "No providers configured yet.",
+                    Style::default().fg(palette::TEXT_MUTED),
+                )),
+                Line::from(Span::styled(
+                    "Press A to browse every supported provider and add one.",
+                    Style::default().fg(palette::TEXT_MUTED),
+                )),
+            ])
+            .render(content, buf);
+            return;
+        }
+
+        let selected_pos = filtered
+            .iter()
+            .position(|(idx, _)| *idx == self.selected_idx)
+            .unwrap_or(0);
+        let visible_rows = usize::from(content.height);
+        let visible_start = Self::visible_start(selected_pos, filtered.len(), visible_rows);
         let mut lines: Vec<Line> = Vec::with_capacity(visible_rows);
-        for (idx, row) in self
-            .rows
+        for (pos, (idx, row)) in filtered
             .iter()
             .enumerate()
             .skip(visible_start)
             .take(visible_rows)
         {
-            let is_selected = idx == self.selected_idx;
+            let is_selected = *idx == self.selected_idx;
+            debug_assert_eq!(is_selected, pos == selected_pos);
             let is_active = row.is_active;
             let arrow = if is_selected { "▸" } else { " " };
             let active_dot = if is_active { " *" } else { "  " };
@@ -1277,7 +1379,7 @@ impl ProviderPickerView {
             ]);
             if is_selected {
                 line.style = Self::selected_row_bg_style();
-                let target_width = usize::from(inner.width);
+                let target_width = usize::from(content.width);
                 let line_width = line.width();
                 if line_width < target_width {
                     line.spans.push(Span::styled(
@@ -1288,7 +1390,7 @@ impl ProviderPickerView {
             }
             lines.push(line);
         }
-        Paragraph::new(lines).render(inner, buf);
+        Paragraph::new(lines).render(content, buf);
     }
 
     fn render_key_entry(&self, area: Rect, buf: &mut Buffer) {
@@ -1300,17 +1402,22 @@ impl ProviderPickerView {
                     .fg(palette::DEEPSEEK_SKY)
                     .add_modifier(Modifier::BOLD),
             )))
-            .title_bottom(Line::from(vec![
-                Span::styled(" Enter ", Style::default().fg(palette::TEXT_MUTED)),
-                Span::raw("save & switch "),
-                Span::styled(" Esc ", Style::default().fg(palette::TEXT_MUTED)),
-                Span::raw("back "),
-            ]))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(palette::BORDER_COLOR))
-            .style(Style::default());
+            .style(Style::default().bg(palette::DEEPSEEK_INK));
         let inner = outer.inner(area);
         outer.render(area, buf);
+
+        // The action footer moves into the body so it wraps instead of clipping
+        // at narrow widths (#3732); the key-entry fields render above it.
+        let content = render_modal_footer(
+            inner,
+            buf,
+            &[
+                ActionHint::new("Enter", "save & switch"),
+                ActionHint::new("Esc", "back"),
+            ],
+        );
 
         let layout = Layout::default()
             .direction(Direction::Vertical)
@@ -1319,7 +1426,7 @@ impl ProviderPickerView {
                 Constraint::Length(2),
                 Constraint::Min(1),
             ])
-            .split(inner);
+            .split(content);
 
         let masked = mask_key(&self.api_key_input);
         let display = if masked.is_empty() {
@@ -1403,7 +1510,11 @@ impl ModalView for ProviderPickerView {
                     self.move_down();
                     ViewAction::None
                 }
-                KeyCode::Enter => {
+                // Row-dependent actions are no-ops when the current filter
+                // (#3830) hides every row — e.g. a fresh Configured view
+                // with nothing configured yet shows the empty state and
+                // `selected_idx` doesn't point at anything on screen.
+                KeyCode::Enter if self.row_visible(self.selected_idx) => {
                     let provider = self.selected_provider();
                     if self.selected_has_key() {
                         ViewAction::EmitAndClose(ViewEvent::ProviderPickerApplied { provider })
@@ -1416,14 +1527,30 @@ impl ModalView for ProviderPickerView {
                         ViewAction::None
                     }
                 }
-                KeyCode::Char(c) if key.modifiers.is_empty() && c.eq_ignore_ascii_case(&'r') => {
+                KeyCode::Char(c)
+                    if key.modifiers.is_empty()
+                        && c.eq_ignore_ascii_case(&'r')
+                        && self.row_visible(self.selected_idx) =>
+                {
                     self.enter_key_entry();
+                    ViewAction::None
+                }
+                // Toggle between the configured-only default view and the
+                // full provider catalog (#3830). Handled before the
+                // type-ahead arm so `a`/`A` always toggles instead of
+                // seeking a provider whose name starts with "a".
+                KeyCode::Char(c) if key.modifiers.is_empty() && c.eq_ignore_ascii_case(&'a') => {
+                    self.toggle_view();
                     ViewAction::None
                 }
                 // Jump to the `/model` picker pre-filtered to this provider
                 // (#3083). Handled before the type-ahead arm so `m`/`M` opens
                 // models instead of seeking a provider whose name starts with m.
-                KeyCode::Char(c) if key.modifiers.is_empty() && c.eq_ignore_ascii_case(&'m') => {
+                KeyCode::Char(c)
+                    if key.modifiers.is_empty()
+                        && c.eq_ignore_ascii_case(&'m')
+                        && self.row_visible(self.selected_idx) =>
+                {
                     let provider = self.selected_provider();
                     ViewAction::EmitAndClose(ViewEvent::ProviderPickerOpenModels { provider })
                 }
@@ -1488,21 +1615,13 @@ impl ModalView for ProviderPickerView {
     }
 
     fn render(&self, area: Rect, buf: &mut Buffer) {
-        let popup_width = 120.min(area.width.saturating_sub(4)).max(64);
-        let popup_height = match self.stage {
+        let preferred_height = match self.stage {
             Stage::List => (self.rows.len() as u16).saturating_add(2),
             Stage::KeyEntry => 10,
-        }
-        .min(area.height.saturating_sub(4))
-        .max(8);
-        let popup_area = Rect {
-            x: area.x + (area.width.saturating_sub(popup_width)) / 2,
-            y: area.y + (area.height.saturating_sub(popup_height)) / 2,
-            width: popup_width,
-            height: popup_height,
         };
+        let popup_area = centered_modal_area(area, 120, preferred_height, 64, 8);
 
-        Clear.render(popup_area, buf);
+        render_modal_surface(area, popup_area, buf);
 
         match self.stage {
             Stage::List => self.render_list(popup_area, buf),
@@ -1595,6 +1714,14 @@ mod tests {
     }
 
     fn move_to_provider(picker: &mut ProviderPickerView, provider: ApiProvider) {
+        // The target may be hidden by the default configured-only view
+        // (#3830); switch to the full catalog so navigation can still reach
+        // it, matching what a user pressing `A` would do.
+        if let Some(idx) = picker.rows.iter().position(|row| row.provider == provider)
+            && !picker.row_visible(idx)
+        {
+            picker.toggle_view();
+        }
         let max_steps = picker.rows.len();
         for _ in 0..max_steps {
             if picker.selected_provider() == provider {
@@ -1619,6 +1746,9 @@ mod tests {
     fn type_ahead_jumps_to_provider_by_first_letter() {
         let config = Config::default();
         let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
+        // Z.ai isn't configured, so it's hidden by the default view (#3830);
+        // browse the full catalog like a user pressing `A` would.
+        picker.toggle_view();
         // `z` is unique to Z.ai among provider display names.
         picker.handle_key(key(KeyCode::Char('z')));
         assert_eq!(picker.selected_provider(), ApiProvider::Zai);
@@ -1648,6 +1778,9 @@ mod tests {
     fn mouse_scroll_moves_selection_in_list_stage() {
         let config = Config::default();
         let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
+        // Scroll across the full catalog (#3830), not just the configured
+        // subset, which would only contain the active provider here.
+        picker.toggle_view();
         let before = picker.selected_idx;
         picker.handle_mouse(MouseEvent {
             kind: MouseEventKind::ScrollDown,
@@ -1686,6 +1819,121 @@ mod tests {
         );
         // DeepSeek is no longer hard-coded first.
         assert_ne!(names.first(), Some(&"DeepSeek"));
+    }
+
+    #[test]
+    fn default_view_shows_only_configured_providers() {
+        // #3830: with nothing but the active provider set up, the default
+        // list view excludes the unconfigured catalog noise — even though
+        // `rows` (the underlying data) still has every provider, per
+        // `picker_lists_all_providers` above. Doesn't assert an exact count:
+        // `OpenaiCodex` reads a real OAuth file from disk in
+        // `has_api_key_for`, so it's legitimately "configured" on a machine
+        // with a prior Codex login and must not make this test host-dependent.
+        let config = Config::default();
+        let picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
+
+        assert_eq!(picker.view, ProviderListView::Configured);
+        let visible: Vec<ApiProvider> = picker
+            .filtered_rows()
+            .iter()
+            .map(|(_, row)| row.provider)
+            .collect();
+        assert!(visible.contains(&ApiProvider::Deepseek), "{visible:?}");
+        assert!(
+            !visible.contains(&ApiProvider::Custom),
+            "the unused custom-provider placeholder slot isn't \"configured\": {visible:?}"
+        );
+        for unconfigured in [
+            ApiProvider::Zai,
+            ApiProvider::Openrouter,
+            ApiProvider::Novita,
+            ApiProvider::Ollama,
+        ] {
+            assert!(
+                !visible.contains(&unconfigured),
+                "{unconfigured:?} has no credentials and isn't active: {visible:?}"
+            );
+        }
+        assert!(
+            picker.rows.len() > visible.len(),
+            "underlying data keeps every provider"
+        );
+    }
+
+    #[test]
+    fn explicit_provider_config_marks_provider_configured_without_active_or_key() {
+        // #3830: a non-default `[providers.<name>]` entry (here just a base
+        // URL override, no key) counts as "configured" even though the
+        // provider is neither active nor has working credentials.
+        let config = Config {
+            providers: Some(crate::config::ProvidersConfig {
+                openrouter: crate::config::ProviderConfig {
+                    base_url: Some("https://custom.openrouter.example/v1".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Config::default()
+        };
+        let picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
+        let row = picker
+            .rows
+            .iter()
+            .find(|row| row.provider == ApiProvider::Openrouter)
+            .expect("openrouter row");
+        assert!(row.is_configured);
+        assert!(!row.has_key, "explicit config doesn't imply a working key");
+    }
+
+    #[test]
+    fn self_hosted_provider_not_auto_configured_without_explicit_setup() {
+        // #3830: `has_api_key_for` always reports `true` for self-hosted
+        // providers (no auth required to route to them) — that must not, on
+        // its own, make Ollama/Sglang/Vllm show up in the default
+        // configured-only view for every user regardless of setup.
+        let config = Config::default();
+        let picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
+        let ollama = picker
+            .rows
+            .iter()
+            .find(|row| row.provider == ApiProvider::Ollama)
+            .expect("ollama row");
+        assert!(
+            ollama.has_key,
+            "self-hosted providers report has_key unconditionally"
+        );
+        assert!(
+            !ollama.is_configured,
+            "but that alone must not mark them configured"
+        );
+
+        // Active self-hosted provider still counts as configured.
+        let active_picker = ProviderPickerView::new(ApiProvider::Ollama, &config);
+        let active_ollama = active_picker
+            .rows
+            .iter()
+            .find(|row| row.provider == ApiProvider::Ollama)
+            .expect("ollama row");
+        assert!(active_ollama.is_configured);
+    }
+
+    #[test]
+    fn toggle_view_reveals_full_catalog_and_back() {
+        let config = Config::default();
+        let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
+        let configured_count = picker.filtered_rows().len();
+        assert_eq!(picker.view, ProviderListView::Configured);
+
+        let action = picker.handle_key(key(KeyCode::Char('a')));
+        assert!(matches!(action, ViewAction::None));
+        assert_eq!(picker.view, ProviderListView::Catalog);
+        assert_eq!(picker.filtered_rows().len(), picker.rows.len());
+        assert!(picker.filtered_rows().len() > configured_count);
+
+        picker.handle_key(key(KeyCode::Char('A')));
+        assert_eq!(picker.view, ProviderListView::Configured);
+        assert_eq!(picker.filtered_rows().len(), configured_count);
     }
 
     #[test]
@@ -2306,6 +2554,9 @@ mod tests {
     fn list_navigation_wraps_between_first_and_last_provider() {
         let config = Config::default();
         let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
+        // Wrap across the full catalog (#3830), not just the configured
+        // subset, which would only contain the active provider here.
+        picker.toggle_view();
         let first = picker.rows.first().expect("non-empty list").provider;
         let last = picker.rows.last().expect("non-empty list").provider;
 
@@ -2480,12 +2731,84 @@ mod tests {
     #[test]
     fn tall_list_render_shows_all_providers_without_scrolling() {
         let config = Config::default();
-        let picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
+        let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
+        // "All providers" means the full catalog (#3830), not just configured.
+        picker.toggle_view();
 
         let rendered = render_text(&picker, 80, 23);
 
         assert!(rendered.contains("DeepSeek *"));
         assert!(rendered.contains("Ollama"));
+    }
+
+    /// The four terminal sizes the v0.8.66 modal blocker (#3732) requires every
+    /// overlay to remain readable and fully operable at.
+    const BLOCKER_SIZES: [(u16, u16); 4] = [(80, 24), (100, 30), (120, 32), (160, 40)];
+
+    #[test]
+    fn provider_picker_is_usable_and_opaque_at_blocker_sizes() {
+        use crate::tui::views::ViewStack;
+        // Provider display names contain capital X/Q (Xiaomi MiMo, Qianfan), so
+        // use a glyph that can never appear in the modal content as the
+        // bleed-through sentinel.
+        const SENTINEL: &str = "\u{2592}"; // ▒
+        let config = Config::default();
+        // Make the first provider in the sorted list active so its highlighted
+        // row sits at the top of the list, never on the vertical center cell
+        // that must read as the opaque modal ink.
+        let active = ProviderPickerView::new(ApiProvider::Deepseek, &config).rows[0].provider;
+
+        for (w, h) in BLOCKER_SIZES {
+            let area = Rect::new(0, 0, w, h);
+            let mut buf = Buffer::empty(area);
+            for y in 0..h {
+                for x in 0..w {
+                    buf[(x, y)].set_symbol(SENTINEL);
+                }
+            }
+            // Render through the ViewStack so the shared opaque backdrop is
+            // painted exactly as it is in production.
+            let mut stack = ViewStack::new();
+            stack.push(ProviderPickerView::new(active, &config));
+            stack.render(area, &mut buf);
+
+            let rows: Vec<String> = (0..h)
+                .map(|y| {
+                    (0..w)
+                        .map(|x| buf[(x, y)].symbol().to_string())
+                        .collect::<String>()
+                })
+                .collect();
+            let text = rows.join("\n");
+
+            // Footer keeps every action (it wraps instead of clipping).
+            for label in ["move", "jump", "edit key", "models", "cancel"] {
+                assert!(text.contains(label), "{w}x{h}: missing '{label}' hint");
+            }
+            // The Enter action label is dynamic (apply vs set key); one shows.
+            assert!(
+                text.contains("apply") || text.contains("set key"),
+                "{w}x{h}: missing Enter action label"
+            );
+            // Composited frame is fully opaque: no sentinel survives and the
+            // center cell carries the modal ink background.
+            assert!(
+                !text.contains(SENTINEL),
+                "{w}x{h}: background bleed-through into modal surface"
+            );
+            assert_eq!(
+                buf[(w / 2, h / 2)].bg,
+                palette::DEEPSEEK_INK,
+                "{w}x{h}: modal interior must be opaque"
+            );
+            // No row exceeds the frame width (no horizontal overflow).
+            for (y, row) in rows.iter().enumerate() {
+                assert!(
+                    unicode_width::UnicodeWidthStr::width(row.trim_end()) <= w as usize,
+                    "{w}x{h}: row {y} overflows width: {row:?}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -45,6 +45,10 @@ If a shell tool is missing from the model-visible catalog in Agent mode, check
 for an explicit `allow_shell = false` in the active config/profile or runtime
 session. Durable tasks and automation keep conservative omitted-field defaults;
 they only receive shell access when their task settings explicitly grant it.
+`allow_shell = true` controls shell availability only; direct multiline
+`exec_shell` commands remain blocked by shell safety validation. For heredocs,
+embedded scripts, or long manual flows, use single-line commands, write a
+script/file first, or run through `task_shell_start`/background shell.
 YOLO turns shell access on together with trust mode and auto-approval.
 
 All action-capable modes have access to persistent RLM sessions through `rlm_open`, `rlm_eval`, `rlm_configure`, and `rlm_close`. Inside an RLM Python REPL, `sub_query_batch` fans out 1-16 cheap parallel child calls pinned to `deepseek-v4-flash`. The model reaches for it when work is too large or repetitive for the parent transcript.

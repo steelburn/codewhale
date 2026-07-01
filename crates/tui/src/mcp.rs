@@ -48,6 +48,55 @@ fn validate_mcp_config_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Expand `${NAME}` placeholders in an MCP config value from the process
+/// environment. This lets secrets (API keys, bearer tokens, …) be supplied
+/// through environment variables instead of being written in cleartext into
+/// the MCP config file on disk.
+///
+/// On a missing or malformed placeholder the error names only the offending
+/// variable, never the surrounding value, so a secret-bearing string is never
+/// echoed into logs or error output.
+fn expand_env_placeholders(value: &str) -> Result<String> {
+    let mut out = String::new();
+    let mut rest = value;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find('}') else {
+            anyhow::bail!("unterminated environment placeholder in MCP config value");
+        };
+        let name = &after[..end];
+        if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            anyhow::bail!("invalid environment placeholder in MCP config value");
+        }
+        let env_value = std::env::var(name).with_context(|| {
+            format!("environment variable {name} required by MCP config is not set")
+        })?;
+        out.push_str(&env_value);
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+/// Expand `${NAME}` placeholders across every value of an MCP config map
+/// (e.g. the stdio child `env`). `context` only labels expansion errors so a
+/// failure can be attributed to the right map.
+fn expand_env_placeholders_map(
+    values: &HashMap<String, String>,
+    context: &str,
+) -> Result<HashMap<String, String>> {
+    let mut expanded = HashMap::with_capacity(values.len());
+    for (key, value) in values {
+        expanded.insert(
+            key.clone(),
+            expand_env_placeholders(value)
+                .with_context(|| format!("failed to expand MCP {context} value for {key}"))?,
+        );
+    }
+    Ok(expanded)
+}
+
 /// Mask a URL so any embedded credentials in the userinfo portion (e.g.
 /// `https://user:secret@host`) are replaced with `***`. Failures fall back to
 /// the original string so we don't lose context — we never want masking to
@@ -1664,11 +1713,14 @@ impl McpPool {
             return Ok(resources);
         }
 
+        let mut items = Vec::new();
         let errors = self.connect_all().await;
         for (server, err) in errors {
             tracing::warn!("Failed to connect MCP server '{server}' for resources: {err:#}");
+            if oauth::error_looks_auth_required(&err) {
+                items.push(Self::mcp_auth_required_error_item(&server));
+            }
         }
-        let mut items = Vec::new();
         for (server, conn) in &self.connections {
             for resource in conn.resources() {
                 items.push(serde_json::json!({
@@ -1705,13 +1757,16 @@ impl McpPool {
             return Ok(templates);
         }
 
+        let mut items = Vec::new();
         let errors = self.connect_all().await;
         for (server, err) in errors {
             tracing::warn!(
                 "Failed to connect MCP server '{server}' for resource templates: {err:#}"
             );
+            if oauth::error_looks_auth_required(&err) {
+                items.push(Self::mcp_auth_required_error_item(&server));
+            }
         }
-        let mut items = Vec::new();
         for (server, conn) in &self.connections {
             for template in conn.resource_templates() {
                 items.push(serde_json::json!({
@@ -1724,6 +1779,14 @@ impl McpPool {
             }
         }
         Ok(items)
+    }
+
+    fn mcp_auth_required_error_item(server: &str) -> serde_json::Value {
+        serde_json::json!({
+            "error": "authentication_required",
+            "server": server,
+            "message": oauth::auth_required_login_hint(server),
+        })
     }
 
     /// Get all discovered prompts with server-prefixed names

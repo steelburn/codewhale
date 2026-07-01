@@ -21,12 +21,12 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.100"
-codewhale-config = { path = "../config", version = "0.8.65" }
-codewhale-execpolicy = { path = "../execpolicy", version = "0.8.65" }
-codewhale-protocol = { path = "../protocol", version = "0.8.65" }
-codewhale-release = { path = "../release", version = "0.8.65" }
-codewhale-secrets = { path = "../secrets", version = "0.8.65" }
-codewhale-tools = { path = "../tools", version = "0.8.65" }
+codewhale-config = { path = "../config", version = "0.8.66" }
+codewhale-execpolicy = { path = "../execpolicy", version = "0.8.66" }
+codewhale-protocol = { path = "../protocol", version = "0.8.66" }
+codewhale-release = { path = "../release", version = "0.8.66" }
+codewhale-secrets = { path = "../secrets", version = "0.8.66" }
+codewhale-tools = { path = "../tools", version = "0.8.66" }
 schemaui = { version = "0.12.0", default-features = false, optional = true }
 async-stream = "0.3.6"
 async-trait = "0.1"

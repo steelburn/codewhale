@@ -232,6 +232,40 @@ fn mcp_server_config_omits_headers_when_empty() {
     );
 }
 
+#[test]
+fn expand_env_placeholders_expands_value_from_environment() {
+    let _lock = crate::test_support::lock_test_env();
+    let _secret =
+        crate::test_support::EnvVarGuard::set("MCP_TEST_SECRET_TOKEN", "test-secret-123456");
+    let mut env = HashMap::new();
+    env.insert(
+        "API_TOKEN".to_string(),
+        "${MCP_TEST_SECRET_TOKEN}".to_string(),
+    );
+
+    let expanded = expand_env_placeholders_map(&env, "env").unwrap();
+
+    assert_eq!(
+        expanded.get("API_TOKEN").map(String::as_str),
+        Some("test-secret-123456")
+    );
+}
+
+#[test]
+fn expand_env_placeholders_reports_missing_variable_without_secret_value() {
+    let _lock = crate::test_support::lock_test_env();
+    let _missing = crate::test_support::EnvVarGuard::remove("MCP_TEST_MISSING_SECRET");
+
+    let err = expand_env_placeholders("Bearer ${MCP_TEST_MISSING_SECRET}")
+        .expect_err("missing env should fail")
+        .to_string();
+
+    // The error must name the variable but must not leak the surrounding
+    // value (which in practice carries the secret).
+    assert!(err.contains("MCP_TEST_MISSING_SECRET"));
+    assert!(!err.contains("Bearer "));
+}
+
 #[tokio::test]
 async fn mcp_http_auth_prefers_static_authorization_over_bearer_env() {
     let mut headers = HashMap::new();
@@ -354,6 +388,19 @@ fn streamable_http_transport_stores_headers() {
         },
     );
     assert_eq!(transport.auth.headers, headers);
+}
+
+#[test]
+fn mcp_auth_required_error_item_is_model_visible() {
+    let item = McpPool::mcp_auth_required_error_item("nordic-mcp");
+    assert_eq!(item["error"], "authentication_required");
+    assert_eq!(item["server"], "nordic-mcp");
+    assert!(
+        item["message"]
+            .as_str()
+            .expect("message")
+            .contains("codewhale mcp login nordic-mcp")
+    );
 }
 
 #[test]

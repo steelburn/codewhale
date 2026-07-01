@@ -1,12 +1,16 @@
-//! Fleet setup and loadout planner.
+//! `/fleet setup` — a progressive "set up your agent team" flow.
 //!
-//! NOTE (audit #7 / #3167): the modal title, footer hints, and the lane/row
-//! taxonomy below are intentionally English for now. #3167 reworks this view
-//! from a read-only summary into an interactive provider/model picker, which
-//! will churn most of this text; localizing the ~90 volatile technical strings
-//! into all shipped locales before that lands would be throwaway work. The
-//! command entry (`CmdFleetDescription`) is already localized, and the
-//! functional selection wiring (audit #8) is handled here regardless of locale.
+//! Replaces the old six-column config matrix (#3791). Fleet is presented as an
+//! agent team: the user makes one focused choice at a time (a role, then a model
+//! class) and then reviews the full posture — model/route, permissions, tools,
+//! workspace/org scope, and review policy — before starting. "Start" inserts a
+//! safe profile-authoring prompt into the composer; nothing is written to disk,
+//! preserving the existing InsertText-to-compose commit path.
+//!
+//! NOTE (audit #7 / #3167): the role/model taxonomy and copy below are
+//! intentionally English for now; #3167 reworks this into an interactive
+//! provider/model picker that will churn most of this text. The command entry
+//! (`CmdFleetDescription`) is already localized.
 
 use std::path::{Path, PathBuf};
 
@@ -16,74 +20,106 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Padding, Paragraph, Widget},
+    widgets::{Block, Borders, Padding, Paragraph, Widget, Wrap},
 };
 
 use crate::config::Config;
 use crate::palette;
 use crate::tui::app::App;
 use crate::tui::views::{
-    CommandPaletteAction, ModalKind, ModalView, ViewAction, ViewEvent, truncate_view_text,
+    ActionHint, CommandPaletteAction, ModalKind, ModalView, ViewAction, ViewEvent,
+    centered_modal_area, render_modal_footer, render_modal_surface, truncate_view_text,
 };
 
 const PROFILE_DIR: &str = ".codewhale/agents";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RowTone {
-    Current,
-    Ready,
-    Info,
-    Warning,
+/// A selectable choice in a wizard step: a short identifier `label`, a one-line
+/// `summary`, and a longer `description` shown (wrapped) in the detail pane.
+struct Choice {
+    label: &'static str,
+    summary: &'static str,
+    description: &'static str,
 }
 
-impl RowTone {
-    fn style(self, selected: bool) -> Style {
-        if selected {
-            return Style::default()
-                .fg(palette::SELECTION_TEXT)
-                .bg(palette::SELECTION_BG)
-                .add_modifier(Modifier::BOLD);
-        }
+/// Agent-team roles. `label` doubles as the profile `role_hint` and file stem,
+/// so these strings are part of the generated-profile contract.
+const ROLES: [Choice; 8] = [
+    Choice {
+        label: "manager",
+        summary: "Plan & split queued work",
+        description: "Coordinates the Fleet run: plans the work, splits it into bounded tasks, and dispatches workers.",
+    },
+    Choice {
+        label: "main",
+        summary: "Default orchestrator",
+        description: "The parent for the whole Fleet. Owns topology and verifies the claims workers return.",
+    },
+    Choice {
+        label: "scout",
+        summary: "Read-first research",
+        description: "Research and repo reconnaissance. Reads and summarizes before anything is written.",
+    },
+    Choice {
+        label: "builder",
+        summary: "Implements bounded changes",
+        description: "Implements changes strictly inside its assigned task scope; writes only what the slice needs.",
+    },
+    Choice {
+        label: "reviewer",
+        summary: "Read-only review",
+        description: "Checks regressions, tests, and diffs. Read-only — it never writes.",
+    },
+    Choice {
+        label: "verifier",
+        summary: "Runs focused validation",
+        description: "Runs targeted validation and reports receipts back to the orchestrator.",
+    },
+    Choice {
+        label: "synthesizer",
+        summary: "Reduce receipts to handoff",
+        description: "Turns worker receipts into bounded handoff state instead of raw transcript replay.",
+    },
+    Choice {
+        label: "custom",
+        summary: "Author a profile by hand",
+        description: "Define the posture yourself in a workspace agent TOML profile under .codewhale/agents/.",
+    },
+];
 
-        Style::default().fg(match self {
-            Self::Current => palette::WHALE_ACCENT_PRIMARY,
-            Self::Ready => palette::STATUS_SUCCESS,
-            Self::Info => palette::TEXT_PRIMARY,
-            Self::Warning => palette::STATUS_WARNING,
-        })
-    }
-}
-
-#[derive(Debug, Clone)]
-struct FleetSetupRow {
-    label: String,
-    value: String,
-    detail: String,
-    tone: RowTone,
-}
-
-impl FleetSetupRow {
-    fn new(label: impl Into<String>, value: impl Into<String>, detail: impl Into<String>) -> Self {
-        Self {
-            label: label.into(),
-            value: value.into(),
-            detail: detail.into(),
-            tone: RowTone::Info,
-        }
-    }
-
-    fn tone(mut self, tone: RowTone) -> Self {
-        self.tone = tone;
-        self
-    }
-}
-
-#[derive(Debug, Clone)]
-struct FleetSetupLane {
-    title: &'static str,
-    subtitle: &'static str,
-    rows: Vec<FleetSetupRow>,
-}
+/// Model-routing classes. `label` is mapped to a profile `model_class_hint` by
+/// [`model_class_hint`]; default is `inherit` (reuse the active route).
+const MODEL_CLASSES: [Choice; 6] = [
+    Choice {
+        label: "inherit",
+        summary: "Same model as now",
+        description: "Reuse the active provider, model, and reasoning for this worker. Recommended default.",
+    },
+    Choice {
+        label: "fast",
+        summary: "Low-latency scout",
+        description: "An opt-in low-latency class for wide fan-out and quick reconnaissance.",
+    },
+    Choice {
+        label: "balanced",
+        summary: "Everyday build/review",
+        description: "A balanced class for normal build and review work.",
+    },
+    Choice {
+        label: "strong",
+        summary: "Hard problems",
+        description: "The strongest class for security, release, and architecture work.",
+    },
+    Choice {
+        label: "deep-reasoning",
+        summary: "More reasoning",
+        description: "Higher reasoning effort when the active route supports it.",
+    },
+    Choice {
+        label: "tool-heavy",
+        summary: "Operator workflows",
+        description: "Shell- and artifact-heavy operator workflows.",
+    },
+];
 
 #[derive(Debug, Clone)]
 pub struct FleetSetupSnapshot {
@@ -140,21 +176,23 @@ impl FleetSetupSnapshot {
     }
 }
 
-/// Lane index of the role picker (lane "1 Role").
-const ROLE_LANE: usize = 0;
-/// Lane index of the model-class picker (lane "2 Model").
-const MODEL_LANE: usize = 1;
+/// Which focused screen of the wizard is showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    /// Pick the team role.
+    Role,
+    /// Pick the model-routing class.
+    Model,
+    /// Review the full posture and start.
+    Review,
+}
 
 pub struct FleetSetupView {
-    lanes: Vec<FleetSetupLane>,
-    selected_lane: usize,
-    selected_rows: Vec<usize>,
-    scrolls: Vec<usize>,
-    // The route context the profile prompt is generated against. The prompt
-    // itself is built on demand from the *current* role/model selection (see
-    // `insert_profile_prompt_action`) so the planner selection has a functional
-    // outcome.
     snapshot: FleetSetupSnapshot,
+    step: Step,
+    role_idx: usize,
+    model_idx: usize,
+    review_scroll: usize,
 }
 
 impl FleetSetupView {
@@ -164,77 +202,85 @@ impl FleetSetupView {
     }
 
     fn from_snapshot(snapshot: FleetSetupSnapshot) -> Self {
-        let lanes = build_lanes(&snapshot);
-        let len = lanes.len();
         Self {
-            lanes,
-            selected_lane: 0,
-            selected_rows: vec![0; len],
-            scrolls: vec![0; len],
             snapshot,
+            step: Step::Role,
+            role_idx: 0,
+            model_idx: 0,
+            review_scroll: 0,
         }
     }
 
-    /// Label of the row currently selected in `lane`, if any.
-    fn selected_label(&self, lane: usize) -> Option<&str> {
-        let row = self.selected_rows.get(lane).copied().unwrap_or_default();
-        self.lanes
-            .get(lane)
-            .and_then(|lane| lane.rows.get(row))
-            .map(|row| row.label.as_str())
+    /// The planner role chosen (drives the profile file name and `role_hint`).
+    fn selected_role(&self) -> &'static str {
+        ROLES[self.role_idx.min(ROLES.len() - 1)].label
     }
 
-    /// The planner role chosen in the Role lane (drives the profile file name
-    /// and `role_hint`). Falls back to `custom` when unresolved.
-    fn selected_role(&self) -> &str {
-        self.selected_label(ROLE_LANE).unwrap_or("custom")
-    }
-
-    /// The model class chosen in the Model lane, mapped to a profile schema
-    /// `model_class_hint` value.
+    /// The model class chosen, mapped to a profile schema `model_class_hint`.
     fn selected_model_class(&self) -> &'static str {
-        model_class_hint(self.selected_label(MODEL_LANE).unwrap_or("inherit"))
+        model_class_hint(MODEL_CLASSES[self.model_idx.min(MODEL_CLASSES.len() - 1)].label)
     }
 
-    fn selected_row(&self) -> usize {
-        self.selected_rows
-            .get(self.selected_lane)
-            .copied()
-            .unwrap_or_default()
-    }
-
-    fn selected_row_mut(&mut self) -> &mut usize {
-        &mut self.selected_rows[self.selected_lane]
-    }
-
-    fn selected_scroll_mut(&mut self) -> &mut usize {
-        &mut self.scrolls[self.selected_lane]
-    }
-
-    fn move_lane_left(&mut self) {
-        self.selected_lane = self.selected_lane.saturating_sub(1);
-    }
-
-    fn move_lane_right(&mut self) {
-        if self.selected_lane + 1 < self.lanes.len() {
-            self.selected_lane += 1;
+    /// Number of selectable rows on the current step (0 on the review step).
+    fn step_len(&self) -> usize {
+        match self.step {
+            Step::Role => ROLES.len(),
+            Step::Model => MODEL_CLASSES.len(),
+            Step::Review => 0,
         }
     }
 
-    fn move_row_up(&mut self) {
-        *self.selected_row_mut() = self.selected_row().saturating_sub(1);
-        *self.selected_scroll_mut() = self.selected_row();
+    fn move_up(&mut self) {
+        match self.step {
+            Step::Role => self.role_idx = self.role_idx.saturating_sub(1),
+            Step::Model => self.model_idx = self.model_idx.saturating_sub(1),
+            Step::Review => self.review_scroll = self.review_scroll.saturating_sub(1),
+        }
     }
 
-    fn move_row_down(&mut self) {
-        let max = self
-            .lanes
-            .get(self.selected_lane)
-            .map(|lane| lane.rows.len().saturating_sub(1))
-            .unwrap_or_default();
-        let next = (self.selected_row() + 1).min(max);
-        *self.selected_row_mut() = next;
-        *self.selected_scroll_mut() = next.saturating_sub(4);
+    fn move_down(&mut self) {
+        match self.step {
+            Step::Role => {
+                self.role_idx = (self.role_idx + 1).min(self.step_len().saturating_sub(1));
+            }
+            Step::Model => {
+                self.model_idx = (self.model_idx + 1).min(self.step_len().saturating_sub(1));
+            }
+            Step::Review => self.review_scroll = self.review_scroll.saturating_add(1),
+        }
+    }
+
+    /// Advance to the next step, or — on the review step — commit by inserting
+    /// the profile-authoring prompt into the composer.
+    fn advance(&mut self) -> ViewAction {
+        match self.step {
+            Step::Role => {
+                self.step = Step::Model;
+                ViewAction::None
+            }
+            Step::Model => {
+                self.step = Step::Review;
+                self.review_scroll = 0;
+                ViewAction::None
+            }
+            Step::Review => self.insert_profile_prompt_action(),
+        }
+    }
+
+    /// Step back toward the first screen. Returns `None` at the first step (the
+    /// host closes the modal via Esc instead).
+    fn back(&mut self) -> ViewAction {
+        match self.step {
+            Step::Role => ViewAction::None,
+            Step::Model => {
+                self.step = Step::Role;
+                ViewAction::None
+            }
+            Step::Review => {
+                self.step = Step::Model;
+                ViewAction::None
+            }
+        }
     }
 
     fn insert_profile_prompt_action(&self) -> ViewAction {
@@ -245,15 +291,37 @@ impl FleetSetupView {
         })
     }
 
-    /// Build the profile authoring prompt for the *current* role/model
-    /// selection. Re-evaluated each time so navigating the planner changes what
-    /// `g`/Enter inserts.
+    /// Build the profile authoring prompt for the current role/model selection.
     fn profile_prompt(&self) -> String {
         profile_authoring_prompt(
             &self.snapshot,
             self.selected_role(),
             self.selected_model_class(),
         )
+    }
+
+    /// The action hints for the current step's footer (wrapped by the shared
+    /// footer renderer so they can never run off the modal edge).
+    fn footer_hints(&self) -> Vec<ActionHint> {
+        let mut hints = Vec::new();
+        match self.step {
+            Step::Role => {
+                hints.push(ActionHint::new("↑/↓", "choose"));
+                hints.push(ActionHint::new("Enter", "next"));
+            }
+            Step::Model => {
+                hints.push(ActionHint::new("↑/↓", "choose"));
+                hints.push(ActionHint::new("Enter", "next"));
+                hints.push(ActionHint::new("←", "back"));
+            }
+            Step::Review => {
+                hints.push(ActionHint::new("↑/↓", "scroll"));
+                hints.push(ActionHint::new("Enter", "start"));
+                hints.push(ActionHint::new("←", "back"));
+            }
+        }
+        hints.push(ActionHint::new("Esc", "cancel"));
+        hints
     }
 }
 
@@ -269,58 +337,55 @@ impl ModalView for FleetSetupView {
     fn handle_key(&mut self, key: KeyEvent) -> ViewAction {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => ViewAction::Close,
-            KeyCode::Left | KeyCode::Char('h') => {
-                self.move_lane_left();
-                ViewAction::None
-            }
-            KeyCode::Right | KeyCode::Char('l') => {
-                self.move_lane_right();
-                ViewAction::None
-            }
             KeyCode::Up | KeyCode::Char('k') => {
-                self.move_row_up();
+                self.move_up();
                 ViewAction::None
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                self.move_row_down();
+                self.move_down();
                 ViewAction::None
             }
-            KeyCode::Enter | KeyCode::Char('g') | KeyCode::Char('G') => {
-                self.insert_profile_prompt_action()
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => self.advance(),
+            KeyCode::Left | KeyCode::Char('h') => self.back(),
+            KeyCode::Home => {
+                self.review_scroll = 0;
+                ViewAction::None
+            }
+            KeyCode::PageUp => {
+                self.review_scroll = self.review_scroll.saturating_sub(8);
+                ViewAction::None
+            }
+            KeyCode::PageDown => {
+                self.review_scroll = self.review_scroll.saturating_add(8);
+                ViewAction::None
             }
             _ => ViewAction::None,
         }
     }
 
     fn render(&self, area: Rect, buf: &mut Buffer) {
-        let popup_width = area.width.saturating_sub(4).clamp(72, 116).min(area.width);
-        let popup_height = area.height.saturating_sub(4).clamp(18, 38).min(area.height);
-        let popup_area = Rect {
-            x: area.x + area.width.saturating_sub(popup_width) / 2,
-            y: area.y + area.height.saturating_sub(popup_height) / 2,
-            width: popup_width,
-            height: popup_height,
+        let popup_area = centered_modal_area(area, 96, 30, 60, 16);
+        render_modal_surface(area, popup_area, buf);
+
+        let step_no = match self.step {
+            Step::Role => 1,
+            Step::Model => 2,
+            Step::Review => 3,
         };
-
-        Clear.render(popup_area, buf);
-
         let block = Block::default()
             .title(Line::from(Span::styled(
-                " Fleet Setup ",
+                " Fleet setup — your agent team ",
                 Style::default()
                     .fg(palette::WHALE_ACCENT_PRIMARY)
                     .add_modifier(Modifier::BOLD),
             )))
-            .title_bottom(Line::from(vec![
-                Span::styled(" Left/Right ", Style::default().fg(palette::TEXT_MUTED)),
-                Span::raw("lane "),
-                Span::styled(" Up/Down ", Style::default().fg(palette::TEXT_MUTED)),
-                Span::raw("option "),
-                Span::styled(" Enter/G ", Style::default().fg(palette::TEXT_MUTED)),
-                Span::raw("profile prompt "),
-                Span::styled(" Esc ", Style::default().fg(palette::TEXT_MUTED)),
-                Span::raw("close "),
-            ]))
+            .title_bottom(
+                Line::from(Span::styled(
+                    format!(" Step {step_no}/3 "),
+                    Style::default().fg(palette::TEXT_MUTED),
+                ))
+                .alignment(ratatui::layout::Alignment::Right),
+            )
             .borders(Borders::ALL)
             .border_style(Style::default().fg(palette::BORDER_COLOR))
             .style(Style::default().bg(palette::DEEPSEEK_INK))
@@ -329,304 +394,258 @@ impl ModalView for FleetSetupView {
         let inner = block.inner(popup_area);
         block.render(popup_area, buf);
 
-        let direction = if inner.width >= 94 {
-            Direction::Horizontal
-        } else {
-            Direction::Vertical
-        };
-        let constraints = vec![Constraint::Ratio(1, self.lanes.len() as u32); self.lanes.len()];
-        let areas = Layout::default()
-            .direction(direction)
-            .constraints(constraints)
-            .split(inner);
+        let hints = self.footer_hints();
+        let content = render_modal_footer(inner, buf, &hints);
 
-        for (idx, lane) in self.lanes.iter().enumerate() {
-            let focused = idx == self.selected_lane;
-            let scroll = self.scrolls.get(idx).copied().unwrap_or_default();
-            let selected = self.selected_rows.get(idx).copied().unwrap_or_default();
-            render_lane(lane, areas[idx], buf, focused, selected, scroll);
+        // Header (intro + breadcrumb) above the step body.
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(3), Constraint::Min(1)])
+            .split(content);
+        self.render_header(chunks[0], buf);
+
+        match self.step {
+            Step::Role => render_choice_step(
+                chunks[1],
+                buf,
+                &ROLES,
+                self.role_idx,
+                &[
+                    "Fleet runs sub-agents that delegate work. Pick the role this".to_string(),
+                    "team member should play. It becomes the profile role_hint.".to_string(),
+                ],
+            ),
+            Step::Model => render_choice_step(
+                chunks[1],
+                buf,
+                &MODEL_CLASSES,
+                self.model_idx,
+                &[
+                    format!(
+                        "Current route: {} / {}  ·  reasoning {}",
+                        self.snapshot.provider, self.snapshot.model, self.snapshot.reasoning
+                    ),
+                    format!(
+                        "Maps to model_class_hint = {}.",
+                        self.selected_model_class()
+                    ),
+                ],
+            ),
+            Step::Review => self.render_review(chunks[1], buf),
         }
     }
 }
 
-fn build_lanes(snapshot: &FleetSetupSnapshot) -> Vec<FleetSetupLane> {
-    let (profile_value, profile_detail) = profile_file_status(&snapshot.workspace);
-    let token_budget = snapshot
-        .token_budget
-        .map(|budget| format!("{budget} tokens"))
-        .unwrap_or_else(|| "unbounded".to_string());
+impl FleetSetupView {
+    fn render_header(&self, area: Rect, buf: &mut Buffer) {
+        let (title, subtitle) = match self.step {
+            Step::Role => (
+                "Choose a team role",
+                "Each Fleet member plays one role in the delegation.",
+            ),
+            Step::Model => (
+                "Choose a model class",
+                "How this worker should be routed. Inherit keeps your current model.",
+            ),
+            Step::Review => (
+                "Review & start",
+                "Confirm the posture below, then start to author the profile.",
+            ),
+        };
+        let lines = vec![
+            Line::from(Span::styled(
+                title,
+                Style::default().fg(palette::DEEPSEEK_SKY).bold(),
+            )),
+            Line::from(Span::styled(
+                subtitle,
+                Style::default().fg(palette::TEXT_MUTED),
+            )),
+        ];
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: true })
+            .render(area, buf);
+    }
 
-    vec![
-        FleetSetupLane {
-            title: "1 Role",
-            subtitle: "role and persona",
-            rows: vec![
-                FleetSetupRow::new("manager", "plan/split", "coordinates queued Fleet work"),
-                FleetSetupRow::new("main", "orchestrator", "default parent for the whole Fleet")
-                    .tone(RowTone::Ready),
-                FleetSetupRow::new("scout", "read-first", "research and repo reconnaissance"),
-                FleetSetupRow::new("builder", "write", "implements bounded changes"),
-                FleetSetupRow::new("reviewer", "read-only", "checks regressions and tests"),
-                FleetSetupRow::new("verifier", "test-runner", "runs focused validation"),
-                FleetSetupRow::new("synthesizer", "reduce", "turns receipts into handoff state"),
-                FleetSetupRow::new(
-                    "custom",
-                    "agent profile",
-                    "workspace TOML can define posture",
-                )
-                .tone(RowTone::Current),
-            ],
-        },
-        FleetSetupLane {
-            title: "2 Model",
-            subtitle: "class and route intent",
-            rows: vec![
-                FleetSetupRow::new(
-                    "current route",
-                    format!("{} / {}", snapshot.provider, snapshot.model),
-                    format!("default same model, reasoning {}", snapshot.reasoning),
-                )
-                .tone(RowTone::Current),
-                FleetSetupRow::new("inherit", "same model", "reuse active provider/model"),
-                FleetSetupRow::new("fast", "scout", "opt-in low-latency fanout"),
-                FleetSetupRow::new("balanced", "auto class", "normal build/review when chosen")
-                    .tone(RowTone::Ready),
-                FleetSetupRow::new(
-                    "preset",
-                    "editable",
-                    "recommended tiers never force the orchestrator",
-                )
-                .tone(RowTone::Current),
-                FleetSetupRow::new("strong", "hard", "security, release, architecture"),
-                FleetSetupRow::new(
-                    "fixed model",
-                    "profile model",
-                    "visible model id on active route",
-                )
-                .tone(RowTone::Current),
-                FleetSetupRow::new("deep-reasoning", "debug", "higher reasoning when supported"),
-                FleetSetupRow::new("tool-heavy", "operator", "shell and artifact workflows"),
-            ],
-        },
-        FleetSetupLane {
-            title: "3 Permission",
-            subtitle: "authority posture",
-            rows: vec![
-                FleetSetupRow::new(
-                    "parent envelope",
-                    "inherit+narrow",
-                    "children cannot widen approval, trust, or secrets",
-                )
-                .tone(RowTone::Ready),
-                FleetSetupRow::new("reviewer", "read-only", "default for review/plan/scout")
-                    .tone(RowTone::Ready),
-                FleetSetupRow::new("builder", "scoped write", "write only inside task bounds"),
-                FleetSetupRow::new(
-                    "approval",
-                    "required",
-                    "profiles cannot disable required approvals",
-                )
-                .tone(RowTone::Ready),
-                FleetSetupRow::new(
-                    "custom profile",
-                    "no grants",
-                    "TOML may narrow posture but not expand it",
-                ),
-            ],
-        },
-        FleetSetupLane {
-            title: "4 Tools",
-            subtitle: "capability loadout",
-            rows: vec![
-                FleetSetupRow::new("workspace files", profile_value, profile_detail)
-                    .tone(RowTone::Ready),
-                FleetSetupRow::new(
-                    "custom profile",
-                    "generate TOML",
-                    "Enter inserts a safe authoring prompt",
-                )
-                .tone(RowTone::Current),
-                FleetSetupRow::new("read tools", "default", "search, inspect, summarize")
-                    .tone(RowTone::Ready),
-                FleetSetupRow::new(
-                    "write tools",
-                    "builder only",
-                    "edit/apply patch after scope",
-                ),
-                FleetSetupRow::new("shell", "policy gated", "allowed by parent/runtime posture"),
-                FleetSetupRow::new(
-                    "artifacts",
-                    "receipts",
-                    "logs and handoff data stay inspectable",
-                ),
-            ],
-        },
-        FleetSetupLane {
-            title: "5 Org",
-            subtitle: "team and recursion",
-            rows: vec![
-                FleetSetupRow::new(
-                    "Fleet config",
-                    "sub-agents",
-                    "durable slots, profiles, models, tools, ledger",
-                )
-                .tone(RowTone::Current),
-                FleetSetupRow::new(
-                    "WhaleFlow",
-                    "agent plan",
-                    "agent-authored workflow selects and monitors slots",
-                )
-                .tone(RowTone::Ready),
-                FleetSetupRow::new(
-                    "role workers",
-                    if snapshot.subagents_enabled {
-                        "enabled"
-                    } else {
-                        "disabled"
-                    },
-                    format!(
-                        "{} concurrent, {} launch slots, {} admitted",
-                        snapshot.max_subagents, snapshot.launch_concurrency, snapshot.max_admitted
-                    ),
-                )
-                .tone(if snapshot.subagents_enabled {
-                    RowTone::Ready
+    fn render_review(&self, area: Rect, buf: &mut Buffer) {
+        let role = &ROLES[self.role_idx.min(ROLES.len() - 1)];
+        let model = &MODEL_CLASSES[self.model_idx.min(MODEL_CLASSES.len() - 1)];
+        let (profile_value, _) = profile_file_status(&self.snapshot.workspace);
+        let file_stem = profile_file_stem(role.label);
+        let token_budget = self
+            .snapshot
+            .token_budget
+            .map(|budget| format!("{budget} tokens"))
+            .unwrap_or_else(|| "unbounded".to_string());
+
+        let mut lines: Vec<Line> = Vec::new();
+        let section = |lines: &mut Vec<Line>, label: &str, body: String| {
+            lines.push(Line::from(Span::styled(
+                label.to_string(),
+                Style::default().fg(palette::DEEPSEEK_SKY).bold(),
+            )));
+            lines.push(Line::from(Span::styled(
+                body,
+                Style::default().fg(palette::TEXT_PRIMARY),
+            )));
+            lines.push(Line::from(""));
+        };
+
+        section(
+            &mut lines,
+            "Role",
+            format!("{} — {}", role.label, role.summary),
+        );
+        section(
+            &mut lines,
+            "Model",
+            format!(
+                "{} (model_class_hint = {})  ·  route {} / {}, reasoning {}",
+                model.label,
+                self.selected_model_class(),
+                self.snapshot.provider,
+                self.snapshot.model,
+                self.snapshot.reasoning
+            ),
+        );
+        section(
+            &mut lines,
+            "Permissions",
+            "Inherit the parent envelope and narrow only. Children cannot widen approval, trust, or secrets, and required approvals stay on.".to_string(),
+        );
+        section(
+            &mut lines,
+            "Tools",
+            "Read tools by default; write tools for builders within scope; shell stays policy-gated; artifacts and receipts stay inspectable.".to_string(),
+        );
+        section(
+            &mut lines,
+            "Workspace & org",
+            format!(
+                "{} · sub-agents {} ({} concurrent, {} launch slots, {} admitted) · recursion agent {} / fleet {} (ceiling {})",
+                self.snapshot.workspace.display(),
+                if self.snapshot.subagents_enabled {
+                    "enabled"
                 } else {
-                    RowTone::Warning
-                }),
-                FleetSetupRow::new(
-                    "recursion",
-                    format!(
-                        "agent {} / fleet {}",
-                        snapshot.subagent_spawn_depth, snapshot.fleet_spawn_depth
-                    ),
-                    format!("ceiling {}", codewhale_config::MAX_SPAWN_DEPTH_CEILING),
-                )
-                .tone(RowTone::Ready),
-                FleetSetupRow::new(
-                    "slot grid",
-                    "1-5 slots",
-                    "add or drill right into a recursive ring",
-                )
-                .tone(RowTone::Ready),
-                FleetSetupRow::new(
-                    "limits",
-                    "100 total / depth 5",
-                    "workflow population cap, separate from launch concurrency",
-                ),
-                FleetSetupRow::new(
-                    "DeepSeek preset",
-                    "Pro -> Flash",
-                    "editable per slot; cheaper as rings expand",
-                ),
-                FleetSetupRow::new(
-                    "budget",
-                    token_budget,
-                    format!(
-                        "{}s api, {}s heartbeat",
-                        snapshot.api_timeout_secs, snapshot.heartbeat_timeout_secs
-                    ),
-                ),
-                FleetSetupRow::new("retry/ledger", "Fleet", "durable receipts and inspection"),
-            ],
-        },
-        FleetSetupLane {
-            title: "6 Review",
-            subtitle: "check and run",
-            rows: vec![
-                FleetSetupRow::new(
-                    "runtime",
-                    "Fleet -> exec",
-                    "durable workers launch the headless runtime",
-                )
-                .tone(RowTone::Current),
-                FleetSetupRow::new(
-                    "status",
-                    "/fleet status",
-                    "compat /subagents opens the same worker view",
-                )
-                .tone(RowTone::Ready),
-                FleetSetupRow::new(
-                    "inspect",
-                    "ledger",
-                    "route, receipt, artifact, terminal state",
-                ),
-                FleetSetupRow::new(
-                    "run spec",
-                    "review first",
-                    "confirm role/profile/loadout before launch",
-                ),
-                FleetSetupRow::new("handoff", "bounded", "summaries over raw transcript replay"),
-            ],
-        },
-    ]
+                    "disabled"
+                },
+                self.snapshot.max_subagents,
+                self.snapshot.launch_concurrency,
+                self.snapshot.max_admitted,
+                self.snapshot.subagent_spawn_depth,
+                self.snapshot.fleet_spawn_depth,
+                codewhale_config::MAX_SPAWN_DEPTH_CEILING,
+            ),
+        );
+        section(
+            &mut lines,
+            "Review policy",
+            format!(
+                "Budget {token_budget} · {}s api, {}s heartbeat. Fleet -> exec runs the workers; /fleet status (or /subagents) inspects the ledger.",
+                self.snapshot.api_timeout_secs, self.snapshot.heartbeat_timeout_secs
+            ),
+        );
+        section(
+            &mut lines,
+            "Profile",
+            format!(
+                "{PROFILE_DIR}/{file_stem}.toml  ·  {profile_value} present. Start inserts a safe authoring prompt into the composer — nothing is written to disk.",
+            ),
+        );
+
+        // `scroll` offsets by *visual* (post-wrap) rows, so the bound must count
+        // wrapped rows — not logical lines — or the bottom sections become
+        // unreachable. Estimate each line's wrapped height from its display
+        // width; an over-estimate is harmless (scroll clamps at the real end).
+        let wrap_width = usize::from(area.width).max(1);
+        let visual_rows: usize = lines
+            .iter()
+            .map(|line| line.width().div_ceil(wrap_width).max(1))
+            .sum();
+        let max_scroll = visual_rows.saturating_sub(usize::from(area.height).max(1));
+        let scroll = self.review_scroll.min(max_scroll);
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: true })
+            .scroll((scroll as u16, 0))
+            .render(area, buf);
+    }
 }
 
-fn render_lane(
-    lane: &FleetSetupLane,
+/// Render a wizard choice step: a list of selectable identifiers on the left and
+/// a wrapped detail pane (summary + description + context) on the right. Stacks
+/// vertically when the body is too narrow for two columns so nothing truncates.
+fn render_choice_step(
     area: Rect,
     buf: &mut Buffer,
-    focused: bool,
+    choices: &[Choice],
     selected: usize,
-    scroll: usize,
+    context: &[String],
 ) {
-    let border = if focused {
-        palette::WHALE_ACCENT_PRIMARY
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let (list_area, detail_area) = if area.width >= 56 {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(22), Constraint::Min(20)])
+            .split(area);
+        (cols[0], cols[1])
     } else {
-        palette::BORDER_COLOR
+        let list_height = (choices.len() as u16 + 1).min(area.height.saturating_sub(1).max(1));
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(list_height), Constraint::Min(1)])
+            .split(area);
+        (rows[0], rows[1])
     };
-    let block = Block::default()
-        .title(Line::from(Span::styled(
-            format!(" {} ", lane.title),
+
+    // List: labels are identifiers, so a `>`-marked single line each is safe.
+    let list_width = usize::from(list_area.width);
+    let mut list_lines: Vec<Line> = Vec::with_capacity(choices.len());
+    for (idx, choice) in choices.iter().enumerate() {
+        let is_selected = idx == selected;
+        let pointer = if is_selected { "> " } else { "  " };
+        let style = if is_selected {
             Style::default()
-                .fg(if focused {
-                    palette::WHALE_ACCENT_PRIMARY
-                } else {
-                    palette::TEXT_MUTED
-                })
-                .add_modifier(Modifier::BOLD),
-        )))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(border))
-        .style(Style::default().bg(palette::DEEPSEEK_INK))
-        .padding(Padding::horizontal(1));
-    let inner = block.inner(area);
-    block.render(area, buf);
-
-    let width = inner.width.saturating_sub(1) as usize;
-    let visible_rows = inner.height.saturating_sub(2) as usize;
-    let max_scroll = lane.rows.len().saturating_sub(visible_rows);
-    let scroll = scroll.min(max_scroll);
-
-    let mut lines = Vec::with_capacity(visible_rows + 2);
-    lines.push(Line::from(Span::styled(
-        truncate_view_text(lane.subtitle, width),
-        Style::default().fg(palette::TEXT_MUTED),
-    )));
-
-    for (row_idx, row) in lane.rows.iter().enumerate().skip(scroll).take(visible_rows) {
-        let is_selected = focused && row_idx == selected;
-        let row_style = row.tone.style(is_selected);
-        let muted_style = if is_selected {
-            row_style
+                .fg(palette::SELECTION_TEXT)
+                .bg(palette::SELECTION_BG)
+                .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(palette::TEXT_MUTED)
+            Style::default().fg(palette::TEXT_PRIMARY)
         };
-        let pointer = if is_selected { ">" } else { " " };
-        let summary = format!("{pointer} {}: {}", row.label, row.value);
-        lines.push(Line::from(Span::styled(
-            truncate_view_text(&summary, width),
-            row_style,
+        list_lines.push(Line::from(Span::styled(
+            truncate_view_text(&format!("{pointer}{}", choice.label), list_width),
+            style,
         )));
-        if inner.height >= 9 {
-            lines.push(Line::from(Span::styled(
-                truncate_view_text(&format!("  {}", row.detail), width),
-                muted_style,
+    }
+    Paragraph::new(list_lines).render(list_area, buf);
+
+    // Detail: summary + wrapped description + wrapped context, all word-wrapped.
+    let choice = &choices[selected.min(choices.len().saturating_sub(1))];
+    let mut detail_lines: Vec<Line> = vec![
+        Line::from(Span::styled(
+            choice.summary,
+            Style::default().fg(palette::WHALE_ACCENT_PRIMARY).bold(),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            choice.description,
+            Style::default().fg(palette::TEXT_PRIMARY),
+        )),
+    ];
+    if !context.is_empty() {
+        detail_lines.push(Line::from(""));
+        for entry in context {
+            detail_lines.push(Line::from(Span::styled(
+                entry.clone(),
+                Style::default().fg(palette::TEXT_MUTED),
             )));
         }
     }
-
-    Paragraph::new(lines).render(inner, buf);
+    Paragraph::new(detail_lines)
+        .wrap(Wrap { trim: true })
+        .render(detail_area, buf);
 }
 
 fn profile_file_status(workspace: &Path) -> (String, String) {
@@ -658,14 +677,13 @@ fn profile_file_status(workspace: &Path) -> (String, String) {
     }
 }
 
-/// Map a Model-lane row label to a profile-schema `model_class_hint` value.
-/// Route-context rows (`current route`, `fixed model`) and anything unknown
-/// resolve to `inherit` so the generated profile reuses the active route.
+/// Map a Model-step row label to a profile-schema `model_class_hint` value.
+/// Unknown/route-context labels resolve to `inherit`.
 fn model_class_hint(label: &str) -> &'static str {
     match label {
         "fast" => "fast",
         "balanced" => "balanced",
-        // "strong" = security/release/architecture work → the strongest schema class.
+        // "strong" = security/release/architecture → the strongest schema class.
         "strong" => "deep-reasoning",
         "deep-reasoning" => "deep-reasoning",
         "tool-heavy" => "tool-heavy",
@@ -727,7 +745,11 @@ fn profile_authoring_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::views::ViewStack;
     use crossterm::event::KeyModifiers;
+    use unicode_width::UnicodeWidthStr;
+
+    const BLOCKER_SIZES: [(u16, u16); 4] = [(80, 24), (100, 30), (120, 32), (160, 40)];
 
     fn snapshot() -> FleetSetupSnapshot {
         FleetSetupSnapshot {
@@ -752,42 +774,60 @@ mod tests {
     }
 
     #[test]
-    fn arrow_keys_move_across_lanes_and_rows() {
+    fn arrows_move_within_step_and_enter_advances() {
         let mut view = FleetSetupView::from_snapshot(snapshot());
+        assert_eq!(view.step, Step::Role);
 
-        view.handle_key(key(KeyCode::Right));
         view.handle_key(key(KeyCode::Down));
+        assert_eq!(view.role_idx, 1);
 
-        assert_eq!(view.selected_lane, 1);
-        assert_eq!(view.selected_row(), 1);
+        view.handle_key(key(KeyCode::Enter));
+        assert_eq!(view.step, Step::Model);
 
+        view.handle_key(key(KeyCode::Down));
+        assert_eq!(view.model_idx, 1);
+
+        view.handle_key(key(KeyCode::Enter));
+        assert_eq!(view.step, Step::Review);
+
+        // Left steps back through the wizard.
         view.handle_key(key(KeyCode::Left));
-
-        assert_eq!(view.selected_lane, 0);
-        assert_eq!(view.selected_row(), 0);
+        assert_eq!(view.step, Step::Model);
+        view.handle_key(key(KeyCode::Left));
+        assert_eq!(view.step, Step::Role);
     }
 
     #[test]
-    fn enter_inserts_profile_authoring_prompt() {
+    fn esc_cancels_from_any_step() {
         let mut view = FleetSetupView::from_snapshot(snapshot());
+        view.handle_key(key(KeyCode::Enter)); // -> Model
+        let action = view.handle_key(key(KeyCode::Esc));
+        assert!(matches!(action, ViewAction::Close));
+    }
 
-        let action = view.handle_key(key(KeyCode::Enter));
+    #[test]
+    fn start_on_review_inserts_profile_prompt_for_selection() {
+        let mut view = FleetSetupView::from_snapshot(snapshot());
+        // Role: manager(0) main(1) scout(2) builder(3) -> builder.
+        view.handle_key(key(KeyCode::Down));
+        view.handle_key(key(KeyCode::Down));
+        view.handle_key(key(KeyCode::Down));
+        view.handle_key(key(KeyCode::Enter)); // -> Model
+        // Model: inherit(0) fast(1) -> fast.
+        view.handle_key(key(KeyCode::Down));
+        view.handle_key(key(KeyCode::Enter)); // -> Review
 
+        let action = view.handle_key(key(KeyCode::Enter)); // Start
         match action {
             ViewAction::EmitAndClose(ViewEvent::CommandPaletteSelected {
                 action: CommandPaletteAction::InsertText { text },
             }) => {
-                // Default selection is the first Role row ("manager").
-                assert!(text.contains("Target path: .codewhale/agents/manager.toml"));
-                assert!(text.contains("role_hint (set to \"manager\")"));
+                assert!(text.contains("Target path: .codewhale/agents/builder.toml"));
+                assert!(text.contains("role_hint (set to \"builder\")"));
+                assert!(text.contains("model_class_hint (set to \"fast\""));
                 assert!(text.contains("provider = DeepSeek"));
-                assert!(text.contains("model (optional explicit model id"));
                 assert!(text.contains("Do not include provider, base_url"));
                 assert!(text.contains("Fleet is the durable sub-agent config surface"));
-                assert!(text.contains("workers are summoned as focused Fleet members"));
-                assert!(text.contains("default model behavior is same-route inheritance"));
-                assert!(text.contains("model tiers are recommendations"));
-                assert!(text.contains("Fleet owns the worker config"));
                 assert!(text.contains("topology belongs to the orchestrator"));
             }
             other => panic!("expected profile prompt insertion, got {other:?}"),
@@ -795,84 +835,114 @@ mod tests {
     }
 
     #[test]
-    fn selected_role_and_model_class_drive_generated_profile() {
-        let mut view = FleetSetupView::from_snapshot(snapshot());
-
-        // Role lane: manager(0) main(1) scout(2) builder(3) ... → move to builder.
-        view.handle_key(key(KeyCode::Down));
-        view.handle_key(key(KeyCode::Down));
-        view.handle_key(key(KeyCode::Down));
-        // Model lane: current route(0) inherit(1) fast(2) ... → move right then to fast.
-        view.handle_key(key(KeyCode::Right));
-        view.handle_key(key(KeyCode::Down));
-        view.handle_key(key(KeyCode::Down));
-
+    fn default_selection_targets_manager_inherit() {
+        let view = FleetSetupView::from_snapshot(snapshot());
         let prompt = view.profile_prompt();
-        assert!(
-            prompt.contains("Target path: .codewhale/agents/builder.toml"),
-            "selection should drive the profile file name; got: {prompt}"
-        );
-        assert!(
-            prompt.contains("role_hint (set to \"builder\")"),
-            "selection should drive role_hint; got: {prompt}"
-        );
-        assert!(
-            prompt.contains("model_class_hint (set to \"fast\""),
-            "selection should drive model_class_hint; got: {prompt}"
-        );
-        assert!(prompt.contains("Selected planner role: builder. Selected model class: fast."));
+        assert!(prompt.contains("Target path: .codewhale/agents/manager.toml"));
+        assert!(prompt.contains("model_class_hint (set to \"inherit\""));
+        assert!(prompt.contains("Current route context only"));
+        assert!(prompt.contains("permission-narrowing"));
+    }
+
+    fn render_through_stack(view_at: impl Fn() -> FleetSetupView, w: u16, h: u16) -> Vec<String> {
+        let area = Rect::new(0, 0, w, h);
+        let mut buf = Buffer::empty(area);
+        for y in 0..h {
+            for x in 0..w {
+                buf[(x, y)].set_symbol("X");
+            }
+        }
+        let mut stack = ViewStack::new();
+        stack.push(view_at());
+        stack.render(area, &mut buf);
+        (0..h)
+            .map(|y| {
+                (0..w)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect()
     }
 
     #[test]
-    fn profile_prompt_uses_current_route_only_as_context() {
-        let view = FleetSetupView::from_snapshot(snapshot());
+    fn fleet_setup_is_usable_and_opaque_at_blocker_sizes() {
+        // Exercise each step so all three screens are validated at every size.
+        type Builder = (&'static str, fn() -> FleetSetupView);
+        let builders: [Builder; 3] = [
+            ("role", || FleetSetupView::from_snapshot(snapshot())),
+            ("model", || {
+                let mut v = FleetSetupView::from_snapshot(snapshot());
+                v.step = Step::Model;
+                v
+            }),
+            ("review", || {
+                let mut v = FleetSetupView::from_snapshot(snapshot());
+                v.step = Step::Review;
+                v
+            }),
+        ];
 
-        assert!(view.profile_prompt().contains("Current route context only"));
-        assert!(view.profile_prompt().contains("permission-narrowing"));
-        assert!(view.profile_prompt().contains("same-route inheritance"));
-        assert!(
-            view.profile_prompt()
-                .contains("durable sub-agent config surface")
-        );
-        assert!(
-            view.profile_prompt()
-                .contains("topology belongs to the orchestrator")
-        );
-        assert!(!view.profile_prompt().contains("builder + reviewer"));
+        for (label, make) in builders {
+            for (w, h) in BLOCKER_SIZES {
+                let rows = render_through_stack(make, w, h);
+                let text = rows.join("\n");
+
+                // No bleed-through anywhere in the composited frame.
+                assert!(
+                    !text.contains('X'),
+                    "{label} {w}x{h}: background bleed-through"
+                );
+                // Some action label is always visible.
+                assert!(text.contains("cancel"), "{label} {w}x{h}: missing footer");
+                // The first impression communicates Fleet = agent team.
+                assert!(
+                    text.contains("agent team"),
+                    "{label} {w}x{h}: missing framing"
+                );
+                // No row overflows the frame width.
+                for (y, row) in rows.iter().enumerate() {
+                    assert!(
+                        UnicodeWidthStr::width(row.trim_end()) <= w as usize,
+                        "{label} {w}x{h}: row {y} overflows: {row:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
-    fn render_mentions_fleet_to_agent_bridge_and_recursion() {
-        let view = FleetSetupView::from_snapshot(snapshot());
-        let mut buf = Buffer::empty(Rect::new(0, 0, 120, 32));
+    fn review_lists_model_permissions_tools_and_scope() {
+        // Top of the review: the leading sections are visible without scrolling.
+        let top = render_through_stack(
+            || {
+                let mut v = FleetSetupView::from_snapshot(snapshot());
+                v.step = Step::Review;
+                v
+            },
+            120,
+            40,
+        )
+        .join("\n");
+        for section in ["Role", "Model", "Permissions", "Tools"] {
+            assert!(top.contains(section), "review missing section: {section}");
+        }
 
-        assert!(
-            view.lanes
-                .iter()
-                .flat_map(|lane| lane.rows.iter())
-                .any(|row| row.value == "Fleet -> exec")
-        );
-        assert!(
-            view.lanes
-                .iter()
-                .flat_map(|lane| lane.rows.iter())
-                .any(|row| row.label == "slot grid" && row.value == "1-5 slots")
-        );
-        assert!(
-            view.lanes
-                .iter()
-                .flat_map(|lane| lane.rows.iter())
-                .any(|row| row.label == "limits" && row.value == "100 total / depth 5")
-        );
-        view.render(Rect::new(0, 0, 120, 32), &mut buf);
-        let rendered = buf
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-
-        assert!(rendered.contains("Fleet"));
-        assert!(rendered.contains("recursion"));
-        assert!(rendered.contains("WhaleFlow"));
+        // The review is intentionally scrollable; scrolling to the bottom reveals
+        // the workspace/org scope, review policy, and the honest "no disk write"
+        // note on the Start action.
+        let bottom = render_through_stack(
+            || {
+                let mut v = FleetSetupView::from_snapshot(snapshot());
+                v.step = Step::Review;
+                v.review_scroll = 999; // clamps to max in render
+                v
+            },
+            120,
+            40,
+        )
+        .join("\n");
+        for needle in ["Workspace", "Review policy", "nothing is written to disk"] {
+            assert!(bottom.contains(needle), "scrolled review missing: {needle}");
+        }
     }
 }

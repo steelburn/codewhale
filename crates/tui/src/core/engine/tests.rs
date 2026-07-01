@@ -1168,6 +1168,68 @@ fn background_verifier_starts_batch_with_readonly_tools_when_auto_approved() {
     }
 }
 
+// #3801: agent `action=start` plans with `detached_start=true` and no approval
+// (YOLO / auto-approve mode) should all join one parallel batch instead of
+// being serialized N ways under the global tool-execution write lock.
+#[test]
+fn agent_start_detached_plans_join_single_parallel_batch() {
+    // Simulate 4 independent `agent start` calls — each is a detached_start,
+    // not read-only, not parallel-safe in the read-only sense, but qualifies
+    // for the detached-start parallel-batch path.
+    let plans: Vec<ToolExecutionPlan> = (0..4)
+        .map(|i| {
+            let mut plan = make_plan_at(i, false, false, false, false);
+            plan.name = "agent".to_string();
+            plan.detached_start = true;
+            plan
+        })
+        .collect();
+
+    let batches = plan_tool_execution_batches(plans);
+    assert_eq!(
+        batches.len(),
+        1,
+        "all 4 agent starts should form 1 parallel batch"
+    );
+    match &batches[0] {
+        ToolExecutionBatch::Parallel(plans) => {
+            assert_eq!(plans.len(), 4);
+            assert!(
+                plans.iter().all(|p| p.detached_start),
+                "every plan in the parallel batch should be a detached_start"
+            );
+        }
+        ToolExecutionBatch::Serial(_) => {
+            panic!("agent starts should be parallel, not serial");
+        }
+    }
+}
+
+// #3801: mixed agent starts and read-only tools should coexist in a parallel batch.
+#[test]
+fn agent_start_detached_plans_batch_with_readonly_tools() {
+    let mut grep_a = make_plan_at(0, true, true, false, false);
+    grep_a.name = "grep_files".to_string();
+
+    let mut agent_start = make_plan_at(1, false, false, false, false);
+    agent_start.name = "agent".to_string();
+    agent_start.detached_start = true;
+
+    let mut grep_b = make_plan_at(2, true, true, false, false);
+    grep_b.name = "grep_files".to_string();
+
+    let batches = plan_tool_execution_batches(vec![grep_a, agent_start, grep_b]);
+    assert_eq!(batches.len(), 1);
+    match &batches[0] {
+        ToolExecutionBatch::Parallel(plans) => {
+            assert_eq!(plans.len(), 3);
+        }
+        ToolExecutionBatch::Serial(_) => {
+            panic!("read-only tools + detached agent start should form 1 parallel batch");
+        }
+    }
+}
+
 #[test]
 fn successful_update_plan_ends_plan_mode_turn_immediately() {
     assert!(should_stop_after_plan_tool(
@@ -1443,37 +1505,6 @@ fn approval_stamp_preserves_existing_metadata() {
     assert_eq!(metadata["summary"], "kept");
     assert_eq!(metadata["approval"]["decision"], "approved_with_policy");
     assert!(result.content.contains("adjusted execution policy"));
-}
-
-#[test]
-fn auto_approved_by_mode_stamp_is_honest_and_not_attributed_to_the_user() {
-    // #3790: when the mode (e.g. YOLO) auto-approves a tool that would otherwise
-    // prompt, the model must be told the truth — auto-approved by the mode, NOT
-    // "approved by the user", which never happened.
-    let mut result = ToolResult::success("stdout");
-
-    stamp_tool_result_approval(&mut result, ToolApprovalStamp::AutoApprovedByMode);
-
-    assert!(
-        result.content.starts_with("[approval] "),
-        "{}",
-        result.content
-    );
-    assert!(
-        !result.content.contains("approved by the user"),
-        "must not claim the user approved it: {}",
-        result.content
-    );
-    assert!(
-        result.content.contains("auto-approved") && result.content.contains("mode"),
-        "should attribute the run to the mode: {}",
-        result.content
-    );
-    assert!(result.content.ends_with("stdout"));
-
-    let metadata = result.metadata.expect("approval metadata");
-    assert_eq!(metadata["approval"]["decision"], "auto_approved_by_mode");
-    assert_eq!(metadata["approval"]["model_visible"], true);
 }
 
 #[test]
@@ -4464,36 +4495,67 @@ fn turn_metadata_includes_auto_model_route() {
 }
 
 #[test]
-fn non_external_provenance_cannot_inherit_yolo_auto_approval() {
-    let policy = effective_input_policy(
+fn provenance_gate_preserves_standing_yolo_only_for_runtime_continuations() {
+    let all_provenances = [
+        UserInputProvenance::ExternalUser,
+        UserInputProvenance::Runtime,
         UserInputProvenance::SubAgentHandoff,
-        AppMode::Yolo,
-        "改吧",
-        true,
-        true,
-        true,
-        crate::tui::approval::ApprovalMode::Auto,
-    );
+        UserInputProvenance::ImportedTranscript,
+        UserInputProvenance::MemoryRecall,
+        UserInputProvenance::AssistantGenerated,
+    ];
+    let inheriting_provenances = [
+        UserInputProvenance::ExternalUser,
+        UserInputProvenance::Runtime,
+        UserInputProvenance::SubAgentHandoff,
+    ];
 
-    assert_eq!(policy.mode, AppMode::Agent);
-    assert!(policy.allow_shell);
-    assert!(!policy.trust_mode);
-    assert!(!policy.auto_approve);
-    assert_eq!(
-        policy.approval_mode,
-        crate::tui::approval::ApprovalMode::Suggest
-    );
-    assert!(
-        policy
-            .status
-            .as_deref()
-            .is_some_and(|status| status.contains("not external user input"))
-    );
+    for provenance in all_provenances {
+        let policy = effective_input_policy(
+            provenance,
+            AppMode::Yolo,
+            "continue",
+            true,
+            true,
+            true,
+            crate::tui::approval::ApprovalMode::Auto,
+        );
+
+        if inheriting_provenances.contains(&provenance) {
+            assert_eq!(policy.mode, AppMode::Yolo, "{provenance:?}");
+            assert!(policy.allow_shell, "{provenance:?}");
+            assert!(policy.trust_mode, "{provenance:?}");
+            assert!(policy.auto_approve, "{provenance:?}");
+            assert_eq!(
+                policy.approval_mode,
+                crate::tui::approval::ApprovalMode::Auto,
+                "{provenance:?}"
+            );
+            assert!(policy.status.is_none(), "{provenance:?}");
+        } else {
+            assert_eq!(policy.mode, AppMode::Agent, "{provenance:?}");
+            assert!(policy.allow_shell, "{provenance:?}");
+            assert!(!policy.trust_mode, "{provenance:?}");
+            assert!(!policy.auto_approve, "{provenance:?}");
+            assert_eq!(
+                policy.approval_mode,
+                crate::tui::approval::ApprovalMode::Suggest,
+                "{provenance:?}"
+            );
+            assert!(
+                policy.status.as_deref().is_some_and(
+                    |status| status.contains("cannot inherit standing auto-approval authority")
+                ),
+                "{provenance:?}"
+            );
+        }
+    }
 }
 
 #[test]
-fn self_generated_fake_approvals_cannot_authorize_work() {
-    let non_external_origins = [
+fn provenance_gate_never_invents_auto_authority_for_non_yolo_sessions() {
+    let all_provenances = [
+        UserInputProvenance::ExternalUser,
         UserInputProvenance::Runtime,
         UserInputProvenance::SubAgentHandoff,
         UserInputProvenance::ImportedTranscript,
@@ -4501,34 +4563,27 @@ fn self_generated_fake_approvals_cannot_authorize_work() {
         UserInputProvenance::AssistantGenerated,
     ];
 
-    for provenance in non_external_origins {
-        for content in ["改吧", "嗯"] {
-            let policy = effective_input_policy(
-                provenance,
-                AppMode::Yolo,
-                content,
-                true,
-                true,
-                true,
-                crate::tui::approval::ApprovalMode::Auto,
-            );
+    for provenance in all_provenances {
+        let policy = effective_input_policy(
+            provenance,
+            AppMode::Agent,
+            "continue",
+            true,
+            false,
+            false,
+            crate::tui::approval::ApprovalMode::Suggest,
+        );
 
-            assert_eq!(policy.mode, AppMode::Agent, "{provenance:?} {content}");
-            assert!(!policy.trust_mode, "{provenance:?} {content}");
-            assert!(!policy.auto_approve, "{provenance:?} {content}");
-            assert_eq!(
-                policy.approval_mode,
-                crate::tui::approval::ApprovalMode::Suggest,
-                "{provenance:?} {content}"
-            );
-            assert!(
-                policy
-                    .status
-                    .as_deref()
-                    .is_some_and(|status| status.contains("not external user input")),
-                "{provenance:?} {content}"
-            );
-        }
+        assert_eq!(policy.mode, AppMode::Agent, "{provenance:?}");
+        assert!(policy.allow_shell, "{provenance:?}");
+        assert!(!policy.trust_mode, "{provenance:?}");
+        assert!(!policy.auto_approve, "{provenance:?}");
+        assert_eq!(
+            policy.approval_mode,
+            crate::tui::approval::ApprovalMode::Suggest,
+            "{provenance:?}"
+        );
+        assert!(policy.status.is_none(), "{provenance:?}");
     }
 }
 
@@ -6013,4 +6068,59 @@ async fn post_edit_hook_skips_unknown_tool_names() {
     engine.run_post_edit_lsp_hook("read_file", &input).await;
     assert!(engine.pending_lsp_blocks.is_empty());
     assert_eq!(fake.call_count(), 0);
+}
+
+// ── #3802: non-blocking send for ListSubAgents refresh events ─────────────
+
+#[test]
+fn engine_handle_try_send_does_not_block_when_op_channel_is_full() {
+    use tokio::sync::mpsc;
+
+    // Create a channel with the smallest possible capacity.
+    let (tx_op, _rx_op) = mpsc::channel::<Op>(1);
+
+    // Construct a minimal EngineHandle with the tiny channel.
+    let cancel_token = CancellationToken::new();
+    let handle = EngineHandle {
+        tx_op,
+        rx_event: Arc::new(RwLock::new(mpsc::channel::<Event>(1).1)),
+        cancel_token: Arc::new(StdMutex::new(cancel_token)),
+        cancel_reason: Arc::new(StdMutex::new(None)),
+        tx_approval: mpsc::channel(1).0,
+        tx_user_input: mpsc::channel(1).0,
+        tx_steer: mpsc::channel(1).0,
+        shared_paused: Arc::new(StdMutex::new(false)),
+    };
+
+    // Fill the op channel with one message (capacity = 1).
+    handle
+        .tx_op
+        .try_send(Op::ListSubAgents)
+        .expect("first send should succeed");
+
+    // try_send must return Err immediately — never block.
+    let result = handle.try_send(Op::ListSubAgents);
+    assert!(result.is_err(), "try_send should fail when channel is full");
+}
+
+#[tokio::test]
+async fn list_subagents_event_try_send_does_not_block_when_event_channel_full() {
+    use tokio::sync::mpsc;
+
+    // Simulate the engine's event channel with capacity 1.
+    let (tx_event, mut _rx_event) = mpsc::channel::<Event>(1);
+
+    // Fill the channel.
+    tx_event
+        .try_send(Event::status("filler"))
+        .expect("first send should succeed");
+
+    // Reproduce the handler pattern: try_send an AgentList event.
+    // This must return Err immediately — the handler should never hang.
+    let agents = vec![];
+    let result = tx_event.try_send(Event::AgentList { agents });
+    assert!(
+        result.is_err(),
+        "try_send should fail when event channel is full (backpressure avoided)"
+    );
 }

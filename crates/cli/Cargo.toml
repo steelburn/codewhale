@@ -19,14 +19,14 @@ path = "src/bin/codew_legacy_shim.rs"
 anyhow.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
-codewhale-agent = { path = "../agent", version = "0.8.65" }
-codewhale-app-server = { path = "../app-server", version = "0.8.65" }
-codewhale-config = { path = "../config", version = "0.8.65" }
-codewhale-execpolicy = { path = "../execpolicy", version = "0.8.65" }
-codewhale-mcp = { path = "../mcp", version = "0.8.65" }
-codewhale-release = { path = "../release", version = "0.8.65" }
-codewhale-secrets = { path = "../secrets", version = "0.8.65" }
-codewhale-state = { path = "../state", version = "0.8.65" }
+codewhale-agent = { path = "../agent", version = "0.8.66" }
+codewhale-app-server = { path = "../app-server", version = "0.8.66" }
+codewhale-config = { path = "../config", version = "0.8.66" }
+codewhale-execpolicy = { path = "../execpolicy", version = "0.8.66" }
+codewhale-mcp = { path = "../mcp", version = "0.8.66" }
+codewhale-release = { path = "../release", version = "0.8.66" }
+codewhale-secrets = { path = "../secrets", version = "0.8.66" }
+codewhale-state = { path = "../state", version = "0.8.66" }
 chrono.workspace = true
 dirs.workspace = true
 serde.workspace = true

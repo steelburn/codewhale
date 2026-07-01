@@ -1145,17 +1145,12 @@ impl Engine {
                     .await;
 
                 match self.await_tool_approval(&tool_id).await {
-                    Ok(approval @ (ApprovalResult::Approved | ApprovalResult::ApprovedByMode)) => {
-                        // #3790: a `!`-command can be auto-approved by the active
-                        // mode (e.g. YOLO) rather than by an individual click;
-                        // stamp it honestly so the model is not told the user
-                        // approved a call they were never prompted for.
-                        let by_mode = matches!(approval, ApprovalResult::ApprovedByMode);
+                    Ok(ApprovalResult::Approved) => {
                         emit_tool_audit(json!({
                             "event": "tool.approval_decision",
                             "tool_id": tool_id.clone(),
                             "tool_name": tool_name.clone(),
-                            "decision": if by_mode { "auto_approved_by_mode" } else { "approved" },
+                            "decision": "approved",
                             "source": "composer_bang",
                         }));
                         let mut result = Self::execute_tool_with_lock(
@@ -1174,11 +1169,7 @@ impl Engine {
                         if let Ok(tool_result) = result.as_mut() {
                             stamp_tool_result_approval(
                                 tool_result,
-                                if by_mode {
-                                    ToolApprovalStamp::AutoApprovedByMode
-                                } else {
-                                    ToolApprovalStamp::ApprovedByUser
-                                },
+                                ToolApprovalStamp::ApprovedByUser,
                             );
                         }
                         result
@@ -1523,12 +1514,33 @@ impl Engine {
                         }
                     }
                     Op::ListSubAgents => {
-                        let agents = {
+                        // #3803: the sidebar refresh is a read-only snapshot.
+                        // Render from a read lock; only take the write lock to
+                        // run cleanup on a bounded cadence, so a UI refresh storm
+                        // during a sub-agent fanout no longer contends for the
+                        // write lock (against completions/persistence) on every
+                        // request. Cleanup still auto-cancels stale agents.
+                        let due = {
+                            let manager = self.subagent_manager.read().await;
+                            manager.cleanup_due(
+                                crate::tools::subagent::SUBAGENT_LIST_CLEANUP_MIN_INTERVAL,
+                            )
+                        };
+                        let agents = if due {
                             let mut manager = self.subagent_manager.write().await;
                             manager.cleanup(Duration::from_secs(60 * 60));
                             manager.list()
+                        } else {
+                            self.subagent_manager.read().await.list()
                         };
-                        let _ = self.tx_event.send(Event::AgentList { agents }).await;
+                        // #3802: use non-blocking send — this is a refresh event
+                        // that can safely be dropped when the channel is full.
+                        // The next drain cycle will re-request the list.
+                        if let Err(_e) = self.tx_event.try_send(Event::AgentList { agents }) {
+                            tracing::debug!(
+                                "Event channel full; dropping ListSubAgents refresh (will retry next drain)"
+                            );
+                        }
                     }
                     Op::ChangeMode {
                         mode,
@@ -3483,7 +3495,7 @@ fn effective_input_policy(
     let mut dynamic_active_tools = Vec::new();
     let mut status = None;
 
-    if !provenance.can_authorize_work() {
+    if !provenance_can_inherit_standing_auto_authority(provenance) {
         let had_auto_authority = matches!(mode, AppMode::Yolo)
             || trust_mode
             || auto_approve
@@ -3501,7 +3513,7 @@ fn effective_input_policy(
         }
         if had_auto_authority {
             status = Some(format!(
-                "Input provenance '{}' is not external user input; continuing with approvals required.",
+                "Input provenance '{}' cannot inherit standing auto-approval authority; continuing with approvals required.",
                 provenance.as_str()
             ));
         }
@@ -3524,6 +3536,15 @@ fn effective_input_policy(
         dynamic_active_tools,
         status,
     }
+}
+
+fn provenance_can_inherit_standing_auto_authority(provenance: UserInputProvenance) -> bool {
+    matches!(
+        provenance,
+        UserInputProvenance::ExternalUser
+            | UserInputProvenance::Runtime
+            | UserInputProvenance::SubAgentHandoff
+    )
 }
 
 fn is_review_only_user_intent(content: &str) -> bool {
@@ -3810,10 +3831,6 @@ impl MockEngineHandle {
     pub(crate) async fn recv_approval_event(&mut self) -> Option<MockApprovalEvent> {
         match self.rx_approval.recv().await? {
             ApprovalDecision::Approved { id } => Some(MockApprovalEvent::Approved { id }),
-            // #3790: a mode auto-approval surfaces as Approved to the mock
-            // recorder; tests assert the honest "auto-approved by mode" note on
-            // the tool result itself rather than on this channel event.
-            ApprovalDecision::ApprovedByMode { id } => Some(MockApprovalEvent::Approved { id }),
             ApprovalDecision::Denied { id } => Some(MockApprovalEvent::Denied { id }),
             ApprovalDecision::RetryWithPolicy { id, policy } => {
                 Some(MockApprovalEvent::RetryWithPolicy { id, policy })

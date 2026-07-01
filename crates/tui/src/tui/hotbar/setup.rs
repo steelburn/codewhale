@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     buffer::Buffer,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Widget},
@@ -12,7 +12,10 @@ use ratatui::{
 use crate::config::Config;
 use crate::palette;
 use crate::tui::app::App;
-use crate::tui::views::{ModalKind, ModalView, ViewAction, ViewEvent};
+use crate::tui::views::{
+    ActionHint, ModalKind, ModalView, ViewAction, ViewEvent, centered_modal_area,
+    render_modal_footer,
+};
 
 use super::actions::{
     HotbarActionCategory, HotbarActionMetadata, HotbarArgsBehavior, HotbarRecommendationOptions,
@@ -445,11 +448,6 @@ impl HotbarSetupView {
             .join("  ");
         lines.push(Line::from(slots));
         lines.push(Line::from(self.status_text()));
-        if self.help_visible {
-            lines.push(Line::from(
-                "Tab/Shift+Tab source  Up/Down action  1-8 slot  Enter assign  Space toggle  Delete clear  s save  d disable  Esc cancel",
-            ));
-        }
         lines
     }
 }
@@ -531,29 +529,34 @@ impl ModalView for HotbarSetupView {
     }
 
     fn render(&self, area: Rect, buf: &mut Buffer) {
-        let popup_width = 118.min(area.width.saturating_sub(4)).max(72);
-        let popup_height = 28.min(area.height.saturating_sub(4)).max(12);
-        let popup_area = Rect {
-            x: area.x + (area.width.saturating_sub(popup_width)) / 2,
-            y: area.y + (area.height.saturating_sub(popup_height)) / 2,
-            width: popup_width,
-            height: popup_height,
-        };
+        let popup_area = centered_modal_area(area, 118, 28, 72, 12);
         Clear.render(popup_area, buf);
         let block = Block::default()
             .title(" Hotbar setup ")
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(palette::BORDER_COLOR));
+            .border_style(Style::default().fg(palette::BORDER_COLOR))
+            .style(Style::default().bg(palette::DEEPSEEK_INK));
         let inner = block.inner(popup_area);
         block.render(popup_area, buf);
 
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(1)])
-            .split(inner);
+        let content = render_modal_footer(
+            inner,
+            buf,
+            &[
+                ActionHint::new("Tab/Shift+Tab", "source"),
+                ActionHint::new("Up/Down", "action"),
+                ActionHint::new("1-8", "slot"),
+                ActionHint::new("Enter", "assign"),
+                ActionHint::new("Space", "toggle"),
+                ActionHint::new("Delete", "clear"),
+                ActionHint::new("s", "save"),
+                ActionHint::new("d", "disable"),
+                ActionHint::new("Esc", "cancel"),
+            ],
+        );
         Paragraph::new(self.render_lines())
             .style(Style::default().fg(palette::TEXT_PRIMARY))
-            .render(chunks[0], buf);
+            .render(content, buf);
     }
 
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
@@ -625,7 +628,9 @@ mod tests {
         );
         assert_eq!(view.selected_source(), Some(HotbarActionCategory::App));
         assert!(view.recommended_action_ids().contains("mode.agent"));
-        assert!(view.checked_action_ids().contains("mode.plan"));
+        // #3807: a fresh config seeds no bindings, so the wizard opens with
+        // nothing checked until the user opts in.
+        assert!(view.checked_action_ids().is_empty());
     }
 
     #[test]
@@ -788,5 +793,55 @@ mod tests {
         assert_eq!(view.selected_slot(), 8);
         view.handle_key(key(KeyCode::Left));
         assert_eq!(view.selected_slot(), 7);
+    }
+
+    #[test]
+    fn hotbar_setup_is_usable_and_opaque_at_blocker_sizes() {
+        use crate::tui::views::ViewStack;
+        use unicode_width::UnicodeWidthStr;
+
+        const BLOCKER_SIZES: [(u16, u16); 4] = [(80, 24), (100, 30), (120, 32), (160, 40)];
+        let app = test_app();
+        for (w, h) in BLOCKER_SIZES {
+            let area = Rect::new(0, 0, w, h);
+            let mut buf = Buffer::empty(area);
+            for y in 0..h {
+                for x in 0..w {
+                    buf[(x, y)].set_symbol("X");
+                }
+            }
+            let mut stack = ViewStack::new();
+            stack.push(HotbarSetupView::new(&app, &Config::default()));
+            stack.render(area, &mut buf);
+
+            let rows: Vec<String> = (0..h)
+                .map(|y| (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect())
+                .collect();
+            let text = rows.join("\n");
+
+            // Footer keeps every action.
+            for label in [
+                "source", "action", "slot", "assign", "toggle", "clear", "save", "disable",
+                "cancel",
+            ] {
+                assert!(text.contains(label), "{w}x{h}: footer missing '{label}'");
+            }
+
+            // Composited frame is fully opaque.
+            assert!(!text.contains('X'), "{w}x{h}: background bleed-through");
+            assert_eq!(
+                buf[(w / 2, h / 2)].bg,
+                palette::DEEPSEEK_INK,
+                "{w}x{h}: modal interior must be opaque"
+            );
+
+            // No horizontal overflow.
+            for (y, row) in rows.iter().enumerate() {
+                assert!(
+                    UnicodeWidthStr::width(row.trim_end()) <= w as usize,
+                    "{w}x{h}: row {y} overflows width: {row:?}"
+                );
+            }
+        }
     }
 }

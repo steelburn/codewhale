@@ -1,17 +1,19 @@
 # v0.8.66 Release Ledger
 
-This ledger records the live v0.8.66 release lane as of 2026-06-27. It is a
-release-prep artifact, not a tag, GitHub Release, npm publish, or version bump.
+This ledger records the live v0.8.66 release lane as of 2026-06-30. It is a
+release-readiness artifact, not a tag, GitHub Release, npm publish, or artifact
+push.
 
 ## Current Release Candidate
 
-- Main candidate: `5e9f7662f` (`Merge pull request #3706 ...`).
-- Workspace/npm version currently remains `0.8.65`; do not bump to `0.8.66`
-  without explicit maintainer approval.
-- Latest main CI, Nightly, CodeQL, CNB sync, and auto-close workflows were green
-  at `5e9f7662f` when this ledger was written.
-- `codewhale@0.8.65` is published on npm and was used for ACP registry
-  validation.
+- Main candidate: `858337fba7dceac13bee28e1f363f3b4f94dde3d` on `main`.
+- Workspace and npm wrapper versions are bumped to `0.8.66`; `package-lock.json`
+  records `npm/codewhale` at `0.8.66`.
+- `v0.8.66` is not yet tagged locally or on GitHub, and there is no GitHub
+  Release for `v0.8.66`.
+- `codewhale@0.8.65` remains the published npm wrapper used for ACP registry
+  validation; `codewhale@0.8.66` is intentionally not published until the
+  release assets exist and pass verification.
 
 ## Landed v0.8.66 Highlights
 
@@ -77,9 +79,8 @@ Do not close these from code inspection alone:
   need current-version session data, request snapshots, or same-task benchmark
   pairs before final closure.
 
-## Release Actions Not Taken
+## Release Actions Not Taken Yet
 
-- No `0.8.66` version bump.
 - No tag.
 - No npm publish.
 - No GitHub Release.
