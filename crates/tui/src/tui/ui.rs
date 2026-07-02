@@ -10517,6 +10517,27 @@ fn find_user_cell_index_from_tail(app: &App, depth: usize) -> Option<usize> {
 /// the overlay, and surface a status hint. The cycle counter is bumped
 /// so any persistent indices clear; the engine's in-flight context is
 /// re-synced via `Op::SyncSession` so the next turn starts fresh.
+/// Index in `api_messages` to truncate to for a backtrack of `depth` visible
+/// user prompts from the tail. Counts only messages that yield a
+/// `HistoryCell::User` (a real prompt), NOT tool-result messages which are
+/// also stored with `role == "user"`. Returns `None` if fewer than `depth`
+/// user prompts exist.
+fn backtrack_api_cut_index(api_messages: &[Message], depth: usize) -> Option<usize> {
+    let mut user_seen = 0usize;
+    for (idx, msg) in api_messages.iter().enumerate().rev() {
+        let yields_user = history_cells_from_message(msg)
+            .iter()
+            .any(|cell| matches!(cell, HistoryCell::User { .. }));
+        if yields_user {
+            if user_seen == depth {
+                return Some(idx);
+            }
+            user_seen += 1;
+        }
+    }
+    None
+}
+
 fn apply_backtrack(app: &mut App, depth: usize) {
     let Some(history_idx) = find_user_cell_index_from_tail(app, depth) else {
         app.status_message = Some("Backtrack target no longer present".to_string());
@@ -10535,22 +10556,15 @@ fn apply_backtrack(app: &mut App, depth: usize) {
     // `App::truncate_history_to`.
     app.truncate_history_to(history_idx);
 
-    // Trim the API-message log at the matching user message. We
-    // re-walk `api_messages` from the tail, counting role=="user"
-    // boundaries so the depth aligns with what the model sees on the
-    // next turn.
-    let mut user_seen = 0usize;
-    let mut cut = None;
-    for (idx, msg) in app.api_messages.iter().enumerate().rev() {
-        if msg.role == "user" {
-            if user_seen == depth {
-                cut = Some(idx);
-                break;
-            }
-            user_seen += 1;
-        }
-    }
-    if let Some(idx) = cut {
+    // Trim the API-message log at the matching user PROMPT. `depth` counts
+    // visible `HistoryCell::User` cells (real prompts), but a naive
+    // `role == "user"` walk over `api_messages` over-counts: tool results are
+    // stored as `role == "user"` messages too, so in any turn with tool calls
+    // the cut would land mid-turn on a tool_result — leaving a dangling
+    // assistant tool_use with no matching result and a transcript the provider
+    // rejects. Count only messages that actually yield a User cell, the same
+    // predicate `apply_loaded_session` uses.
+    if let Some(idx) = backtrack_api_cut_index(&app.api_messages, depth) {
         app.api_messages.truncate(idx);
     }
 

@@ -11935,3 +11935,58 @@ fn terminal_input_child_pause_drains_codewhale_events_before_editor_handoff() {
     assert!(!input.paused.load(std::sync::atomic::Ordering::Acquire));
     assert!(!input.paused_ack.load(std::sync::atomic::Ordering::Acquire));
 }
+
+#[test]
+fn backtrack_cut_index_skips_tool_result_user_messages() {
+    use crate::models::{ContentBlock, Message};
+    // A turn with tools: user prompt, assistant tool_use, tool_result (role=user),
+    // assistant text; then a second user prompt.
+    let msgs = vec![
+        Message {
+            role: "user".into(),
+            content: vec![ContentBlock::Text {
+                text: "first".into(),
+                cache_control: None,
+            }],
+        },
+        Message {
+            role: "assistant".into(),
+            content: vec![ContentBlock::ToolUse {
+                id: "t1".into(),
+                name: "read_file".into(),
+                input: serde_json::json!({"path":"x"}),
+                caller: None,
+            }],
+        },
+        Message {
+            role: "user".into(),
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "t1".into(),
+                content: "data".into(),
+                is_error: None,
+                content_blocks: None,
+            }],
+        },
+        Message {
+            role: "assistant".into(),
+            content: vec![ContentBlock::Text {
+                text: "answer".into(),
+                cache_control: None,
+            }],
+        },
+        Message {
+            role: "user".into(),
+            content: vec![ContentBlock::Text {
+                text: "second".into(),
+                cache_control: None,
+            }],
+        },
+    ];
+    // depth 0 = cut at the last real user prompt ("second", idx 4).
+    assert_eq!(super::backtrack_api_cut_index(&msgs, 0), Some(4));
+    // depth 1 = cut at the first real user prompt ("first", idx 0) — NOT the
+    // tool_result at idx 2 that a naive role=="user" count would have hit.
+    assert_eq!(super::backtrack_api_cut_index(&msgs, 1), Some(0));
+    // depth beyond available prompts.
+    assert_eq!(super::backtrack_api_cut_index(&msgs, 2), None);
+}

@@ -531,11 +531,26 @@ impl SessionManager {
         &self,
         max_age: std::time::Duration,
     ) -> std::io::Result<usize> {
+        self.prune_sessions_older_than_keeping(max_age, None)
+    }
+
+    /// As [`Self::prune_sessions_older_than`], but never deletes `keep` — the
+    /// active session. A just-resumed session's `updated_at` is stale until
+    /// its first post-resume save, so an age prune could otherwise delete the
+    /// live session out from under the TUI.
+    pub fn prune_sessions_older_than_keeping(
+        &self,
+        max_age: std::time::Duration,
+        keep: Option<&str>,
+    ) -> std::io::Result<usize> {
         let cutoff = Utc::now()
             - chrono::Duration::from_std(max_age).unwrap_or(chrono::Duration::days(365 * 10));
         let sessions = self.list_sessions()?;
         let mut pruned = 0usize;
         for session in sessions {
+            if keep.is_some_and(|id| id == session.id) {
+                continue;
+            }
             if session.updated_at < cutoff {
                 if let Err(err) = self.delete_session(&session.id) {
                     tracing::warn!(
