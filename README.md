@@ -234,18 +234,35 @@ of vibes.
 The system prompt is layered, most-static first, and the order is enforced in
 code (there are tests asserting it can't drift):
 
-1. **Global constitution** — the base law, compiled into every binary. Its
-   priority article fixes the authority order for any conflict.
-2. **Your project's law** — drop a `.codewhale/constitution.json` in a repo to
+1. **Bundled global Constitution** — the base law, compiled into every binary.
+   Its priority article fixes the authority order for any conflict.
+2. **Your user-global constitution** — managed through `/constitution` and
+   `/setup`, saved as structured data under `$CODEWHALE_HOME/constitution.json`,
+   and rendered into a separate model-facing prose block. It is normal guided
+   setup output, not a raw prompt editor.
+3. **Your project's law** — drop a `.codewhale/constitution.json` in a repo to
    declare `protected_invariants`, `branch_policy`, `verification_policy`, and
-   `escalate_when`. It's loaded as its own authority block, above memory and
-   handoffs.
-3. **Your current request** — the operative instruction this turn.
-4. **Live evidence** — what the tools actually returned. Ground truth; the model
-   may be ordered past it, but it may never report a fact that isn't there.
+   `escalate_when`. It's loaded as its own repo-local authority block, above
+   project instructions, memory, and handoffs. A `protected_invariants` entry
+   that carries path globs is not just prose: it compiles into a mechanical,
+   tighten-only write hold in the tool gate (`ask` force-prompts even in YOLO,
+   `block` denies) with a receipt naming the invariant. See
+   [Configuration](docs/CONFIGURATION.md#enforced-repo-law-invariants).
+4. **Project instructions** — `AGENTS.md` and compatibility fallbacks explain
+   how agents should work in this repo.
+5. **Memory and handoffs** — useful recalled state, lower authority than
+   constitution layers and project instructions.
 
-When two instructions conflict, each yields to the one above. Because the law
-lives in the harness, not the model, swapping models keeps the structure intact.
+Your current request and live tool evidence still control the active turn: the
+model may be given many layers, but it may never report a fact that the tools did
+not return. Runtime approval, sandbox, network, and trust controls are enforced
+in code and are not changed by constitution text.
+
+There is also an expert-only full base-prompt override at
+`$CODEWHALE_HOME/prompts/constitution.md` behind an explicit opt-in flag. It is
+not the normal guided setup path. When two instructions conflict, each yields to
+the higher authority layer. Because the law lives in the harness, not the model,
+swapping models keeps the structure intact.
 
 ## Where details live
 

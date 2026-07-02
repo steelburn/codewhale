@@ -2807,6 +2807,11 @@ impl Config {
     pub fn validate(&self) -> Result<()> {
         if let Some(provider) = self.provider.as_deref()
             && ApiProvider::parse(provider).is_none()
+            && self
+                .providers
+                .as_ref()
+                .and_then(|providers| providers.custom_provider_config(provider))
+                .is_none()
         {
             anyhow::bail!(
                 "Invalid provider '{provider}': expected {}.",

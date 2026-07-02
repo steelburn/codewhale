@@ -35,10 +35,6 @@ impl Frame {
         self.parser.screen().size().1
     }
 
-    pub fn resize(&mut self, rows: u16, cols: u16) {
-        self.parser.set_size(rows, cols);
-    }
-
     /// Full visible screen as a single string with a `\n` between rows.
     /// Trailing whitespace on each row is preserved so column-position
     /// assertions stay meaningful.

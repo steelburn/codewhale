@@ -34,7 +34,11 @@ impl RegisterCommand for HotbarCmd {
             Some("help" | "?") => CommandResult::message(
                 "Hotbar gives you Alt+1 through Alt+8 shortcuts (Option key on macOS, Alt \
                  elsewhere). Use `/hotbar` to customize, `/hotbar off` to hide it \
-                 (`hotbar = []`), and `/hotbar on` to restore the default slots.",
+                 (`hotbar = []`), and `/hotbar on` to restore the default slots. \
+                 Hotbar slots dispatch only when no modal, inline picker, or \
+                 onboarding surface owns input. Bare 1-8 insert text in the \
+                 composer. Cmd-number and F-keys are not Hotbar shortcuts unless \
+                 a future release documents and implements them.",
             ),
             Some(other) => CommandResult::error(format!(
                 "Unknown /hotbar target '{other}'. Try `/hotbar`, `/hotbar off`, \
@@ -122,6 +126,8 @@ mod tests {
             message.contains("/hotbar off") && message.contains("/hotbar on"),
             "help should mention both disable and restore paths: {message:?}"
         );
+        assert!(message.contains("Bare 1-8 insert text"));
+        assert!(message.contains("Cmd-number and F-keys are not Hotbar shortcuts"));
     }
 
     #[test]

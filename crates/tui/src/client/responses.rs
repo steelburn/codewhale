@@ -135,7 +135,10 @@ impl DeepSeekClient {
             let mut current_block_index: Option<u32> = None;
             let mut saw_tool_call = false;
             let mut usage_data: Option<Usage> = None;
-            let mut buffer = String::new();
+            // Raw byte buffer: decode only COMPLETE lines so a multi-byte
+            // UTF-8 char split across two network reads is never corrupted
+            // to U+FFFD (line boundaries are ASCII). Mirrors chat.rs.
+            let mut buffer: Vec<u8> = Vec::new();
             let mut done = false;
             let mut content_block_counter: u32 = 0;
 
@@ -155,12 +158,10 @@ impl DeepSeekClient {
                     }
                 };
 
-                buffer.push_str(&String::from_utf8_lossy(&chunk));
+                buffer.extend_from_slice(&chunk);
 
                 // Process complete SSE lines.
-                while let Some(line_end) = buffer.find('\n') {
-                    let line = buffer[..line_end].trim().to_string();
-                    buffer = buffer[line_end + 1..].to_string();
+                while let Some(line) = super::take_sse_line(&mut buffer) {
 
                     if line.is_empty() || line.starts_with(':') {
                         continue;
@@ -921,6 +922,12 @@ mod tests {
         assert!(
             message.contains("blocked before it reached the model"),
             "{message}"
+        );
+        // #3884: the structured LlmError must stay downcastable through the
+        // context layers so sub-agent failure records can classify it.
+        assert!(
+            err.downcast_ref::<crate::llm_client::LlmError>().is_some(),
+            "LlmError should survive the anyhow chain"
         );
     }
 

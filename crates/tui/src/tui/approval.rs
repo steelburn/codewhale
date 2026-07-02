@@ -102,6 +102,9 @@ pub enum ToolCategory {
     McpRead,
     /// MCP actions that may change remote state
     McpAction,
+    /// Sub-agent lifecycle (`agent` start/status/peek/cancel); the child's
+    /// own tool gates govern what it may actually do
+    Agent,
     /// Unknown or unclassified tool surface
     Unknown,
 }
@@ -185,6 +188,12 @@ impl AskRuleSavePreview {
 const ASK_RULE_SAVE_PREVIEW_MAX_ENTRIES: usize = 4;
 
 impl ApprovalRequest {
+    /// Presentation stakes for this request (see [`ApprovalStakes`]).
+    #[must_use]
+    pub fn stakes(&self) -> ApprovalStakes {
+        classify_stakes(&self.tool_name, self.category, self.risk, &self.params)
+    }
+
     #[cfg(test)]
     pub fn new(
         id: &str,
@@ -446,7 +455,9 @@ fn build_apply_patch_ask_rules(params: &Value, workspace: &Path) -> Vec<ToolAskR
 
 /// Get the category for a tool by name
 pub fn get_tool_category(name: &str) -> ToolCategory {
-    if matches!(name, "write_file" | "edit_file" | "apply_patch") {
+    if name == "agent" {
+        ToolCategory::Agent
+    } else if matches!(name, "write_file" | "edit_file" | "apply_patch") {
         ToolCategory::FileWrite
     } else if matches!(
         name,
@@ -493,6 +504,44 @@ pub fn get_tool_category(name: &str) -> ToolCategory {
     }
 }
 
+/// Presentation-level stakes for the approval prompt (#3883 follow-up).
+///
+/// `RiskLevel` drives keymaps and stays conservative ("not provably
+/// read-only" is `Destructive`), but rendering everything in that bucket
+/// as a red DESTRUCTIVE takeover made routine file edits and build
+/// commands read like emergencies. Stakes split presentation three ways:
+///
+/// - `Routine` — provably read-only; minimal chrome.
+/// - `Elevated` — ordinary state-touching work (edits, builds, MCP
+///   actions); a calm approval, not a warning.
+/// - `Critical` — genuinely destructive, publish-like, or
+///   secret-touching per `ToolActionKind`; keeps the strong styling and
+///   the policy semantics lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalStakes {
+    Routine,
+    Elevated,
+    Critical,
+}
+
+#[must_use]
+pub fn classify_stakes(
+    tool_name: &str,
+    category: ToolCategory,
+    risk: RiskLevel,
+    params: &Value,
+) -> ApprovalStakes {
+    if matches!(risk, RiskLevel::Benign) {
+        return ApprovalStakes::Routine;
+    }
+    match crate::tui::auto_review::ToolActionKind::from_tool_call(tool_name, params, category) {
+        crate::tui::auto_review::ToolActionKind::Publish
+        | crate::tui::auto_review::ToolActionKind::Destructive
+        | crate::tui::auto_review::ToolActionKind::Secret => ApprovalStakes::Critical,
+        _ => ApprovalStakes::Elevated,
+    }
+}
+
 /// Decide the stakes variant for an approval request.
 ///
 /// The bias is conservative: a category we don't recognise routes to
@@ -508,7 +557,25 @@ pub fn classify_risk(tool_name: &str, category: ToolCategory, params: &Value) ->
         // Query-only network is benign; opening a URL pulls arbitrary
         // remote content, so it stays destructive.
         ToolCategory::Network => match tool_name {
-            "web_search" | "web_run" | "wait_for_dev_server" => RiskLevel::Benign,
+            "web_search" | "wait_for_dev_server" => RiskLevel::Benign,
+            // web_run is benign for search/query, but its `open`/`click`
+            // actions fetch model-supplied URLs (arbitrary remote content) —
+            // destructive, consistent with fetch_url.
+            "web_run" => {
+                let fetches_url = params
+                    .get("open")
+                    .and_then(Value::as_array)
+                    .is_some_and(|a| !a.is_empty())
+                    || params
+                        .get("click")
+                        .and_then(Value::as_array)
+                        .is_some_and(|a| !a.is_empty());
+                if fetches_url {
+                    RiskLevel::Destructive
+                } else {
+                    RiskLevel::Benign
+                }
+            }
             _ => RiskLevel::Destructive,
         },
         // Shell stays destructive unless the existing command-safety analyzer
@@ -521,6 +588,13 @@ pub fn classify_risk(tool_name: &str, category: ToolCategory, params: &Value) ->
             }
             RiskLevel::Destructive
         }
+        // Sub-agent lifecycle: status/peek are inspection-only. Starts and
+        // other actions keep the explicit-options keymap (the child's own
+        // gates govern what it may do once running).
+        ToolCategory::Agent => match params.get("action").and_then(Value::as_str) {
+            Some("status" | "peek" | "list") => RiskLevel::Benign,
+            _ => RiskLevel::Destructive,
+        },
         // File writes, MCP actions, unclassified surfaces — all
         // require explicit confirmation.
         ToolCategory::FileWrite | ToolCategory::McpAction | ToolCategory::Unknown => {
@@ -615,6 +689,16 @@ fn build_impact_summary(tool_name: &str, category: ToolCategory, params: &Value)
             }
             impacts
         }
+        ToolCategory::Agent => {
+            let mut impacts = vec![
+                "Starts or inspects a child agent task; the child's own tool gates still apply."
+                    .to_string(),
+            ];
+            if let Some(kind) = param_preview(params, &["type"], 40) {
+                impacts.push(format!("Child type: {kind}"));
+            }
+            impacts
+        }
         ToolCategory::Unknown => {
             let mut impacts = vec![
                 "Tool is not classified. Review params carefully before approving.".to_string(),
@@ -639,6 +723,9 @@ fn localized_description_zh_hans(category: ToolCategory) -> String {
         ToolCategory::Network => "请求访问网络或远程内容。请确认目标可信。".to_string(),
         ToolCategory::McpRead => "请求从 MCP 服务器读取信息。".to_string(),
         ToolCategory::McpAction => "请求调用 MCP 服务器操作，可能产生副作用。".to_string(),
+        ToolCategory::Agent => {
+            "请求启动或查看子代理任务；子代理仍受其自身工具门控约束。".to_string()
+        }
         ToolCategory::Unknown => "请求运行未分类工具。批准前请仔细检查参数。".to_string(),
     }
 }
@@ -686,6 +773,14 @@ fn build_impact_summary_zh_hans(
             let mut impacts = vec!["调用可能产生副作用的 MCP 服务器操作。".to_string()];
             if let Some(target) = mcp_target_hint(tool_name) {
                 impacts.push(format!("MCP 目标：{target}"));
+            }
+            impacts
+        }
+        ToolCategory::Agent => {
+            let mut impacts =
+                vec!["启动或查看子代理任务；子代理仍受其自身工具门控约束。".to_string()];
+            if let Some(kind) = param_preview(params, &["type"], 40) {
+                impacts.push(format!("子代理类型：{kind}"));
             }
             impacts
         }
@@ -758,6 +853,29 @@ fn build_prominent_details(
                 details.push(ApprovalDetail {
                     label: "Target".to_string(),
                     value: target,
+                    shell_lines: None,
+                });
+            }
+        }
+        ToolCategory::Agent => {
+            if let Some(action) = param_preview(params, &["action"], 40) {
+                details.push(ApprovalDetail {
+                    label: "Action".to_string(),
+                    value: action,
+                    shell_lines: None,
+                });
+            }
+            if let Some(kind) = param_preview(params, &["type"], 40) {
+                details.push(ApprovalDetail {
+                    label: "Type".to_string(),
+                    value: kind,
+                    shell_lines: None,
+                });
+            }
+            if let Some(prompt) = param_preview(params, &["prompt", "task", "message"], 200) {
+                details.push(ApprovalDetail {
+                    label: "Prompt".to_string(),
+                    value: prompt,
                     shell_lines: None,
                 });
             }
@@ -972,6 +1090,9 @@ fn localize_detail_label(label: &str, locale: Locale) -> &str {
             "Path" => "路径",
             "Target" => "目标",
             "Input" => "输入",
+            "Action" => "操作",
+            "Type" => "类型",
+            "Prompt" => "提示",
             _ => label,
         },
         _ => label,
@@ -1297,8 +1418,27 @@ impl ApprovalView {
     }
 
     fn emit_params_pager(&self) -> ViewAction {
-        let content = serde_json::to_string_pretty(&self.request.params)
-            .unwrap_or_else(|_| self.request.params.to_string());
+        // The compact prompt keeps the about/impact dossier out of the
+        // default band; the pager is where that context now lives.
+        let locale = self.locale();
+        let (about_label, impact_label) = match locale {
+            Locale::ZhHans => ("说明：", "影响："),
+            _ => ("About: ", "Impact: "),
+        };
+        let mut content = String::new();
+        content.push_str(about_label);
+        content.push_str(&self.request.description_for_locale(locale));
+        content.push('\n');
+        for impact in self.request.impacts_for_locale(locale) {
+            content.push_str(impact_label);
+            content.push_str(&impact);
+            content.push('\n');
+        }
+        content.push('\n');
+        content.push_str(
+            &serde_json::to_string_pretty(&self.request.params)
+                .unwrap_or_else(|_| self.request.params.to_string()),
+        );
         ViewAction::Emit(ViewEvent::OpenTextPager {
             title: format!("Tool Params: {}", self.request.tool_name),
             content,
@@ -1669,6 +1809,16 @@ mod tests {
             "Write a file to disk",
             &json!({"path": "src/main.rs", "content": "test"}),
             "tool:write_file",
+        )
+    }
+
+    fn critical_request() -> ApprovalRequest {
+        ApprovalRequest::new(
+            "test-id",
+            "exec_shell",
+            "Run a shell command",
+            &json!({"command": "rm -rf ~/"}),
+            "tool:exec_shell",
         )
     }
 
@@ -2946,6 +3096,92 @@ diff --git a/src/b.rs b/src/b.rs
     }
 
     #[test]
+    fn web_run_risk_is_param_aware() {
+        // search/query is benign; open/click fetch arbitrary URLs -> destructive.
+        assert_eq!(
+            classify_risk("web_run", ToolCategory::Network, &json!({"search": "rust"})),
+            RiskLevel::Benign
+        );
+        assert_eq!(
+            classify_risk(
+                "web_run",
+                ToolCategory::Network,
+                &json!({"open": [{"ref": "https://evil.example"}]})
+            ),
+            RiskLevel::Destructive
+        );
+        assert_eq!(
+            classify_risk(
+                "web_run",
+                ToolCategory::Network,
+                &json!({"click": [{"ref": "1"}]})
+            ),
+            RiskLevel::Destructive
+        );
+    }
+
+    #[test]
+    fn stakes_split_routine_elevated_critical() {
+        assert_eq!(benign_request().stakes(), ApprovalStakes::Routine);
+        assert_eq!(destructive_request().stakes(), ApprovalStakes::Elevated);
+        assert_eq!(shell_request().stakes(), ApprovalStakes::Elevated);
+        assert_eq!(critical_request().stakes(), ApprovalStakes::Critical);
+        // Publish-like shell is critical in every origin.
+        let publish = ApprovalRequest::new(
+            "test-id",
+            "exec_shell",
+            "Run a shell command",
+            &json!({"command": "git push origin main"}),
+            "tool:exec_shell",
+        );
+        assert_eq!(publish.stakes(), ApprovalStakes::Critical);
+    }
+
+    #[test]
+    fn agent_tool_is_classified_and_renders_calm() {
+        assert_eq!(get_tool_category("agent"), ToolCategory::Agent);
+
+        let request = ApprovalRequest::new(
+            "test-id",
+            "agent",
+            "Start a sub-agent",
+            &json!({"action": "start", "type": "explore", "prompt": "map the workspace"}),
+            "tool:agent",
+        );
+        assert_eq!(request.category, ToolCategory::Agent);
+        assert_eq!(request.stakes(), ApprovalStakes::Elevated);
+
+        let view = ApprovalView::new(request);
+        let lines = render_lines(&view, 100, 40);
+        let joined = lines.join("\n");
+        assert!(joined.contains("APPROVAL"), "{joined}");
+        assert!(!joined.contains("DESTRUCTIVE"), "{joined}");
+        assert!(
+            !joined.contains("not classified"),
+            "agent must not render the unknown-tool warning:\n{joined}"
+        );
+        assert!(joined.contains("Action"), "{joined}");
+        assert!(joined.contains("start"), "{joined}");
+        assert!(joined.contains("explore"), "{joined}");
+        assert!(joined.contains("map the workspace"), "{joined}");
+    }
+
+    #[test]
+    fn agent_status_and_peek_are_benign() {
+        for action in ["status", "peek", "list"] {
+            let request = ApprovalRequest::new(
+                "test-id",
+                "agent",
+                "Inspect a sub-agent",
+                &json!({"action": action, "agent_id": "agent_1"}),
+                "tool:agent",
+            );
+            assert_eq!(request.risk, RiskLevel::Benign, "{action}");
+            assert_eq!(request.stakes(), ApprovalStakes::Routine, "{action}");
+        }
+    }
+
+    #[test]
     fn render_benign_includes_review_badge_and_selection_hint() {
         let view = ApprovalView::new(benign_request());
         let lines = render_lines(&view, 100, 40);
@@ -2961,8 +3197,43 @@ diff --git a/src/b.rs b/src/b.rs
     }
 
     #[test]
-    fn render_destructive_shows_warning_badge_and_one_step_hint() {
+    fn render_elevated_write_is_calm_and_compact() {
+        // Ordinary state-touching work (a file write) renders as a calm
+        // APPROVAL ask: no DESTRUCTIVE badge, no policy dossier, no
+        // impact/category taxonomy — that detail stays one `v` away.
         let view = ApprovalView::new(destructive_request());
+        let lines = render_lines(&view, 100, 40);
+        let joined = lines.join("\n");
+        assert!(joined.contains("APPROVAL"), "missing calm badge:\n{joined}");
+        assert!(
+            !joined.contains("DESTRUCTIVE"),
+            "routine write must not scream DESTRUCTIVE:\n{joined}"
+        );
+        assert_approval_key_badges_visible(&joined);
+        assert!(
+            joined.contains("Enter selected option"),
+            "selection hint missing:\n{joined}"
+        );
+        assert!(
+            !joined.contains("active approval policy"),
+            "policy prose is critical-only:\n{joined}"
+        );
+        assert!(
+            !joined.contains("Impact:"),
+            "impact dossier is critical-only:\n{joined}"
+        );
+        assert!(
+            !joined.contains("Type:"),
+            "category taxonomy is critical-only:\n{joined}"
+        );
+        assert!(joined.contains("write_file"));
+    }
+
+    #[test]
+    fn render_critical_shows_warning_badge_and_policy_semantics() {
+        // Genuinely destructive work keeps the strong styling and the
+        // policy/cancel semantics.
+        let view = ApprovalView::new(critical_request());
         let lines = render_lines(&view, 100, 40);
         let joined = lines.join("\n");
         assert!(
@@ -2971,10 +3242,6 @@ diff --git a/src/b.rs b/src/b.rs
         );
         assert_approval_key_badges_visible(&joined);
         assert!(
-            joined.contains("Enter selected option"),
-            "destructive hint missing:\n{joined}"
-        );
-        assert!(
             joined.contains("active approval policy"),
             "missing policy/review-rule semantics:\n{joined}"
         );
@@ -2982,17 +3249,21 @@ diff --git a/src/b.rs b/src/b.rs
             joined.contains("Deny rejects only this tool call"),
             "missing deny-vs-abort semantics:\n{joined}"
         );
-        assert!(joined.contains("write_file"));
+        assert!(joined.contains("rm -rf"));
     }
 
     #[test]
-    fn render_destructive_zh_hans_localizes_security_copy() {
+    fn render_elevated_zh_hans_is_calm_and_localized() {
         let view = ApprovalView::new_for_locale(destructive_request(), Locale::ZhHans);
         let lines = render_lines(&view, 100, 40);
         let joined = compact_rendered_text(&lines);
         assert!(
-            joined.contains("破坏性"),
-            "missing zh risk badge:\n{joined}"
+            joined.contains("需要批准"),
+            "missing zh calm badge:\n{joined}"
+        );
+        assert!(
+            !joined.contains("破坏性"),
+            "routine write must not use the destructive zh badge:\n{joined}"
         );
         assert!(
             joined.contains("选择："),
@@ -3003,16 +3274,31 @@ diff --git a/src/b.rs b/src/b.rs
             "missing zh one-step hint:\n{joined}"
         );
         assert!(
-            joined.contains("文件写入"),
-            "missing zh category:\n{joined}"
+            !joined.contains("影响："),
+            "impact dossier is critical-only:\n{joined}"
+        );
+        assert!(
+            joined.contains("仅本次批准"),
+            "missing zh approve option:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn render_critical_zh_hans_localizes_security_copy() {
+        let view = ApprovalView::new_for_locale(critical_request(), Locale::ZhHans);
+        let lines = render_lines(&view, 100, 40);
+        let joined = compact_rendered_text(&lines);
+        assert!(
+            joined.contains("破坏性"),
+            "missing zh risk badge:\n{joined}"
         );
         assert!(
             joined.contains("影响："),
             "missing zh impact label:\n{joined}"
         );
         assert!(
-            joined.contains("写入：src/main.rs"),
-            "missing zh impact path:\n{joined}"
+            joined.contains("规则:"),
+            "missing zh policy semantics:\n{joined}"
         );
         assert!(
             joined.contains("仅本次批准"),

@@ -545,7 +545,7 @@ impl ToolSpec for WriteFileTool {
             })?;
         }
 
-        fs::write(&file_path, file_content).map_err(|e| {
+        crate::utils::write_atomic(&file_path, file_content.as_bytes()).map_err(|e| {
             ToolError::execution_failed(format!("Failed to write {}: {}", file_path.display(), e))
         })?;
         context.note_file_read(&file_path);
@@ -702,7 +702,7 @@ impl ToolSpec for EditFileTool {
             (contents.replace(search, replace), count, None)
         };
 
-        fs::write(&file_path, &updated).map_err(|e| {
+        crate::utils::write_atomic(&file_path, updated.as_bytes()).map_err(|e| {
             ToolError::execution_failed(format!("Failed to write {}: {}", file_path.display(), e))
         })?;
         context.note_file_read(&file_path);
@@ -1450,11 +1450,6 @@ mod tests {
         );
     }
 
-    /// Serialises tests that mutate `DEEPSEEK_CONFIG_PATH` so they don't
-    /// race against each other — env vars are process-global and the
-    /// settings loader inspects this var on every call.
-    static DS_CONFIG_PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     struct ConfigPathEnvGuard {
         prior: Option<std::ffi::OsString>,
     }
@@ -1483,7 +1478,11 @@ mod tests {
         // missing.
         // Sync test (calls `read_pdf` directly, not the async ReadFileTool
         // wrapper) so the env-var lock is never held across an `.await`.
-        let _lock = DS_CONFIG_PATH_LOCK.lock().unwrap();
+        // Must hold the process-wide env lock, not a module-local one:
+        // other test modules redirect `DEEPSEEK_CONFIG_PATH`/`HOME` under
+        // `lock_test_env`, and a module-local mutex would let this test's
+        // redirect interleave with theirs.
+        let _lock = crate::test_support::lock_test_env();
         let _guard = ConfigPathEnvGuard::capture();
 
         let tmp = tempdir().expect("tempdir");
@@ -1497,7 +1496,7 @@ mod tests {
             "prefer_external_pdftotext = true\n",
         )
         .unwrap();
-        // Safety: serialised by DS_CONFIG_PATH_LOCK; reverted by guard.
+        // Safety: serialised by the process-wide test env lock; reverted by guard.
         unsafe {
             std::env::set_var("DEEPSEEK_CONFIG_PATH", &config_path);
         }

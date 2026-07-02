@@ -1,4 +1,5 @@
 use super::*;
+use crate::tools::{AgentToolSurfaceOptions, ToolRegistryBuilder};
 use crate::worker_profile::ShellPolicy;
 use axum::{Json, Router, http::StatusCode, response::IntoResponse, routing::post};
 use std::collections::HashSet;
@@ -1994,6 +1995,156 @@ fn test_subagent_tools_respect_nested_agent_depth_budget() {
     assert!(!capped.is_tool_allowed("agent"));
 }
 
+fn tool_names(tools: Vec<Tool>) -> HashSet<String> {
+    tools.into_iter().map(|tool| tool.name).collect()
+}
+
+fn enabled_agent_surface_options() -> AgentToolSurfaceOptions {
+    let mut options = AgentToolSurfaceOptions::new(ShellPolicy::Full);
+    options.apply_patch_enabled = true;
+    options.web_search_enabled = true;
+    options.memory_tool_enabled = true;
+    options.goal_state = Some(crate::tools::goal::new_shared_goal_state());
+    options
+}
+
+fn disabled_feature_agent_surface_options() -> AgentToolSurfaceOptions {
+    let mut options = AgentToolSurfaceOptions::new(ShellPolicy::Full);
+    options.goal_state = Some(crate::tools::goal::new_shared_goal_state());
+    options
+}
+
+#[test]
+fn subagent_general_catalog_matches_parent_agent_surface_when_features_enabled() {
+    let tmp = tempdir().expect("tempdir");
+    let mut runtime =
+        stub_runtime().with_agent_tool_surface_options(enabled_agent_surface_options());
+    runtime.context = ToolContext::new(tmp.path().to_path_buf());
+    let todo_list = crate::tools::todo::new_shared_todo_list();
+    let plan_state = crate::tools::plan::new_shared_plan_state();
+
+    let parent_registry = ToolRegistryBuilder::new()
+        .with_full_agent_surface_options(
+            Some(runtime.client.clone()),
+            runtime.model.clone(),
+            runtime.manager.clone(),
+            runtime.clone(),
+            runtime.agent_tool_surface_options.clone(),
+            todo_list.clone(),
+            plan_state.clone(),
+        )
+        .build(runtime.context.clone());
+    let child_registry =
+        SubAgentToolRegistry::new(runtime, SubAgentType::General, None, todo_list, plan_state);
+
+    let parent_names = tool_names(parent_registry.to_api_tools());
+    let child_names = tool_names(child_registry.tools_for_model(&SubAgentType::General));
+    assert_eq!(
+        child_names, parent_names,
+        "default General sub-agent catalog must stay in parity with the parent Agent surface"
+    );
+}
+
+#[test]
+fn subagent_feature_gates_match_parent_agent_surface() {
+    let tmp = tempdir().expect("tempdir");
+    let mut runtime =
+        stub_runtime().with_agent_tool_surface_options(disabled_feature_agent_surface_options());
+    runtime.context = ToolContext::new(tmp.path().to_path_buf());
+    let todo_list = crate::tools::todo::new_shared_todo_list();
+    let plan_state = crate::tools::plan::new_shared_plan_state();
+
+    let parent_registry = ToolRegistryBuilder::new()
+        .with_full_agent_surface_options(
+            Some(runtime.client.clone()),
+            runtime.model.clone(),
+            runtime.manager.clone(),
+            runtime.clone(),
+            runtime.agent_tool_surface_options.clone(),
+            todo_list.clone(),
+            plan_state.clone(),
+        )
+        .build(runtime.context.clone());
+    let child_registry = SubAgentToolRegistry::new(
+        runtime,
+        SubAgentType::Implementer,
+        None,
+        todo_list,
+        plan_state,
+    );
+
+    let parent_names = tool_names(parent_registry.to_api_tools());
+    let child_names = tool_names(child_registry.tools_for_model(&SubAgentType::Implementer));
+    for name in [
+        "apply_patch",
+        "web_search",
+        "fetch_url",
+        "web.run",
+        "wait_for_dev_server",
+        "remember",
+    ] {
+        assert!(
+            !parent_names.contains(name),
+            "{name} should be parent-gated"
+        );
+        assert!(!child_names.contains(name), "{name} should be child-gated");
+    }
+}
+
+#[test]
+fn explore_catalog_inherits_web_but_hides_write_shell_and_fim_tools() {
+    let tmp = tempdir().expect("tempdir");
+    let mut runtime =
+        stub_runtime().with_agent_tool_surface_options(enabled_agent_surface_options());
+    runtime.context = ToolContext::new(tmp.path().to_path_buf());
+    runtime.context.auto_approve = true;
+    let registry = SubAgentToolRegistry::new(
+        runtime,
+        SubAgentType::Explore,
+        None,
+        crate::tools::todo::new_shared_todo_list(),
+        crate::tools::plan::new_shared_plan_state(),
+    );
+
+    let names = tool_names(registry.tools_for_model(&SubAgentType::Explore));
+    for name in ["web_search", "fetch_url", "web.run", "wait_for_dev_server"] {
+        assert!(names.contains(name), "Explore should inherit {name}");
+    }
+    for name in [
+        "write_file",
+        "edit_file",
+        "apply_patch",
+        "fim_edit",
+        "exec_shell",
+        "task_shell_start",
+    ] {
+        assert!(!names.contains(name), "Explore must hide {name}");
+    }
+}
+
+#[test]
+fn implementer_catalog_inherits_patch_and_fim_when_enabled() {
+    let tmp = tempdir().expect("tempdir");
+    let mut runtime =
+        stub_runtime().with_agent_tool_surface_options(enabled_agent_surface_options());
+    runtime.context = ToolContext::new(tmp.path().to_path_buf());
+    let registry = SubAgentToolRegistry::new(
+        runtime,
+        SubAgentType::Implementer,
+        None,
+        crate::tools::todo::new_shared_todo_list(),
+        crate::tools::plan::new_shared_plan_state(),
+    );
+
+    let names = tool_names(registry.tools_for_model(&SubAgentType::Implementer));
+    for name in ["apply_patch", "fim_edit", "write_file", "edit_file"] {
+        assert!(
+            names.contains(name),
+            "Implementer should inherit write-capable tool {name}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn api_timeout_preserves_checkpoint_and_returns_needs_input_without_parking() {
     let tmp = tempdir().expect("tempdir");
@@ -3113,6 +3264,79 @@ fn subagent_failed_sentinel_format_is_well_formed() {
 }
 
 #[test]
+fn annotated_failure_message_composes_class_tag_and_model_hint() {
+    // #3884: the failure recorder composes subagent_failure_message (adds the
+    // class tag + full chain) with annotate_child_model_error (adds the
+    // model-availability hint). Pin the composition the mailbox/update_failed
+    // call sites actually perform, not just the helper in isolation.
+    let err = anyhow::Error::new(crate::llm_client::LlmError::AuthorizationError(
+        "The model `gpt-5.5-codex` does not exist or you do not have access".to_string(),
+    ))
+    .context("Responses API request failed");
+
+    let annotated = annotate_child_model_error(&subagent_failure_message(&err), "gpt-5.5-codex");
+
+    // Class tag from subagent_failure_message.
+    assert!(annotated.starts_with("[auth]"), "{annotated}");
+    // Full chain preserved.
+    assert!(
+        annotated.contains("Responses API request failed"),
+        "{annotated}"
+    );
+    assert!(annotated.contains("does not exist"), "{annotated}");
+    // Model-availability hint fired because the real provider text now
+    // reaches the classifier (it could not when only the masked outer
+    // context string was recorded).
+    assert!(annotated.contains("gpt-5.5-codex"), "{annotated}");
+    assert!(
+        annotated.contains("child model override")
+            || annotated.contains("child-agent model config"),
+        "{annotated}"
+    );
+}
+
+#[test]
+fn subagent_failure_message_preserves_error_chain() {
+    // #3884: `to_string()` on an anyhow error prints only the outermost
+    // context ("Responses API request failed"), masking the HTTP status and
+    // body detail carried by the source `LlmError`. The failure message must
+    // walk the chain and prefix the error class.
+    let err = anyhow::Error::new(crate::llm_client::LlmError::InvalidRequest {
+        status: 400,
+        message: "model `gpt-5.5-codex` is not supported on this endpoint".to_string(),
+    })
+    .context("Responses API request failed");
+
+    let message = subagent_failure_message(&err);
+    assert!(message.starts_with("[invalid_request]"), "{message}");
+    assert!(
+        message.contains("Responses API request failed"),
+        "{message}"
+    );
+    assert!(message.contains("Invalid request (400)"), "{message}");
+    assert!(
+        message.contains("not supported on this endpoint"),
+        "{message}"
+    );
+
+    // Rate limits classify too — the fanout failure shape from the report.
+    let err = anyhow::Error::new(crate::llm_client::LlmError::RateLimited {
+        message: "please slow down".to_string(),
+        retry_after: None,
+    })
+    .context("Responses API request failed");
+    let message = subagent_failure_message(&err);
+    assert!(message.starts_with("[rate_limited]"), "{message}");
+    assert!(message.contains("please slow down"), "{message}");
+
+    // Plain errors with no LlmError in the chain pass through untagged but
+    // still fully chained.
+    let err = anyhow::anyhow!("boom").context("outer");
+    let message = subagent_failure_message(&err);
+    assert_eq!(message, "outer: boom");
+}
+
+#[test]
 fn annotate_child_model_error_adds_actionable_hint() {
     // #2653: a bare provider 403 becomes actionable by naming the model and the
     // recovery path, while unrelated errors pass through unchanged.
@@ -3762,6 +3986,7 @@ fn stub_runtime() -> SubAgentRuntime {
         role_models: std::collections::HashMap::new(),
         context,
         allow_shell: true,
+        agent_tool_surface_options: AgentToolSurfaceOptions::new(ShellPolicy::Full),
         worker_profile: WorkerRuntimeProfile::for_role(SubAgentType::General),
         event_tx: None,
         manager: new_shared_subagent_manager(workspace, 5),
@@ -4100,6 +4325,10 @@ fn child_runtime_inherits_speech_output_dir() {
     let child = runtime.child_runtime();
 
     assert_eq!(child.speech_output_dir, Some(output_dir));
+    assert_eq!(
+        child.agent_tool_surface_options.speech_output_dir,
+        Some(PathBuf::from("configured-speech-output"))
+    );
 }
 
 #[test]
@@ -5090,4 +5319,193 @@ fn cleanup_due_gates_write_locked_cleanup_to_a_bounded_cadence() {
         manager.cleanup_due(Duration::from_secs(0)),
         "a zero interval is always due"
     );
+}
+
+// ── #3882: bounded sub-agent output under Fleet fanout ─────────────────────
+
+/// Serialize-and-restore guard for the shared spillover test root, mirroring
+/// the pattern in `tools::truncate::tests`.
+fn with_spillover_root<F: FnOnce()>(root: &std::path::Path, f: F) {
+    let _guard = crate::tools::truncate::TEST_SPILLOVER_GUARD
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    let prior = crate::tools::truncate::set_test_spillover_root(Some(root.to_path_buf()));
+    struct Restore(Option<std::path::PathBuf>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            crate::tools::truncate::set_test_spillover_root(self.0.take());
+        }
+    }
+    let _restore = Restore(prior);
+    f();
+}
+
+#[test]
+fn bounded_tail_messages_keeps_recent_within_budget_and_counts_omitted() {
+    let messages: Vec<Message> = (0..10)
+        .map(|i| text_message("user", &format!("{i}:{}", "x".repeat(10_000))))
+        .collect();
+
+    let (kept, omitted) = bounded_tail_messages(&messages, 35_000);
+
+    assert!(!kept.is_empty());
+    assert_eq!(kept.len() + omitted, messages.len());
+    assert!(omitted > 0, "a 100 KB history must not fit a 35 KB budget");
+    // The tail is the most recent slice, in order.
+    let last_kept = message_text(kept.last().expect("tail non-empty"));
+    assert!(
+        last_kept.starts_with("9:"),
+        "kept tail must end at the newest message"
+    );
+    let total: usize = kept.iter().map(approximate_message_bytes).sum();
+    assert!(
+        total <= 35_000 + 11_000,
+        "kept tail exceeds budget by more than one message: {total}"
+    );
+}
+
+#[test]
+fn bounded_tail_messages_always_keeps_the_final_message() {
+    let messages = vec![
+        text_message("user", &"a".repeat(50_000)),
+        text_message("assistant", &"b".repeat(50_000)),
+    ];
+
+    let (kept, omitted) = bounded_tail_messages(&messages, 10);
+
+    assert_eq!(
+        kept.len(),
+        1,
+        "the newest message survives even over budget"
+    );
+    assert_eq!(omitted, 1);
+    assert!(message_text(&kept[0]).starts_with('b'));
+}
+
+#[test]
+fn checkpoints_are_byte_bounded_under_fanout_scale_output() {
+    // Simulates the #3882 report shape: a worker whose tool results are
+    // multi-MB build logs. Without bounding, every per-step checkpoint clone
+    // carried the whole history; the persisted fleet file and every snapshot
+    // multiplied it further.
+    let huge = "error: expected `;`\n".repeat(120_000); // ~2.3 MB per message
+    let messages: Vec<Message> = (0..6).map(|_| text_message("user", &huge)).collect();
+
+    let checkpoint = make_checkpoint("fleet-worker-1", 6, messages.clone());
+
+    assert_eq!(checkpoint.message_count, messages.len());
+    assert!(checkpoint.omitted_messages > 0);
+    assert!(
+        !checkpoint.messages.is_empty(),
+        "checkpoint must stay continuable"
+    );
+    let serialized = serde_json::to_string(&checkpoint).expect("serialize checkpoint");
+    assert!(
+        serialized.len() <= SUBAGENT_CHECKPOINT_MESSAGE_BUDGET_BYTES + huge.len() + 64 * 1024,
+        "checkpoint JSON must be bounded, got {} bytes",
+        serialized.len()
+    );
+    // The raw history is ~14 MB; the checkpoint must not carry it.
+    assert!(
+        serialized.len() < 4 * 1024 * 1024,
+        "checkpoint JSON should be far below the raw transcript size, got {} bytes",
+        serialized.len()
+    );
+}
+
+#[test]
+fn checkpoint_without_omitted_field_still_deserializes() {
+    // Records persisted before v0.8.67 carry no omitted_messages key.
+    let legacy = r#"{
+        "checkpoint_id": "a:step:1:ts:1",
+        "agent_id": "a",
+        "continuation_handle": "agent:a:checkpoint:a:step:1:ts:1",
+        "reason": "interrupted",
+        "continuable": true,
+        "steps_taken": 1,
+        "message_count": 1,
+        "created_at_ms": 1
+    }"#;
+    let checkpoint: SubAgentCheckpoint =
+        serde_json::from_str(legacy).expect("legacy checkpoint should load");
+    assert_eq!(checkpoint.omitted_messages, 0);
+}
+
+#[test]
+fn subagent_tool_results_spill_to_disk_and_stay_bounded_inline() {
+    let tmp = tempdir().expect("tempdir");
+    with_spillover_root(tmp.path(), || {
+        let raw = "cargo build noise line\n".repeat(220_000); // ~5 MB
+        let raw_len = raw.len();
+
+        let (inline, spilled) =
+            bound_subagent_tool_result("fleet-worker-1", "call-42", raw.clone());
+
+        let path = spilled.expect("multi-MB output must spill");
+        // Model-visible content is bounded to head + footer.
+        assert!(inline.len() <= crate::tools::truncate::SPILLOVER_HEAD_BYTES + 1024);
+        assert!(inline.contains("Sub-agent tool output truncated"));
+        assert!(inline.contains(&path.display().to_string()));
+        assert!(inline.contains("read_file"));
+        // Full output remains recoverable from disk.
+        let on_disk = std::fs::read_to_string(&path).expect("spill file readable");
+        assert_eq!(on_disk.len(), raw_len);
+
+        // Small outputs pass through untouched, no spill file.
+        let (small, spilled) =
+            bound_subagent_tool_result("fleet-worker-1", "call-43", "ok".to_string());
+        assert_eq!(small, "ok");
+        assert!(spilled.is_none());
+
+        // Oversized error output is bounded too: sub-agent errors are
+        // routinely full build logs, unlike the root loop's short errors.
+        let (bounded_err, spilled) =
+            bound_subagent_tool_result("fleet-worker-1", "call-44", format!("Error: {raw}"));
+        assert!(spilled.is_some());
+        assert!(bounded_err.len() <= crate::tools::truncate::SPILLOVER_HEAD_BYTES + 1024);
+        assert!(bounded_err.starts_with("Error:"));
+    });
+}
+
+#[test]
+fn fanout_of_workers_with_huge_outputs_keeps_resident_state_bounded() {
+    // Acceptance shape for #3882: multiple workers, each emitting multi-MB
+    // tool output. Model-visible content and per-worker checkpoints stay
+    // bounded while every full output is recoverable from disk.
+    let tmp = tempdir().expect("tempdir");
+    with_spillover_root(tmp.path(), || {
+        let huge = "warning: unused import `std::mem`\n".repeat(70_000); // ~2.4 MB
+        let mut resident_bytes = 0usize;
+
+        for worker in 0..4 {
+            let agent_id = format!("fleet-worker-{worker}");
+            let mut messages = Vec::new();
+            for call in 0..3 {
+                let (inline, spilled) =
+                    bound_subagent_tool_result(&agent_id, &format!("call-{call}"), huge.clone());
+                let path = spilled.expect("should spill");
+                assert_eq!(
+                    std::fs::read_to_string(&path).expect("readable").len(),
+                    huge.len()
+                );
+                resident_bytes += inline.len();
+                messages.push(text_message("user", &inline));
+            }
+            let checkpoint = make_checkpoint(&agent_id, 3, messages);
+            let serialized = serde_json::to_string(&checkpoint).expect("serialize");
+            assert!(
+                serialized.len() <= SUBAGENT_CHECKPOINT_MESSAGE_BUDGET_BYTES + 128 * 1024,
+                "worker {worker} checkpoint too large: {} bytes",
+                serialized.len()
+            );
+            resident_bytes += serialized.len();
+        }
+
+        // 4 workers × 3 calls × ~2.4 MB ≈ 29 MB raw. Bounded resident state
+        // must stay under 2 MB total.
+        assert!(
+            resident_bytes < 2 * 1024 * 1024,
+            "resident bytes not bounded: {resident_bytes}"
+        );
+    });
 }

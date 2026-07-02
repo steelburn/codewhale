@@ -3039,6 +3039,119 @@ fn config_store_save_preserves_comments_with_other_keys() {
 }
 
 #[test]
+fn setup_transaction_applies_config_store_body_preserving_comments() {
+    // #3410: the comment-preserving ConfigStore write must compose with
+    // SetupTransaction so a setup step can update config.toml atomically
+    // alongside sibling setup files.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config_path = dir.path().join(CONFIG_FILE_NAME);
+    let state_path = dir.path().join(crate::setup_state::SETUP_STATE_FILE_NAME);
+    fs::write(
+        &config_path,
+        "# my model\nmodel = \"deepseek-v4-flash\"\n# end comment\n",
+    )
+    .expect("write config");
+
+    let mut store = ConfigStore::load(Some(config_path.clone())).expect("load config store");
+    store.config.model = Some("deepseek-v4-pro".to_string());
+
+    let mut transaction = persistence::SetupTransaction::new();
+    transaction.stage(
+        &config_path,
+        store.rendered_body().expect("rendered body").into_bytes(),
+    );
+    transaction
+        .stage_json(&state_path, &SetupState::default())
+        .expect("stage setup state");
+    transaction.commit().expect("commit");
+
+    let body = fs::read_to_string(&config_path).expect("read config");
+    assert!(body.contains("# my model"), "prefix comment preserved");
+    assert!(body.contains("# end comment"), "suffix comment preserved");
+    assert!(body.contains("model = \"deepseek-v4-pro\""));
+    assert!(state_path.exists(), "sibling setup state written");
+}
+
+#[test]
+fn setup_transaction_rolls_back_config_store_body_on_sibling_failure() {
+    // #3410 rollback expectation: when a sibling stage fails to apply, the
+    // already-written config.toml is restored byte-for-byte, comments and
+    // all — no half-applied setup.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config_path = dir.path().join(CONFIG_FILE_NAME);
+    let original = "# my model\nmodel = \"deepseek-v4-flash\"\n# end comment\n";
+    fs::write(&config_path, original).expect("write config");
+    // A parent that is a regular file makes the second stage unwritable.
+    let blocker = dir.path().join("blocker");
+    fs::write(&blocker, b"file, not a directory").expect("write blocker");
+
+    let mut store = ConfigStore::load(Some(config_path.clone())).expect("load config store");
+    store.config.model = Some("deepseek-v4-pro".to_string());
+
+    let mut transaction = persistence::SetupTransaction::new();
+    transaction.stage(
+        &config_path,
+        store.rendered_body().expect("rendered body").into_bytes(),
+    );
+    transaction.stage(blocker.join("nested.json"), b"{}".to_vec());
+    transaction
+        .commit()
+        .expect_err("commit must fail on unwritable sibling");
+
+    let body = fs::read_to_string(&config_path).expect("read config");
+    assert_eq!(body, original, "config restored byte-for-byte on rollback");
+}
+
+#[test]
+fn config_store_load_fails_on_malformed_config_without_touching_file() {
+    // #3410 malformed-config posture: repair is explicit, never implicit.
+    // Loading a malformed config surfaces a parse error naming the path and
+    // leaves the file bytes untouched for the user (or doctor) to repair.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config_path = dir.path().join(CONFIG_FILE_NAME);
+    let malformed = "# half-edited config\nmodel = \"deepseek-v4-flash\n";
+    fs::write(&config_path, malformed).expect("write config");
+
+    let err = ConfigStore::load(Some(config_path.clone())).expect_err("malformed must not parse");
+
+    assert!(
+        format!("{err:#}").contains("failed to parse config"),
+        "error should name the parse failure: {err:#}"
+    );
+    let body = fs::read_to_string(&config_path).expect("read config");
+    assert_eq!(body, malformed, "malformed config left untouched");
+}
+
+#[test]
+fn config_store_rendered_body_preserves_comments_at_legacy_deepseek_path() {
+    // #3410 legacy case: a config still living under `.deepseek/` keeps its
+    // comments when written back through a transaction at the same path.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let legacy_dir = dir.path().join(".deepseek");
+    fs::create_dir_all(&legacy_dir).expect("legacy dir");
+    let config_path = legacy_dir.join(CONFIG_FILE_NAME);
+    fs::write(
+        &config_path,
+        "# legacy home config\nmodel = \"deepseek-v4-flash\"\n",
+    )
+    .expect("write config");
+
+    let mut store = ConfigStore::load(Some(config_path.clone())).expect("load config store");
+    store.config.model = Some("deepseek-v4-pro".to_string());
+
+    let mut transaction = persistence::SetupTransaction::new();
+    transaction.stage(
+        &config_path,
+        store.rendered_body().expect("rendered body").into_bytes(),
+    );
+    transaction.commit().expect("commit");
+
+    let body = fs::read_to_string(&config_path).expect("read config");
+    assert!(body.contains("# legacy home config"), "comment preserved");
+    assert!(body.contains("model = \"deepseek-v4-pro\""));
+}
+
+#[test]
 fn merge_and_preserve_comments_returns_err_on_invalid_serialized() {
     let err = merge_and_preserve_comments("{{{ not toml", "model = 1\n")
         .expect_err("invalid serialized should fail");

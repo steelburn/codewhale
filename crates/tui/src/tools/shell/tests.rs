@@ -1184,7 +1184,11 @@ async fn test_exec_shell_foreground_can_move_to_background() {
         .expect("task should not panic");
 
     assert!(result.success);
-    assert!(result.content.contains("Command moved to background"));
+    assert!(
+        result
+            .content
+            .contains("Foreground shell wait moved to /jobs")
+    );
     // The detach message points the model at the wait tool for early output
     // (the cancel-tool reference was reworded to `exec_shell_wait`).
     assert!(result.content.contains("exec_shell_wait"));

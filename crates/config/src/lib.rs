@@ -3,11 +3,14 @@ pub mod catalog;
 mod harness;
 pub mod model_reference;
 pub mod models_dev;
+pub mod persistence;
 pub mod pricing;
 pub mod provider;
 mod provider_defaults;
 mod provider_kind;
 pub mod route;
+pub mod setup_state;
+pub mod user_constitution;
 pub use harness::{
     HarnessCompactionStrategy, HarnessPosture, HarnessPostureKind, HarnessProfile,
     HarnessSafetyPosture, HarnessToolSurface, built_in_harness_profiles,
@@ -15,6 +18,13 @@ pub use harness::{
 pub use model_reference::{Modality, ModelReferenceCard, ModelReferenceDatabase};
 pub(crate) use provider_defaults::*;
 pub use provider_kind::ProviderKind;
+pub use setup_state::{
+    ConstitutionAuthoring, ConstitutionChoice, ConstitutionSource, ConstitutionValidity,
+    InheritedConfigFacts, RuntimePostureSource, SetupState, SetupStep, StepEntry, StepStatus,
+};
+pub use user_constitution::{
+    AutonomyPreference, UntrustedDraftParse, UserConstitution, UserConstitutionLoad,
+};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
@@ -2935,6 +2945,26 @@ impl ConfigStore {
         })
     }
 
+    /// Render the exact body [`save`](Self::save) would write: the serialized
+    /// config with comments and disabled keys from the originally-loaded file
+    /// merged back in. Exposed so setup flows can stage this body into a
+    /// [`persistence::SetupTransaction`] alongside sibling files and keep the
+    /// comment-preserving write atomic with the rest of the transaction.
+    pub fn rendered_body(&self) -> Result<String> {
+        let serialized =
+            toml::to_string_pretty(&self.config).context("failed to serialize config")?;
+        if let Some(ref original_raw) = self.original_raw {
+            Ok(
+                merge_and_preserve_comments(&serialized, original_raw).unwrap_or_else(|e| {
+                    tracing::warn!("failed to merge config comments, saving without them: {e:#}");
+                    serialized
+                }),
+            )
+        } else {
+            Ok(serialized)
+        }
+    }
+
     pub fn save(&self) -> Result<()> {
         let path = normalize_config_file_path(self.path.clone())?;
         if let Some(parent) = path.parent() {
@@ -2942,16 +2972,7 @@ impl ConfigStore {
                 format!("failed to create config directory {}", parent.display())
             })?;
         }
-        let body = if let Some(ref original_raw) = self.original_raw {
-            let serialized =
-                toml::to_string_pretty(&self.config).context("failed to serialize config")?;
-            merge_and_preserve_comments(&serialized, original_raw).unwrap_or_else(|e| {
-                tracing::warn!("failed to merge config comments, saving without them: {e:#}");
-                serialized
-            })
-        } else {
-            toml::to_string_pretty(&self.config).context("failed to serialize config")?
-        };
+        let body = self.rendered_body()?;
         if checked_path_exists(&path)? {
             let existing = read_checked_config_file(&path)?;
             if existing == body {
@@ -3582,6 +3603,12 @@ fn checked_permissions_path_for_config_path(config_path: &Path) -> Result<PathBu
 
 pub fn resolve_permissions_path(config_path: Option<PathBuf>) -> Result<PathBuf> {
     checked_permissions_path_for_config_path(&resolve_config_path(config_path)?)
+}
+
+/// Read a resolved `permissions.toml` path using the same checked/no-follow
+/// path handling as config loading.
+pub fn read_permissions_file(path: &Path) -> Result<String> {
+    read_checked_permissions_file(path)
 }
 
 fn load_sibling_permissions(config_path: &Path) -> Result<PermissionsToml> {

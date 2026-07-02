@@ -2811,9 +2811,9 @@ fn subagent_panel_rows(
         )));
         actions.push(Some("/fleet status".to_string()));
 
-        // Auto-collapse finished sub-agents: hide detail lines for completed
-        // agents so the sidebar stays compact when work is done.
-        if row.status == "done" {
+        // Auto-collapse finished sub-agents so the sidebar stays compact when
+        // work is done or terminally stopped.
+        if sidebar_agent_status_is_terminal(row.status.as_str()) {
             continue;
         }
 
@@ -2871,6 +2871,13 @@ fn agent_tree_prefix(row: &SidebarAgentRow) -> String {
     }
     let depth = row.spawn_depth.max(2).saturating_sub(2).min(6);
     format!("{}└─ ", "  ".repeat(depth as usize))
+}
+
+fn sidebar_agent_status_is_terminal(status: &str) -> bool {
+    matches!(
+        status,
+        "done" | "canceled" | "failed" | "interrupted" | "budget"
+    )
 }
 
 fn subagent_panel_hover_texts(
@@ -5129,6 +5136,57 @@ mod tests {
         );
         assert_eq!(sorted[0].id, "agent_parent");
         assert_eq!(sorted[1].id, "agent_child");
+    }
+
+    #[test]
+    fn subagent_panel_collapses_terminal_non_done_rows() {
+        let summary = SidebarSubagentSummary {
+            cached_total: 3,
+            cached_running: 0,
+            ..SidebarSubagentSummary::default()
+        };
+        let rows = ["canceled", "failed", "interrupted"]
+            .into_iter()
+            .enumerate()
+            .map(|(idx, status)| SidebarAgentRow {
+                id: format!("agent_terminal_{idx}"),
+                parent_run_id: None,
+                spawn_depth: 1,
+                name: format!("worker-{idx}"),
+                role: "explore".to_string(),
+                status: status.to_string(),
+                objective: None,
+                git_branch: None,
+                progress: Some(format!("{status} with a long stale-looking detail")),
+                steps_taken: 7,
+                duration_ms: Some(1_000),
+            })
+            .collect::<Vec<_>>();
+
+        let (lines, _) = subagent_panel_rows(&summary, &rows, 72, 10, &palette::UI_THEME);
+        let text = lines_to_text(&lines);
+
+        assert!(
+            text.iter().any(|line| line.contains("3 done")),
+            "terminal summary remains visible: {text:?}"
+        );
+        for idx in 0..3 {
+            assert!(
+                text.iter()
+                    .any(|line| line.contains(&format!("worker-{idx}"))),
+                "terminal worker label remains visible: {text:?}"
+            );
+        }
+        assert!(
+            !text.iter().any(|line| line.contains("step(s)")),
+            "terminal rows should not keep noisy detail lines: {text:?}"
+        );
+        assert!(
+            !text
+                .iter()
+                .any(|line| line.contains("stale-looking detail")),
+            "terminal rows should hide stale progress details: {text:?}"
+        );
     }
 
     #[test]

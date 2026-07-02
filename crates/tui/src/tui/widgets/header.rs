@@ -188,7 +188,7 @@ impl<'a> HeaderWidget<'a> {
     fn mode_name(mode: AppMode) -> &'static str {
         match mode {
             AppMode::Agent => "Agent",
-            AppMode::Auto => "Auto",
+            AppMode::Auto => "Agent",
             AppMode::Yolo => "Yolo",
             AppMode::Plan => "Plan",
         }

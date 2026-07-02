@@ -60,6 +60,7 @@ pub enum ShellStatus {
 
 /// Result from a shell command execution
 #[derive(Debug, Clone, Serialize, Deserialize)]
+
 pub struct ShellResult {
     pub task_id: Option<String>,
     pub status: ShellStatus,
@@ -1947,6 +1948,15 @@ shell sandbox). Workarounds: (1) run the Docker build from a regular terminal ou
 TUI, or (2) disable BuildKit with DOCKER_BUILDKIT=0 (only works if your Dockerfiles do not \
 use RUN --mount directives).";
 
+/// Human-readable exit status for a shell result: the numeric code when the
+/// process returned one, or "terminated by signal" when it did not (rather
+/// than leaking `Some(127)` / `None` Debug output to the user).
+fn exit_code_label(code: Option<i32>) -> String {
+    match code {
+        Some(code) => format!("exit code {code}"),
+        None => "terminated by signal".to_string(),
+    }
+}
 const PYTHON_BUILD_DEPENDENCY_HINT: &str = "Python build dependency missing: setuptools is not \
 available in the active environment. Install the declared build requirements first, for example \
 `python -m pip install -U pip setuptools wheel build`, then rerun the build command.";
@@ -2686,7 +2696,7 @@ impl ToolSpec for ExecShellTool {
                 } else if result.status == ShellStatus::Running {
                     if backgrounded_foreground {
                         format!(
-                            "Command moved to background: {task_id_str}\n\nReturns immediately; completion is tracked in task/status state. Keep working; call exec_shell_wait only if you need early output, final output, or wait=true at a true dependency."
+                            "Foreground shell wait moved to /jobs: {task_id_str}\n\nReturns immediately; completion is tracked in task/status state. Keep working; call exec_shell_wait only if you need early output, final output, or wait=true at a true dependency."
                         )
                     } else {
                         format!(
@@ -2705,8 +2715,10 @@ impl ToolSpec for ExecShellTool {
                     )
                 } else {
                     format!(
-                        "Command failed (exit code: {:?})\n\nSTDOUT:\n{}\n\nSTDERR:\n{}",
-                        result.exit_code, result.stdout, result.stderr
+                        "Command failed ({})\n\nSTDOUT:\n{}\n\nSTDERR:\n{}",
+                        exit_code_label(result.exit_code),
+                        result.stdout,
+                        result.stderr
                     )
                 };
                 if let Some(hint) = network_restricted_hint.as_deref() {
@@ -2843,7 +2855,9 @@ fn build_shell_delta_tool_result(delta: ShellDeltaResult, context: &ToolContext)
         match result.status {
             ShellStatus::Running => "Background task running (no new output).".to_string(),
             ShellStatus::Completed => "(no new output)".to_string(),
-            ShellStatus::Failed => format!("Command failed (exit code: {:?})", result.exit_code),
+            ShellStatus::Failed => {
+                format!("Command failed ({})", exit_code_label(result.exit_code))
+            }
             ShellStatus::TimedOut => "Command timed out (no new output).".to_string(),
             ShellStatus::Killed => "Command killed (no new output).".to_string(),
         }

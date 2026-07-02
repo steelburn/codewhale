@@ -44,9 +44,14 @@ fn create_dir_symlink(target: &std::path::Path, link: &std::path::Path) -> std::
 }
 
 #[test]
-fn feature_intro_content_mentions_features_and_disable_paths() {
+fn feature_intro_content_centers_constitution_follow_up() {
     let content = App::feature_intro_content();
-    assert!(content.contains("Hotbar"));
+    assert!(content.contains("Your CodeWhale setup is ready."));
+    assert!(content.contains("Constitution"));
+    assert!(content.contains("/constitution"));
+    assert!(content.contains("/setup"));
+    assert!(content.contains("/provider") && content.contains("/model"));
+    assert!(content.contains("Optional later"));
     assert!(content.contains("/hotbar") && content.contains("/hotbar off"));
     assert!(content.contains("Fleet") && content.contains("/fleet setup"));
 }
@@ -1476,12 +1481,13 @@ fn app_mode_helpers_centralize_parse_labels_and_cycle_order() {
     assert_eq!(AppMode::parse("fast"), None);
 
     assert_eq!(AppMode::Agent.as_setting(), "agent");
-    assert_eq!(AppMode::Auto.as_setting(), "auto");
+    assert_eq!(AppMode::Auto.as_setting(), "agent");
     assert_eq!(AppMode::Plan.display_name(), "Plan");
-    assert_eq!(AppMode::Auto.label(), "AUTO");
+    assert_eq!(AppMode::Auto.display_name(), "Agent");
+    assert_eq!(AppMode::Auto.label(), "AGENT");
     assert_eq!(AppMode::Yolo.label(), "YOLO");
     assert_eq!(AppMode::Agent.number(), '1');
-    assert_eq!(AppMode::Auto.number(), '3');
+    assert_eq!(AppMode::Auto.number(), '1');
     assert_eq!(AppMode::Yolo.number(), '4');
     assert_eq!(
         AppMode::CHOICES,
@@ -1745,12 +1751,12 @@ fn base_policy_for_mode_projects_the_mode_permission_table() {
     assert!(agent.trust_mode);
     assert_eq!(agent.approval_mode, ApprovalMode::Never);
 
-    // Auto: shell-enabled smart review, no trust authority.
+    // Auto: compatibility alias for the durable Agent baseline.
     let auto = base_policy_for_mode(AppMode::Auto, &prefs);
     assert_eq!(auto.mode, AppMode::Auto);
     assert!(auto.allow_shell);
-    assert!(!auto.trust_mode);
-    assert_eq!(auto.approval_mode, ApprovalMode::Auto);
+    assert!(auto.trust_mode);
+    assert_eq!(auto.approval_mode, ApprovalMode::Never);
 
     // YOLO: full authority is represented by Bypass, not a separate
     // auto-approve field (#3736).
@@ -3324,4 +3330,29 @@ fn advance_fallback_cloud_primary_can_hop_cloud_to_local_to_cloud() {
         !reason.contains("local/private policy"),
         "cloud-primary chains should not trigger local/private blocking: {reason}"
     );
+}
+
+#[test]
+fn status_classifier_does_not_paint_negated_success_green() {
+    use super::StatusToastLevel;
+    // Failures that happen to contain a success keyword ("saved", "found")
+    // must not toast green (#3757 UX review).
+    let (level, _, _) = App::classify_status_text("Custom provider was not saved.");
+    assert_ne!(level, StatusToastLevel::Success);
+    let (level, _, _) = App::classify_status_text("Queued message not found");
+    assert_ne!(level, StatusToastLevel::Success);
+    let (level, _, _) = App::classify_status_text("Could not enable subagents");
+    assert_ne!(level, StatusToastLevel::Success);
+    let (level, _, _) = App::classify_status_text("No sessions found");
+    assert_ne!(level, StatusToastLevel::Success);
+
+    // Genuine successes still classify green.
+    let (level, _, _) = App::classify_status_text("Fleet profile saved: reviewer.toml");
+    assert_eq!(level, StatusToastLevel::Success);
+
+    // Both cancel spellings classify as Warning.
+    let (level, _, _) = App::classify_status_text("Turn canceled");
+    assert_eq!(level, StatusToastLevel::Warning);
+    let (level, _, _) = App::classify_status_text("Turn cancelled");
+    assert_eq!(level, StatusToastLevel::Warning);
 }

@@ -362,11 +362,21 @@ pub(crate) fn asset_matches_platform(asset_name: &str, binary_name: &str) -> boo
         || asset_name.starts_with(&format!("{binary_name}."))
 }
 
+fn asset_is_exact_platform_binary(asset_name: &str, binary_name: &str) -> bool {
+    asset_name == binary_name || asset_name == format!("{binary_name}.exe")
+}
+
 fn select_platform_asset<'a>(release: &'a Release, binary_name: &str) -> Option<&'a Asset> {
     release
         .assets
         .iter()
-        .find(|asset| asset_matches_platform(&asset.name, binary_name))
+        .find(|asset| asset_is_exact_platform_binary(&asset.name, binary_name))
+        .or_else(|| {
+            release
+                .assets
+                .iter()
+                .find(|asset| asset_matches_platform(&asset.name, binary_name))
+        })
 }
 
 fn select_checksum_manifest_asset(release: &Release) -> Option<&Asset> {
@@ -1269,6 +1279,49 @@ mod tests {
             "codewhale-macos-aarch64.tar.gz",
             "codewhale-macos-arm64"
         ));
+    }
+
+    #[test]
+    fn select_platform_asset_prefers_bare_binary_over_archive() {
+        let release = Release {
+            tag_name: "v0.8.8".to_string(),
+            prerelease: false,
+            assets: vec![
+                Asset {
+                    name: "codewhale-macos-arm64.tar.gz".to_string(),
+                    browser_download_url: "https://example.invalid/codewhale-macos-arm64.tar.gz"
+                        .to_string(),
+                },
+                Asset {
+                    name: "codewhale-macos-arm64".to_string(),
+                    browser_download_url: "https://example.invalid/codewhale-macos-arm64"
+                        .to_string(),
+                },
+            ],
+        };
+
+        let asset =
+            select_platform_asset(&release, "codewhale-macos-arm64").expect("platform asset");
+
+        assert_eq!(asset.name, "codewhale-macos-arm64");
+    }
+
+    #[test]
+    fn select_platform_asset_falls_back_to_archive_when_bare_binary_is_missing() {
+        let release = Release {
+            tag_name: "v0.8.8".to_string(),
+            prerelease: false,
+            assets: vec![Asset {
+                name: "codewhale-macos-arm64.tar.gz".to_string(),
+                browser_download_url: "https://example.invalid/codewhale-macos-arm64.tar.gz"
+                    .to_string(),
+            }],
+        };
+
+        let asset =
+            select_platform_asset(&release, "codewhale-macos-arm64").expect("platform asset");
+
+        assert_eq!(asset.name, "codewhale-macos-arm64.tar.gz");
     }
 
     #[test]

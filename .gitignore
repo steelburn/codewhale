@@ -128,3 +128,7 @@ scripts/**/__pycache__/
 issues/
 logs/
 notes/
+
+# Agent-local roadmap and scratch (never commit — may hold unreleased plans)
+.agents/
+scratchpad/

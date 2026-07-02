@@ -181,18 +181,24 @@ của CodeWhale** cố định thứ tự quyền lực:
 
 1. **Ý định người dùng là tối thượng.** Yêu cầu hiện tại của bạn đứng trên
    hướng dẫn repo đã cũ, memory, handoff trước đó và các lớp personality.
-2. **Luật của repo phải tường minh.** Thêm `.codewhale/constitution.json` để
+2. **Constitution toàn cục của người dùng được quản lý bằng `/constitution`.**
+   Setup bình thường lưu luật cá nhân bền vững ở dạng dữ liệu có cấu trúc trong
+   `$CODEWHALE_HOME/constitution.json`, rồi render thành prose block cho model;
+   đây không phải trình sửa prompt thô.
+3. **Luật của repo phải tường minh.** Thêm `.codewhale/constitution.json` để
    khai báo quyền lực bền vững của dự án: các bất biến cần bảo vệ, chính sách
    branch, quy tắc kiểm chứng.
-3. **Bằng chứng đứng trên lời kể.** Output của công cụ thắng một phỏng đoán
+4. **Bằng chứng đứng trên lời kể.** Output của công cụ thắng một phỏng đoán
    tự tin. `cargo test` thất bại được báo cáo đúng là `cargo test` thất bại,
    không bao giờ bị tóm tắt thành lạc quan. Kiểm chứng là một phần của nhiệm
    vụ, không phải phần vĩ thanh.
-4. **Memory xếp cuối.** Hữu ích, nhưng không bao giờ có thẩm quyền.
+5. **Memory xếp cuối.** Hữu ích, nhưng không bao giờ có thẩm quyền.
 
 Phần chính sách quan trọng được thực thi bằng code, không phải bằng prompt:
 cổng phê duyệt, sandbox, snapshot, rollback và schema công cụ là các cơ chế
-runtime mà model không thể nói khéo để lách qua.
+runtime mà model không thể nói khéo để lách qua. Constitution có thể diễn đạt
+preference, nhưng không âm thầm đổi approval, sandbox, network, trust hoặc
+quyền MCP.
 
 Và không phần nào của bộ luật đó nằm trong model — vì thế model mới thay
 được. Harness mang constitution; model cung cấp khả năng suy luận. DeepSeek
@@ -210,8 +216,8 @@ trên [codewhale.net](https://codewhale.net/):
 
 - [User guide](docs/GUIDE.md) — giờ đầu tiên với CodeWhale.
 - [Install guide](docs/INSTALL.md) — mọi đường cài đặt và troubleshooting.
-- [Configuration](docs/CONFIGURATION.md) — file cấu hình, constitution của
-  repo và cài đặt provider.
+- [Configuration](docs/CONFIGURATION.md) — `/constitution`, constitution toàn
+  cục của người dùng, constitution của repo và cài đặt provider.
 - [Provider registry](docs/PROVIDERS.md) — đường model, credentials, base URL
   và ranh giới năng lực.
 - [Sub-agents](docs/SUBAGENTS.md) — vai trò, vòng đời, hợp đồng output và

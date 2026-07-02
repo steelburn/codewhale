@@ -6,20 +6,20 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Widget},
+    widgets::{Block, Borders, Paragraph, Widget, Wrap},
 };
 
 use crate::config::Config;
 use crate::palette;
 use crate::tui::app::App;
 use crate::tui::views::{
-    ActionHint, ModalKind, ModalView, ViewAction, ViewEvent, centered_modal_area,
-    render_modal_footer,
+    ActionHint, EmptyState, ListDetailLayout, ModalKind, ModalView, ViewAction, ViewEvent,
+    centered_modal_area, render_modal_footer, render_modal_surface,
 };
 
 use super::actions::{
     HotbarActionCategory, HotbarActionMetadata, HotbarArgsBehavior, HotbarRecommendationOptions,
-    recommend_hotbar_actions,
+    HotbarSafetyClass, recommend_hotbar_actions,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,6 +51,8 @@ pub struct HotbarSetupView {
     draft_bindings: BTreeMap<u8, codewhale_config::HotbarBindingToml>,
     recommended_action_ids: BTreeSet<String>,
     validation_errors: Vec<String>,
+    query: String,
+    filter_focused: bool,
     help_visible: bool,
 }
 
@@ -125,6 +127,8 @@ impl HotbarSetupView {
             original_bindings,
             recommended_action_ids,
             validation_errors: Vec::new(),
+            query: String::new(),
+            filter_focused: false,
             help_visible: false,
         }
     }
@@ -187,6 +191,12 @@ impl HotbarSetupView {
     }
 
     #[must_use]
+    #[cfg(test)]
+    pub fn query(&self) -> &str {
+        &self.query
+    }
+
+    #[must_use]
     pub fn status_text(&self) -> String {
         if let Some(error) = self.validation_errors.last() {
             return error.clone();
@@ -201,6 +211,8 @@ impl HotbarSetupView {
 
     #[cfg(test)]
     pub fn select_action_by_id(&mut self, action_id: &str) -> bool {
+        self.query.clear();
+        self.filter_focused = false;
         let Some(row) = self
             .actions
             .iter()
@@ -293,6 +305,20 @@ impl HotbarSetupView {
     }
 
     fn actions_for_source(&self, source: HotbarActionCategory) -> Vec<&HotbarSetupActionRow> {
+        let query = self.query.trim().to_ascii_lowercase();
+        self.actions
+            .iter()
+            .filter(|row| {
+                row.metadata.category == source
+                    && (query.is_empty() || action_matches_query(row, &query))
+            })
+            .collect()
+    }
+
+    fn unfiltered_actions_for_source(
+        &self,
+        source: HotbarActionCategory,
+    ) -> Vec<&HotbarSetupActionRow> {
         self.actions
             .iter()
             .filter(|row| row.metadata.category == source)
@@ -355,40 +381,10 @@ impl HotbarSetupView {
         })
     }
 
+    #[cfg(test)]
     fn render_lines(&self) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
-        // Plain intro: what Hotbar is + how to hide it, with the platform-correct
-        // modifier glyph (⌥ on macOS, alt+ elsewhere).
-        let alt_prefix = crate::tui::widgets::key_hint::alt_prefix();
-        lines.push(Line::from(Span::styled(
-            format!(
-                "Hotbar gives you {alt_prefix}1-8 shortcuts. Assign actions below; \
-                 press 'd' or run `/hotbar off` to hide it."
-            ),
-            Style::default()
-                .fg(palette::TEXT_PRIMARY)
-                .add_modifier(Modifier::DIM),
-        )));
-        lines.push(Line::from(""));
-        let tabs = self
-            .sources
-            .iter()
-            .map(|source| {
-                if Some(*source) == self.selected_source() {
-                    format!("[{}]", source.as_str())
-                } else {
-                    source.as_str().to_string()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("  ");
-        lines.push(Line::from(vec![Span::styled(
-            tabs,
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )]));
-        lines.push(Line::from(""));
+        lines.extend(self.header_lines());
 
         let Some(source) = self.selected_source() else {
             lines.push(Line::from("No hotbar actions are available."));
@@ -396,41 +392,88 @@ impl HotbarSetupView {
         };
 
         for (idx, row) in self.actions_for_source(source).iter().enumerate() {
-            let marker = if idx == self.selected_action_idx(source) {
-                ">"
-            } else {
-                " "
-            };
-            let checked = if self
-                .draft_bindings
-                .values()
-                .any(|binding| binding.action == row.metadata.id)
-            {
-                "*"
-            } else {
-                " "
-            };
-            let recommended = if self.recommended_action_ids.contains(&row.metadata.id) {
-                "rec"
-            } else {
-                ""
-            };
-            let mut text = format!(
-                "{marker}{checked} {:<3} {:<20} {:<8} {}",
-                recommended,
-                row.metadata.display_name,
-                row.status_label(),
-                row.metadata.description
-            );
-            if let Some(reason) = row.disabled_reason.as_deref() {
-                text.push_str(" (");
-                text.push_str(reason);
-                text.push(')');
-            }
-            lines.push(Line::from(text));
+            lines.push(self.action_row_line(source, idx, row));
         }
 
         lines.push(Line::from(""));
+        lines.push(self.slots_line());
+        lines.push(Line::from(self.status_text()));
+        lines
+    }
+
+    fn header_lines(&self) -> Vec<Line<'static>> {
+        let alt_prefix = crate::tui::widgets::key_hint::alt_prefix();
+        vec![
+            Line::from(Span::styled(
+                format!(
+                    "Hotbar gives you {alt_prefix}1-8 shortcuts. Assign actions below; \
+                     press 'd' or run `/hotbar off` to hide it."
+                ),
+                Style::default()
+                    .fg(palette::TEXT_PRIMARY)
+                    .add_modifier(Modifier::DIM),
+            )),
+            self.slots_line(),
+            self.source_tabs_line(),
+            self.filter_line(),
+            Line::from(self.status_text()),
+        ]
+    }
+
+    fn source_tabs_line(&self) -> Line<'static> {
+        let mut spans = Vec::new();
+        for (idx, source) in self.sources.iter().enumerate() {
+            if idx > 0 {
+                spans.push(Span::raw("  "));
+            }
+            let count = self.unfiltered_actions_for_source(*source).len();
+            let label = if Some(*source) == self.selected_source() {
+                format!("[{} {count}]", source.as_str())
+            } else {
+                format!("{} {count}", source.as_str())
+            };
+            spans.push(Span::styled(
+                label,
+                Style::default()
+                    .fg(if Some(*source) == self.selected_source() {
+                        Color::Cyan
+                    } else {
+                        palette::TEXT_MUTED
+                    })
+                    .add_modifier(if Some(*source) == self.selected_source() {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+            ));
+        }
+        Line::from(spans)
+    }
+
+    fn filter_line(&self) -> Line<'static> {
+        let value = if self.query.is_empty() {
+            if self.filter_focused {
+                "type to filter".to_string()
+            } else {
+                "press / or type to filter".to_string()
+            }
+        } else {
+            self.query.clone()
+        };
+        Line::from(vec![
+            Span::styled("Filter ", Style::default().fg(palette::TEXT_MUTED)),
+            Span::styled(
+                value,
+                Style::default().fg(if self.filter_focused {
+                    palette::DEEPSEEK_SKY
+                } else {
+                    palette::TEXT_PRIMARY
+                }),
+            ),
+        ])
+    }
+
+    fn slots_line(&self) -> Line<'static> {
         let slots = (1..=codewhale_config::HOTBAR_SLOT_COUNT)
             .map(|slot| {
                 let label = self
@@ -446,9 +489,168 @@ impl HotbarSetupView {
             })
             .collect::<Vec<_>>()
             .join("  ");
-        lines.push(Line::from(slots));
-        lines.push(Line::from(self.status_text()));
+        Line::from(slots)
+    }
+
+    fn action_row_line(
+        &self,
+        source: HotbarActionCategory,
+        idx: usize,
+        row: &HotbarSetupActionRow,
+    ) -> Line<'static> {
+        let selected = idx == self.selected_action_idx(source);
+        let marker = if selected { ">" } else { " " };
+        let checked = if self
+            .draft_bindings
+            .values()
+            .any(|binding| binding.action == row.metadata.id)
+        {
+            "*"
+        } else {
+            " "
+        };
+        let recommended = if self.recommended_action_ids.contains(&row.metadata.id) {
+            "rec"
+        } else {
+            ""
+        };
+        let mut text = format!(
+            "{marker}{checked} {:<3} {:<22} {:<8} {}",
+            recommended,
+            row.metadata.display_name,
+            row.status_label(),
+            row.metadata.description
+        );
+        if let Some(reason) = row.disabled_reason.as_deref() {
+            text.push_str(" (");
+            text.push_str(reason);
+            text.push(')');
+        }
+        Line::from(Span::styled(
+            text,
+            Style::default()
+                .fg(if selected {
+                    palette::DEEPSEEK_SKY
+                } else {
+                    palette::TEXT_PRIMARY
+                })
+                .add_modifier(if selected {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
+        ))
+    }
+
+    fn render_header(&self, area: Rect, buf: &mut Buffer) {
+        Paragraph::new(self.header_lines())
+            .style(Style::default().fg(palette::TEXT_PRIMARY))
+            .wrap(Wrap { trim: true })
+            .render(area, buf);
+    }
+
+    fn render_action_list(&self, area: Rect, buf: &mut Buffer) {
+        let Some(source) = self.selected_source() else {
+            EmptyState::new("No actions", "No hotbar action sources are available.")
+                .render(area, buf);
+            return;
+        };
+        let rows = self.actions_for_source(source);
+        if rows.is_empty() {
+            EmptyState::new(
+                "No matching actions",
+                "Clear the filter or switch categories to find another bindable action.",
+            )
+            .primary_action("/", "filter")
+            .secondary_action("Esc", "clear filter")
+            .render(area, buf);
+            return;
+        }
+        let mut lines = vec![Line::from(Span::styled(
+            format!("{} actions", source.as_str()),
+            Style::default()
+                .fg(palette::TEXT_MUTED)
+                .add_modifier(Modifier::BOLD),
+        ))];
+        for (idx, row) in rows.iter().enumerate() {
+            lines.push(self.action_row_line(source, idx, row));
+        }
+        Paragraph::new(lines)
+            .style(Style::default().fg(palette::TEXT_PRIMARY))
+            .render(area, buf);
+    }
+
+    fn render_action_detail(&self, area: Rect, buf: &mut Buffer) {
+        let Some(row) = self.selected_action() else {
+            EmptyState::new(
+                "Select an action",
+                "Move through the catalog to preview the selected slot binding.",
+            )
+            .primary_action("Tab", "category")
+            .secondary_action("/", "filter")
+            .render(area, buf);
+            return;
+        };
+        Paragraph::new(self.detail_lines(row))
+            .style(Style::default().fg(palette::TEXT_PRIMARY))
+            .wrap(Wrap { trim: true })
+            .render(area, buf);
+    }
+
+    fn detail_lines(&self, row: &HotbarSetupActionRow) -> Vec<Line<'static>> {
+        let mut lines = vec![
+            Line::from(Span::styled(
+                row.metadata.display_name.clone(),
+                Style::default()
+                    .fg(palette::TEXT_PRIMARY)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                row.metadata.id.clone(),
+                Style::default().fg(palette::TEXT_MUTED),
+            )),
+            Line::from(""),
+            Line::from(format!("Category: {}", row.metadata.category.as_str())),
+            Line::from(format!("Status: {}", row.status_label())),
+            Line::from(format!("Safety: {}", safety_label(row.metadata.safety))),
+            Line::from(format!("Arguments: {}", args_label(row.metadata.args))),
+            Line::from(format!(
+                "Slot {}: {}",
+                self.selected_slot,
+                self.selected_slot_binding_label()
+            )),
+            Line::from(""),
+            Line::from(row.metadata.description.clone()),
+            Line::from(""),
+            Line::from(preview_line(row)),
+        ];
+        if let Some(reason) = row.disabled_reason.as_deref() {
+            lines.push(Line::from(Span::styled(
+                format!("Unavailable: {reason}"),
+                Style::default().fg(palette::STATUS_WARNING),
+            )));
+        }
+        if self.help_visible {
+            lines.push(Line::from(""));
+            lines.push(Line::from(
+                "Save writes staged slots; Esc cancels staged changes unless a filter is active.",
+            ));
+            lines.push(Line::from(
+                "After save: Alt+1 through Alt+8 dispatch Hotbar slots. Bare 1-8 stay composer text outside setup.",
+            ));
+        }
         lines
+    }
+
+    fn selected_slot_binding_label(&self) -> String {
+        let Some(binding) = self.draft_bindings.get(&self.selected_slot) else {
+            return "empty".to_string();
+        };
+        self.actions
+            .iter()
+            .find(|row| row.metadata.id == binding.action)
+            .map(|row| row.metadata.display_name.clone())
+            .unwrap_or_else(|| binding.action.clone())
     }
 }
 
@@ -459,8 +661,16 @@ impl ModalView for HotbarSetupView {
 
     fn handle_key(&mut self, key: KeyEvent) -> ViewAction {
         match key.code {
+            KeyCode::Esc if self.filter_focused || !self.query.is_empty() => {
+                self.query.clear();
+                self.filter_focused = false;
+                self.validation_errors.clear();
+                ViewAction::None
+            }
             KeyCode::Esc => ViewAction::Close,
-            KeyCode::Char('q') | KeyCode::Char('Q') if key.modifiers.is_empty() => {
+            KeyCode::Char('q') | KeyCode::Char('Q')
+                if key.modifiers.is_empty() && !self.filter_focused =>
+            {
                 ViewAction::Close
             }
             KeyCode::Tab => {
@@ -491,7 +701,19 @@ impl ModalView for HotbarSetupView {
                 self.move_action(-1);
                 ViewAction::None
             }
+            KeyCode::Char('k') | KeyCode::Char('K')
+                if key.modifiers.is_empty() && !self.filter_focused =>
+            {
+                self.move_action(-1);
+                ViewAction::None
+            }
             KeyCode::Down => {
+                self.move_action(1);
+                ViewAction::None
+            }
+            KeyCode::Char('j') | KeyCode::Char('J')
+                if key.modifiers.is_empty() && !self.filter_focused =>
+            {
                 self.move_action(1);
                 ViewAction::None
             }
@@ -499,11 +721,31 @@ impl ModalView for HotbarSetupView {
                 self.assign_selected_action();
                 ViewAction::None
             }
+            KeyCode::Char('a') | KeyCode::Char('A')
+                if key.modifiers.is_empty() && !self.filter_focused =>
+            {
+                self.assign_selected_action();
+                ViewAction::None
+            }
             KeyCode::Char(' ') => {
                 self.toggle_selected_action();
                 ViewAction::None
             }
+            KeyCode::Backspace if self.filter_focused || !self.query.is_empty() => {
+                self.query.pop();
+                if self.query.is_empty() {
+                    self.filter_focused = false;
+                }
+                self.validation_errors.clear();
+                ViewAction::None
+            }
             KeyCode::Backspace | KeyCode::Delete => {
+                self.clear_selected_slot();
+                ViewAction::None
+            }
+            KeyCode::Char('c') | KeyCode::Char('C')
+                if key.modifiers.is_empty() && !self.filter_focused =>
+            {
                 self.clear_selected_slot();
                 ViewAction::None
             }
@@ -512,16 +754,34 @@ impl ModalView for HotbarSetupView {
                 self.select_slot(slot);
                 ViewAction::None
             }
-            KeyCode::Char('s') | KeyCode::Char('S') if key.modifiers.is_empty() => {
+            KeyCode::Char('s') | KeyCode::Char('S')
+                if key.modifiers.is_empty() && !self.filter_focused =>
+            {
                 self.save_action()
             }
-            KeyCode::Char('d') | KeyCode::Char('D') if key.modifiers.is_empty() => {
+            KeyCode::Char('d') | KeyCode::Char('D')
+                if key.modifiers.is_empty() && !self.filter_focused =>
+            {
                 // "Disable Hotbar" from inside the setup flow: hide it and
                 // persist `hotbar = []`. Mirrors `/hotbar off`.
                 ViewAction::EmitAndClose(ViewEvent::HotbarDisableRequested)
             }
+            KeyCode::Char('/') if key.modifiers.is_empty() => {
+                self.filter_focused = true;
+                self.validation_errors.clear();
+                ViewAction::None
+            }
             KeyCode::Char('?') => {
                 self.help_visible = !self.help_visible;
+                ViewAction::None
+            }
+            KeyCode::Char(ch) if key.modifiers.is_empty() => {
+                self.filter_focused = true;
+                self.query.push(ch);
+                self.validation_errors.clear();
+                if let Some(source) = self.selected_source() {
+                    self.set_selected_action_idx(source, 0);
+                }
                 ViewAction::None
             }
             _ => ViewAction::None,
@@ -530,7 +790,7 @@ impl ModalView for HotbarSetupView {
 
     fn render(&self, area: Rect, buf: &mut Buffer) {
         let popup_area = centered_modal_area(area, 118, 28, 72, 12);
-        Clear.render(popup_area, buf);
+        render_modal_surface(area, popup_area, buf);
         let block = Block::default()
             .title(" Hotbar setup ")
             .borders(Borders::ALL)
@@ -546,17 +806,32 @@ impl ModalView for HotbarSetupView {
                 ActionHint::new("Tab/Shift+Tab", "source"),
                 ActionHint::new("Up/Down", "action"),
                 ActionHint::new("1-8", "slot"),
-                ActionHint::new("Enter", "assign"),
+                ActionHint::new("/", "filter"),
+                ActionHint::new("Enter/A", "assign"),
                 ActionHint::new("Space", "toggle"),
-                ActionHint::new("Delete", "clear"),
+                ActionHint::new("C/Delete", "clear"),
                 ActionHint::new("s", "save"),
                 ActionHint::new("d", "disable"),
                 ActionHint::new("Esc", "cancel"),
             ],
         );
-        Paragraph::new(self.render_lines())
-            .style(Style::default().fg(palette::TEXT_PRIMARY))
-            .render(content, buf);
+        let header_height = content.height.min(5);
+        let header = Rect {
+            x: content.x,
+            y: content.y,
+            width: content.width,
+            height: header_height,
+        };
+        self.render_header(header, buf);
+        let body = Rect {
+            x: content.x,
+            y: content.y + header_height,
+            width: content.width,
+            height: content.height.saturating_sub(header_height),
+        };
+        let layout = ListDetailLayout::split(body, 34);
+        self.render_action_list(layout.list, buf);
+        self.render_action_detail(layout.detail, buf);
     }
 
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
@@ -573,6 +848,50 @@ fn wrap_index(current: usize, len: usize, delta: isize) -> usize {
     usize::try_from((current + delta).rem_euclid(len)).expect("wrapped index fits")
 }
 
+fn action_matches_query(row: &HotbarSetupActionRow, query: &str) -> bool {
+    [
+        row.metadata.id.as_str(),
+        row.metadata.display_name.as_str(),
+        row.metadata.description.as_str(),
+        row.metadata.category.as_str(),
+        row.status_label(),
+        row.disabled_reason.as_deref().unwrap_or_default(),
+    ]
+    .into_iter()
+    .any(|value| value.to_ascii_lowercase().contains(query))
+}
+
+fn safety_label(safety: HotbarSafetyClass) -> &'static str {
+    match safety {
+        HotbarSafetyClass::LocalUi => "safe UI",
+        HotbarSafetyClass::LocalState => "local state",
+        HotbarSafetyClass::ConfigChange => "config change",
+        HotbarSafetyClass::ExternalInput => "external input",
+        HotbarSafetyClass::ExistingCommand => "existing command",
+        HotbarSafetyClass::RequiresApproval => "approval gated",
+    }
+}
+
+fn args_label(args: HotbarArgsBehavior) -> &'static str {
+    match args {
+        HotbarArgsBehavior::None => "none",
+        HotbarArgsBehavior::Optional => "optional",
+        HotbarArgsBehavior::Required => "prefill required arguments",
+    }
+}
+
+fn preview_line(row: &HotbarSetupActionRow) -> String {
+    match (row.metadata.category, row.metadata.args) {
+        (HotbarActionCategory::Route, _) => {
+            "Preview: switches provider/model through /model route logic.".to_string()
+        }
+        (_, HotbarArgsBehavior::Required) => {
+            "Preview: pre-fills the composer instead of running blindly.".to_string()
+        }
+        _ => "Preview: dispatches through the existing Hotbar action path.".to_string(),
+    }
+}
+
 fn compact_action_id(action_id: &str) -> String {
     let suffix = action_id.rsplit('.').next().unwrap_or(action_id);
     crate::tui::ui_text::truncate_line_to_width(suffix, 7)
@@ -581,12 +900,12 @@ fn compact_action_id(action_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use crate::config::{ApiProvider, Config};
     use crate::tui::app::TuiOptions;
     use crossterm::event::KeyModifiers;
     use std::path::PathBuf;
 
-    fn test_app() -> App {
+    fn test_app_with_config(config: &Config) -> App {
         let options = TuiOptions {
             model: "deepseek-v4-pro".to_string(),
             workspace: PathBuf::from("."),
@@ -608,9 +927,13 @@ mod tests {
             resume_session_id: None,
             initial_input: None,
         };
-        let mut app = App::new(options, &Config::default());
+        let mut app = App::new(options, config);
         app.ui_locale = crate::localization::Locale::En;
         app
+    }
+
+    fn test_app() -> App {
+        test_app_with_config(&Config::default())
     }
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -624,7 +947,11 @@ mod tests {
 
         assert_eq!(
             view.source_categories(),
-            &[HotbarActionCategory::App, HotbarActionCategory::Slash]
+            &[
+                HotbarActionCategory::App,
+                HotbarActionCategory::Route,
+                HotbarActionCategory::Slash,
+            ]
         );
         assert_eq!(view.selected_source(), Some(HotbarActionCategory::App));
         assert!(view.recommended_action_ids().contains("mode.agent"));
@@ -768,15 +1095,46 @@ mod tests {
     }
 
     #[test]
-    fn keyboard_controls_navigate_source_action_and_slot() {
+    fn wizard_help_documents_runtime_hotbar_shortcut() {
         let app = test_app();
         let mut view = HotbarSetupView::new(&app, &Config::default());
 
+        assert!(matches!(
+            view.handle_key(key(KeyCode::Char('?'))),
+            ViewAction::None
+        ));
+        let rendered = view
+            .selected_action()
+            .map(|row| view.detail_lines(row))
+            .expect("selected action")
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("After save: Alt+1 through Alt+8 dispatch Hotbar slots"));
+        assert!(rendered.contains("Bare 1-8 stay composer text outside setup"));
+    }
+
+    #[test]
+    fn keyboard_controls_navigate_source_action_and_slot() {
+        let mut config = Config {
+            provider: Some(ApiProvider::Deepseek.as_str().to_string()),
+            ..Config::default()
+        };
+        config
+            .provider_config_for_mut(ApiProvider::Openrouter)
+            .model = Some("anthropic/claude-sonnet-4".to_string());
+        let app = test_app_with_config(&config);
+        let mut view = HotbarSetupView::new(&app, &config);
+
         assert_eq!(view.selected_source(), Some(HotbarActionCategory::App));
+        view.handle_key(key(KeyCode::Tab));
+        assert_eq!(view.selected_source(), Some(HotbarActionCategory::Route));
         view.handle_key(key(KeyCode::Tab));
         assert_eq!(view.selected_source(), Some(HotbarActionCategory::Slash));
         view.handle_key(key(KeyCode::BackTab));
-        assert_eq!(view.selected_source(), Some(HotbarActionCategory::App));
+        assert_eq!(view.selected_source(), Some(HotbarActionCategory::Route));
 
         let first = view
             .selected_action()
@@ -793,6 +1151,37 @@ mod tests {
         assert_eq!(view.selected_slot(), 8);
         view.handle_key(key(KeyCode::Left));
         assert_eq!(view.selected_slot(), 7);
+    }
+
+    #[test]
+    fn keyboard_filter_searches_catalog_and_escape_clears_it() {
+        let app = test_app();
+        let mut view = HotbarSetupView::new(&app, &Config::default());
+
+        view.handle_key(key(KeyCode::Tab));
+        assert_eq!(view.selected_source(), Some(HotbarActionCategory::Route));
+        let route_label = view
+            .selected_action()
+            .map(|row| row.metadata.display_name.clone())
+            .expect("route action");
+        let route_query = route_label
+            .chars()
+            .take(4)
+            .collect::<String>()
+            .to_ascii_lowercase();
+        view.handle_key(key(KeyCode::Char('/')));
+        for ch in route_query.chars() {
+            view.handle_key(key(KeyCode::Char(ch)));
+        }
+        assert_eq!(view.query(), route_query);
+        assert!(view.status_text().contains(&route_label));
+
+        view.handle_key(key(KeyCode::Esc));
+        assert_eq!(view.query(), "");
+        assert!(matches!(
+            view.handle_key(key(KeyCode::Esc)),
+            ViewAction::Close
+        ));
     }
 
     #[test]
@@ -821,8 +1210,8 @@ mod tests {
 
             // Footer keeps every action.
             for label in [
-                "source", "action", "slot", "assign", "toggle", "clear", "save", "disable",
-                "cancel",
+                "source", "action", "slot", "filter", "assign", "toggle", "clear", "save",
+                "disable", "cancel",
             ] {
                 assert!(text.contains(label), "{w}x{h}: footer missing '{label}'");
             }

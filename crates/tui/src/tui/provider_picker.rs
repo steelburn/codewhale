@@ -2,7 +2,7 @@
 //! hosted providers / self-hosted providers) and, if it lacks credentials, type the API key
 //! inline before completing the switch (#52).
 //!
-//! The picker is intentionally a single modal with two visible states:
+//! The picker is intentionally a single modal with three visible states:
 //!
 //! 1. **List** — pick a provider; each row shows the active provider arrow
 //!    and an "API key configured" / "needs API key" hint. Enter on a
@@ -13,6 +13,9 @@
 //!    canonical env-var name as a hint. Enter submits
 //!    [`ViewEvent::ProviderPickerApiKeySubmitted`], which the UI handler
 //!    persists via `save_api_key_for` before switching.
+//! 3. **Custom form** — a named OpenAI-compatible endpoint form. Enter submits
+//!    [`ViewEvent::ProviderPickerCustomProviderSubmitted`], which persists a
+//!    `[providers.<name>]` table without storing raw secrets.
 //!
 //! Pressing Esc backs out: from key entry returns to the list; from the
 //! list closes the modal without changes.
@@ -23,7 +26,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Widget},
+    widgets::{Block, Borders, Paragraph, Widget, Wrap},
 };
 
 use crate::config::{
@@ -35,8 +38,8 @@ use crate::model_profile::{SupportState, resolved_capability_profile};
 use crate::palette;
 use crate::tui::app::ReasoningEffort;
 use crate::tui::views::{
-    ActionHint, ModalKind, ModalView, ViewAction, ViewEvent, centered_modal_area,
-    render_modal_footer, render_modal_surface,
+    ActionHint, EmptyState, ListDetailLayout, ModalKind, ModalView, ViewAction, ViewEvent,
+    centered_modal_area, render_modal_footer, render_modal_surface,
 };
 use codewhale_config::catalog::{CatalogOffering, CatalogSnapshot};
 use codewhale_config::provider::WireFormat;
@@ -50,6 +53,15 @@ use std::sync::OnceLock;
 enum Stage {
     List,
     KeyEntry,
+    CustomForm,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CustomProviderField {
+    Name,
+    BaseUrl,
+    Model,
+    ApiKeyEnv,
 }
 
 /// Which subset of `rows` the list stage shows (#3830). `Configured` is the
@@ -67,6 +79,11 @@ pub struct ProviderPickerView {
     stage: Stage,
     view: ProviderListView,
     api_key_input: String,
+    custom_provider_field: CustomProviderField,
+    custom_provider_id: String,
+    custom_provider_base_url: String,
+    custom_provider_model: String,
+    custom_provider_api_key_env: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1118,7 +1135,37 @@ impl ProviderPickerView {
             stage: Stage::List,
             view,
             api_key_input: String::new(),
+            custom_provider_field: CustomProviderField::Name,
+            custom_provider_id: String::new(),
+            custom_provider_base_url: String::new(),
+            custom_provider_model: String::new(),
+            custom_provider_api_key_env: String::new(),
         }
+    }
+
+    /// Open the picker already focused on `target` in its key-entry stage —
+    /// the missing-auth handoff (#3830): when a route switch is rejected for
+    /// want of a key, drop the user straight onto that provider's key prompt
+    /// instead of dead-ending with an error. Falls back to the normal list
+    /// if the target has no row (e.g. an unknown custom id).
+    #[must_use]
+    /// Returns `None` when `target` has no picker row (an unknown/custom
+    /// provider we could not focus or key-enter) so the caller can keep its
+    /// honest error instead of opening a dead-end picker.
+    pub fn new_for_missing_auth(
+        active: ApiProvider,
+        target: ApiProvider,
+        config: &Config,
+        runtime_status: Option<ProviderRuntimeStatus>,
+    ) -> Option<Self> {
+        let mut picker = Self::new_with_runtime_status(active, config, runtime_status);
+        let idx = picker.rows.iter().position(|row| row.provider == target)?;
+        picker.selected_idx = idx;
+        // The target may be an unconfigured catalog row; show the catalog so
+        // it is visible, then jump into key entry for it.
+        picker.view = ProviderListView::Catalog;
+        picker.enter_key_entry();
+        Some(picker)
     }
 
     fn row_visible(&self, idx: usize) -> bool {
@@ -1205,6 +1252,11 @@ impl ProviderPickerView {
         self.rows[self.selected_idx].provider
     }
 
+    fn selected_provider_id(&self) -> Option<String> {
+        let row = &self.rows[self.selected_idx];
+        (row.provider == ApiProvider::Custom).then(|| row.provider_id.clone())
+    }
+
     fn selected_has_key(&self) -> bool {
         self.rows[self.selected_idx].has_key
     }
@@ -1212,6 +1264,67 @@ impl ProviderPickerView {
     fn enter_key_entry(&mut self) {
         self.stage = Stage::KeyEntry;
         self.api_key_input.clear();
+    }
+
+    fn enter_custom_form(&mut self) {
+        self.stage = Stage::CustomForm;
+        self.custom_provider_field = CustomProviderField::Name;
+        self.custom_provider_id.clear();
+        self.custom_provider_base_url.clear();
+        self.custom_provider_model.clear();
+        self.custom_provider_api_key_env.clear();
+    }
+
+    fn custom_form_field_mut(&mut self) -> &mut String {
+        match self.custom_provider_field {
+            CustomProviderField::Name => &mut self.custom_provider_id,
+            CustomProviderField::BaseUrl => &mut self.custom_provider_base_url,
+            CustomProviderField::Model => &mut self.custom_provider_model,
+            CustomProviderField::ApiKeyEnv => &mut self.custom_provider_api_key_env,
+        }
+    }
+
+    fn custom_form_field_value(&self, field: CustomProviderField) -> &str {
+        match field {
+            CustomProviderField::Name => &self.custom_provider_id,
+            CustomProviderField::BaseUrl => &self.custom_provider_base_url,
+            CustomProviderField::Model => &self.custom_provider_model,
+            CustomProviderField::ApiKeyEnv => &self.custom_provider_api_key_env,
+        }
+    }
+
+    fn advance_custom_field(&mut self) {
+        self.custom_provider_field = match self.custom_provider_field {
+            CustomProviderField::Name => CustomProviderField::BaseUrl,
+            CustomProviderField::BaseUrl => CustomProviderField::Model,
+            CustomProviderField::Model => CustomProviderField::ApiKeyEnv,
+            CustomProviderField::ApiKeyEnv => CustomProviderField::ApiKeyEnv,
+        };
+    }
+
+    fn retreat_custom_field(&mut self) {
+        self.custom_provider_field = match self.custom_provider_field {
+            CustomProviderField::Name => CustomProviderField::Name,
+            CustomProviderField::BaseUrl => CustomProviderField::Name,
+            CustomProviderField::Model => CustomProviderField::BaseUrl,
+            CustomProviderField::ApiKeyEnv => CustomProviderField::Model,
+        };
+    }
+
+    fn build_custom_provider_event(&self) -> Option<ViewEvent> {
+        let provider_id = self.custom_provider_id.trim();
+        let base_url = self.custom_provider_base_url.trim();
+        if provider_id.is_empty() || base_url.is_empty() {
+            return None;
+        }
+        let model = non_empty_string(&self.custom_provider_model);
+        let api_key_env = non_empty_string(&self.custom_provider_api_key_env);
+        Some(ViewEvent::ProviderPickerCustomProviderSubmitted {
+            provider_id: provider_id.to_string(),
+            base_url: base_url.to_string(),
+            model,
+            api_key_env,
+        })
     }
 
     fn env_var_for(provider: ApiProvider) -> String {
@@ -1305,6 +1418,7 @@ impl ProviderPickerView {
                 ActionHint::new("a-z", "jump"),
                 ActionHint::new("Enter", enter_action),
                 ActionHint::new("A", view_action),
+                ActionHint::new("C", "custom"),
                 ActionHint::new("R", "edit key"),
                 ActionHint::new("M", "models"),
                 ActionHint::new("Esc", "cancel"),
@@ -1313,25 +1427,22 @@ impl ProviderPickerView {
 
         let filtered = self.filtered_rows();
         if filtered.is_empty() {
-            Paragraph::new(vec![
-                Line::from(Span::styled(
-                    "No providers configured yet.",
-                    Style::default().fg(palette::TEXT_MUTED),
-                )),
-                Line::from(Span::styled(
-                    "Press A to browse every supported provider and add one.",
-                    Style::default().fg(palette::TEXT_MUTED),
-                )),
-            ])
+            EmptyState::new(
+                "No providers configured yet",
+                "Browse every supported provider or create a custom endpoint.",
+            )
+            .primary_action("A", "browse all")
+            .secondary_action("C", "custom")
             .render(content, buf);
             return;
         }
 
+        let layout = ListDetailLayout::split(content, 34);
         let selected_pos = filtered
             .iter()
             .position(|(idx, _)| *idx == self.selected_idx)
             .unwrap_or(0);
-        let visible_rows = usize::from(content.height);
+        let visible_rows = usize::from(layout.list.height);
         let visible_start = Self::visible_start(selected_pos, filtered.len(), visible_rows);
         let mut lines: Vec<Line> = Vec::with_capacity(visible_rows);
         for (pos, (idx, row)) in filtered
@@ -1379,7 +1490,7 @@ impl ProviderPickerView {
             ]);
             if is_selected {
                 line.style = Self::selected_row_bg_style();
-                let target_width = usize::from(content.width);
+                let target_width = usize::from(layout.list.width);
                 let line_width = line.width();
                 if line_width < target_width {
                     line.spans.push(Span::styled(
@@ -1390,7 +1501,91 @@ impl ProviderPickerView {
             }
             lines.push(line);
         }
-        Paragraph::new(lines).render(content, buf);
+        Paragraph::new(lines).render(layout.list, buf);
+        self.render_provider_detail(layout.detail, buf, &self.rows[self.selected_idx]);
+    }
+
+    fn render_provider_detail(&self, area: Rect, buf: &mut Buffer, row: &ProviderDashboardRow) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        let block = Block::default()
+            .title(Line::from(Span::styled(
+                " Details ",
+                Style::default()
+                    .fg(palette::TEXT_PRIMARY)
+                    .add_modifier(Modifier::BOLD),
+            )))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(palette::BORDER_COLOR))
+            .style(Style::default());
+        let inner = block.inner(area);
+        block.render(area, buf);
+
+        let route = if row.default_route.logical_model == row.default_route.wire_model {
+            row.default_route.logical_model.clone()
+        } else {
+            format!(
+                "{} -> {}",
+                row.default_route.logical_model, row.default_route.wire_model
+            )
+        };
+        let mut lines = vec![
+            Line::from(Span::styled(
+                row.display_name.clone(),
+                Style::default()
+                    .fg(palette::TEXT_PRIMARY)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                format!(
+                    "{} | {} | {}",
+                    row.readiness.label(),
+                    row.auth_status.label(),
+                    row.catalog_label()
+                ),
+                Style::default().fg(palette::TEXT_MUTED),
+            )),
+            Line::from(Span::styled(
+                format!("Route: {route}"),
+                Style::default().fg(palette::TEXT_PRIMARY),
+            )),
+            Line::from(Span::styled(
+                format!("Endpoint: {}", row.base_url),
+                Style::default().fg(palette::TEXT_MUTED),
+            )),
+            Line::from(Span::styled(
+                format!(
+                    "Protocol: {} | Usage: {}",
+                    row.supported_protocols.join("+"),
+                    row.usage_meter
+                ),
+                Style::default().fg(palette::TEXT_MUTED),
+            )),
+            Line::from(Span::styled(
+                format!("Capabilities: {}", row.capabilities.label()),
+                Style::default().fg(palette::TEXT_MUTED),
+            )),
+            Line::from(Span::styled(
+                format!("Reasoning: {}", row.reasoning.label()),
+                Style::default().fg(palette::TEXT_MUTED),
+            )),
+        ];
+        if let Some(concurrency) = row.request_concurrency.label() {
+            lines.push(Line::from(Span::styled(
+                concurrency,
+                Style::default().fg(palette::TEXT_MUTED),
+            )));
+        }
+        for message in row.messages.iter().take(2) {
+            lines.push(Line::from(Span::styled(
+                format!("Note: {message}"),
+                Style::default().fg(palette::STATUS_WARNING),
+            )));
+        }
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: true })
+            .render(inner, buf);
     }
 
     fn render_key_entry(&self, area: Rect, buf: &mut Buffer) {
@@ -1455,6 +1650,113 @@ impl ProviderPickerView {
         )))
         .render(layout[1], buf);
     }
+
+    fn render_custom_form(&self, area: Rect, buf: &mut Buffer) {
+        let outer = Block::default()
+            .title(Line::from(Span::styled(
+                " Custom provider ",
+                Style::default()
+                    .fg(palette::DEEPSEEK_SKY)
+                    .add_modifier(Modifier::BOLD),
+            )))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(palette::BORDER_COLOR))
+            .style(Style::default().bg(palette::DEEPSEEK_INK));
+        let inner = outer.inner(area);
+        outer.render(area, buf);
+
+        let content = render_modal_footer(
+            inner,
+            buf,
+            &[
+                ActionHint::new("Tab/↑↓", "field"),
+                ActionHint::new("Enter", "next/save"),
+                ActionHint::new("Esc", "back"),
+            ],
+        );
+        let layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Min(0),
+            ])
+            .split(content);
+
+        Paragraph::new(Line::from(Span::styled(
+            "OpenAI-compatible endpoint. Store an env var name here, not a raw key.",
+            Style::default().fg(palette::TEXT_MUTED),
+        )))
+        .render(layout[0], buf);
+
+        self.render_custom_form_field(layout[1], buf, CustomProviderField::Name, "Name", "acme_ai");
+        self.render_custom_form_field(
+            layout[2],
+            buf,
+            CustomProviderField::BaseUrl,
+            "Base URL",
+            "https://api.example.com/v1",
+        );
+        self.render_custom_form_field(
+            layout[3],
+            buf,
+            CustomProviderField::Model,
+            "Default model",
+            "optional",
+        );
+        self.render_custom_form_field(
+            layout[4],
+            buf,
+            CustomProviderField::ApiKeyEnv,
+            "API key env",
+            "optional",
+        );
+    }
+
+    fn render_custom_form_field(
+        &self,
+        area: Rect,
+        buf: &mut Buffer,
+        field: CustomProviderField,
+        label: &str,
+        placeholder: &str,
+    ) {
+        let selected = self.custom_provider_field == field;
+        let marker = if selected { "▸" } else { " " };
+        let value = self.custom_form_field_value(field);
+        let display = if value.is_empty() { placeholder } else { value };
+        let value_style = if selected {
+            Self::selected_row_style(palette::TEXT_PRIMARY)
+        } else if value.is_empty() {
+            Style::default().fg(palette::TEXT_MUTED)
+        } else {
+            Style::default().fg(palette::TEXT_PRIMARY)
+        };
+        let label_style = if selected {
+            Self::selected_row_style(palette::DEEPSEEK_SKY)
+        } else {
+            Style::default().fg(palette::TEXT_MUTED)
+        };
+        let mut line = Line::from(vec![
+            Span::styled(marker, label_style),
+            Span::styled(" ", label_style),
+            Span::styled(format!("{label}: "), label_style),
+            Span::styled(
+                crate::tui::ui_text::truncate_line_to_width(
+                    display,
+                    usize::from(area.width).saturating_sub(18),
+                ),
+                value_style,
+            ),
+        ]);
+        if selected {
+            line.style = Self::selected_row_bg_style();
+        }
+        Paragraph::new(line).render(area, buf);
+    }
 }
 
 fn mask_key(input: &str) -> String {
@@ -1487,14 +1789,20 @@ impl ModalView for ProviderPickerView {
     }
 
     fn handle_paste(&mut self, text: &str) -> bool {
-        if self.stage == Stage::KeyEntry {
-            let sanitized: String = text.chars().filter(|c| !c.is_whitespace()).collect();
-            if !sanitized.is_empty() {
-                self.api_key_input.push_str(&sanitized);
+        match self.stage {
+            Stage::KeyEntry => {
+                let sanitized: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+                if !sanitized.is_empty() {
+                    self.api_key_input.push_str(&sanitized);
+                }
+                true
             }
-            true
-        } else {
-            false
+            Stage::CustomForm => {
+                let sanitized = text.replace(['\r', '\n', '\t'], " ");
+                self.custom_form_field_mut().push_str(sanitized.trim());
+                true
+            }
+            Stage::List => false,
         }
     }
 
@@ -1516,8 +1824,12 @@ impl ModalView for ProviderPickerView {
                 // `selected_idx` doesn't point at anything on screen.
                 KeyCode::Enter if self.row_visible(self.selected_idx) => {
                     let provider = self.selected_provider();
+                    let provider_id = self.selected_provider_id();
                     if self.selected_has_key() {
-                        ViewAction::EmitAndClose(ViewEvent::ProviderPickerApplied { provider })
+                        ViewAction::EmitAndClose(ViewEvent::ProviderPickerApplied {
+                            provider,
+                            provider_id,
+                        })
                     } else if provider == ApiProvider::Moonshot && kimi_cli_credentials_present() {
                         ViewAction::EmitAndClose(ViewEvent::ProviderPickerKimiOAuthEnabled {
                             provider,
@@ -1543,6 +1855,10 @@ impl ModalView for ProviderPickerView {
                     self.toggle_view();
                     ViewAction::None
                 }
+                KeyCode::Char(c) if key.modifiers.is_empty() && c.eq_ignore_ascii_case(&'c') => {
+                    self.enter_custom_form();
+                    ViewAction::None
+                }
                 // Jump to the `/model` picker pre-filtered to this provider
                 // (#3083). Handled before the type-ahead arm so `m`/`M` opens
                 // models instead of seeking a provider whose name starts with m.
@@ -1552,7 +1868,11 @@ impl ModalView for ProviderPickerView {
                         && self.row_visible(self.selected_idx) =>
                 {
                     let provider = self.selected_provider();
-                    ViewAction::EmitAndClose(ViewEvent::ProviderPickerOpenModels { provider })
+                    let provider_id = self.selected_provider_id();
+                    ViewAction::EmitAndClose(ViewEvent::ProviderPickerOpenModels {
+                        provider,
+                        provider_id,
+                    })
                 }
                 // Type-ahead: any other letter jumps to the next provider whose
                 // name starts with it (e.g. `z` -> "Z.ai").
@@ -1583,8 +1903,10 @@ impl ModalView for ProviderPickerView {
                         ViewAction::None
                     } else {
                         let provider = self.selected_provider();
+                        let provider_id = self.selected_provider_id();
                         ViewAction::EmitAndClose(ViewEvent::ProviderPickerApiKeySubmitted {
                             provider,
+                            provider_id,
                             api_key: key,
                         })
                     }
@@ -1596,6 +1918,45 @@ impl ModalView for ProviderPickerView {
                     if !c.is_whitespace() {
                         self.api_key_input.push(c);
                     }
+                    ViewAction::None
+                }
+                _ => ViewAction::None,
+            },
+            Stage::CustomForm => match key.code {
+                KeyCode::Esc => {
+                    self.stage = Stage::List;
+                    ViewAction::None
+                }
+                KeyCode::Tab | KeyCode::Down => {
+                    self.advance_custom_field();
+                    ViewAction::None
+                }
+                KeyCode::BackTab | KeyCode::Up => {
+                    self.retreat_custom_field();
+                    ViewAction::None
+                }
+                KeyCode::Backspace => {
+                    self.custom_form_field_mut().pop();
+                    ViewAction::None
+                }
+                KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.custom_form_field_mut().pop();
+                    ViewAction::None
+                }
+                KeyCode::Enter if self.custom_provider_field != CustomProviderField::ApiKeyEnv => {
+                    self.advance_custom_field();
+                    ViewAction::None
+                }
+                KeyCode::Enter => self
+                    .build_custom_provider_event()
+                    .map(ViewAction::EmitAndClose)
+                    .unwrap_or(ViewAction::None),
+                KeyCode::Char(c)
+                    if !key
+                        .modifiers
+                        .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                {
+                    self.custom_form_field_mut().push(c);
                     ViewAction::None
                 }
                 _ => ViewAction::None,
@@ -1618,6 +1979,7 @@ impl ModalView for ProviderPickerView {
         let preferred_height = match self.stage {
             Stage::List => (self.rows.len() as u16).saturating_add(2),
             Stage::KeyEntry => 10,
+            Stage::CustomForm => 12,
         };
         let popup_area = centered_modal_area(area, 120, preferred_height, 64, 8);
 
@@ -1626,8 +1988,14 @@ impl ModalView for ProviderPickerView {
         match self.stage {
             Stage::List => self.render_list(popup_area, buf),
             Stage::KeyEntry => self.render_key_entry(popup_area, buf),
+            Stage::CustomForm => self.render_custom_form(popup_area, buf),
         }
     }
+}
+
+fn non_empty_string(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 fn custom_provider_dashboard_rows(
@@ -2360,6 +2728,121 @@ mod tests {
     }
 
     #[test]
+    fn custom_provider_form_emits_named_provider_without_secret_value() {
+        let config = Config::default();
+        let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
+
+        assert!(matches!(
+            picker.handle_key(key(KeyCode::Char('c'))),
+            ViewAction::None
+        ));
+        assert_eq!(picker.stage, Stage::CustomForm);
+        for ch in "acme_ai".chars() {
+            picker.handle_key(key(KeyCode::Char(ch)));
+        }
+        picker.handle_key(key(KeyCode::Enter));
+        for ch in "https://api.acme.example/v1".chars() {
+            picker.handle_key(key(KeyCode::Char(ch)));
+        }
+        picker.handle_key(key(KeyCode::Enter));
+        for ch in "acme/code-1".chars() {
+            picker.handle_key(key(KeyCode::Char(ch)));
+        }
+        picker.handle_key(key(KeyCode::Enter));
+        for ch in "ACME_API_KEY".chars() {
+            picker.handle_key(key(KeyCode::Char(ch)));
+        }
+
+        let action = picker.handle_key(key(KeyCode::Enter));
+        match action {
+            ViewAction::EmitAndClose(ViewEvent::ProviderPickerCustomProviderSubmitted {
+                provider_id,
+                base_url,
+                model,
+                api_key_env,
+            }) => {
+                assert_eq!(provider_id, "acme_ai");
+                assert_eq!(base_url, "https://api.acme.example/v1");
+                assert_eq!(model.as_deref(), Some("acme/code-1"));
+                assert_eq!(api_key_env.as_deref(), Some("ACME_API_KEY"));
+            }
+            other => panic!("expected custom provider submit event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn named_custom_provider_selection_preserves_provider_id() {
+        let mut custom = std::collections::HashMap::new();
+        custom.insert(
+            "local_acme".to_string(),
+            crate::config::ProviderConfig {
+                kind: Some("openai-compatible".to_string()),
+                base_url: Some("http://localhost:9000/v1".to_string()),
+                model: Some("acme/code-1".to_string()),
+                ..Default::default()
+            },
+        );
+        let config = Config {
+            provider: Some("local_acme".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                custom,
+                ..Default::default()
+            }),
+            ..Config::default()
+        };
+        let mut picker = ProviderPickerView::new(ApiProvider::Custom, &config);
+
+        let action = picker.handle_key(key(KeyCode::Enter));
+
+        match action {
+            ViewAction::EmitAndClose(ViewEvent::ProviderPickerApplied {
+                provider,
+                provider_id,
+            }) => {
+                assert_eq!(provider, ApiProvider::Custom);
+                assert_eq!(provider_id.as_deref(), Some("local_acme"));
+            }
+            other => panic!("expected named custom provider apply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn named_custom_provider_model_shortcut_preserves_provider_id() {
+        let mut custom = std::collections::HashMap::new();
+        custom.insert(
+            "local_acme".to_string(),
+            crate::config::ProviderConfig {
+                kind: Some("openai-compatible".to_string()),
+                base_url: Some("http://localhost:9000/v1".to_string()),
+                model: Some("acme/code-1".to_string()),
+                ..Default::default()
+            },
+        );
+        let config = Config {
+            provider: Some("local_acme".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                custom,
+                ..Default::default()
+            }),
+            ..Config::default()
+        };
+        let mut picker = ProviderPickerView::new(ApiProvider::Custom, &config);
+
+        let action = picker.handle_key(key(KeyCode::Char('m')));
+
+        match action {
+            ViewAction::EmitAndClose(ViewEvent::ProviderPickerOpenModels {
+                provider,
+                provider_id,
+            }) => {
+                assert_eq!(provider, ApiProvider::Custom);
+                assert_eq!(provider_id.as_deref(), Some("local_acme"));
+            }
+            other => panic!("expected named custom provider model shortcut, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn provider_dashboard_row_surfaces_anthropic_wire_protocol() {
         let config = Config::default();
         let row = ProviderDashboardRow::from_config(
@@ -2478,10 +2961,10 @@ mod tests {
 
         assert!(rendered.contains("key:configured"));
         assert!(!rendered.contains("auth:configured"));
-        assert!(rendered.contains("route:custom-model"));
+        assert!(rendered.contains("Route: custom-model"));
         assert!(rendered.contains("chat"));
         assert!(rendered.contains("cost: unknown"));
-        assert!(rendered.contains("localhost:9000/v1"));
+        assert!(rendered.contains("Endpoint: http://localhost:9000/v1"));
     }
 
     #[test]
@@ -2493,8 +2976,12 @@ mod tests {
         assert!(picker.selected_has_key());
         let action = picker.handle_key(key(KeyCode::Enter));
         match action {
-            ViewAction::EmitAndClose(ViewEvent::ProviderPickerApplied { provider }) => {
+            ViewAction::EmitAndClose(ViewEvent::ProviderPickerApplied {
+                provider,
+                provider_id,
+            }) => {
                 assert_eq!(provider, ApiProvider::Ollama);
+                assert_eq!(provider_id, None);
             }
             other => panic!("expected ProviderPickerApplied, got {other:?}"),
         }
@@ -2511,8 +2998,12 @@ mod tests {
         // #3083: `m` jumps to the model picker scoped to the highlighted
         // provider rather than acting as a type-ahead seek.
         match action {
-            ViewAction::EmitAndClose(ViewEvent::ProviderPickerOpenModels { provider }) => {
+            ViewAction::EmitAndClose(ViewEvent::ProviderPickerOpenModels {
+                provider,
+                provider_id,
+            }) => {
                 assert_eq!(provider, ApiProvider::Openrouter);
+                assert_eq!(provider_id, None);
             }
             other => panic!("expected ProviderPickerOpenModels, got {other:?}"),
         }
@@ -2527,8 +3018,12 @@ mod tests {
         let action = picker.handle_key(key(KeyCode::Char('M')));
 
         match action {
-            ViewAction::EmitAndClose(ViewEvent::ProviderPickerOpenModels { provider }) => {
+            ViewAction::EmitAndClose(ViewEvent::ProviderPickerOpenModels {
+                provider,
+                provider_id,
+            }) => {
                 assert_eq!(provider, ApiProvider::Deepseek);
+                assert_eq!(provider_id, None);
             }
             other => panic!("expected ProviderPickerOpenModels, got {other:?}"),
         }
@@ -2584,11 +3079,31 @@ mod tests {
         move_to_provider(&mut picker, ApiProvider::Deepseek);
         let action = picker.handle_key(key(KeyCode::Enter));
         match action {
-            ViewAction::EmitAndClose(ViewEvent::ProviderPickerApplied { provider }) => {
+            ViewAction::EmitAndClose(ViewEvent::ProviderPickerApplied {
+                provider,
+                provider_id,
+            }) => {
                 assert_eq!(provider, ApiProvider::Deepseek);
+                assert_eq!(provider_id, None);
             }
             other => panic!("expected ProviderPickerApplied, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn new_for_missing_auth_opens_key_entry_focused_on_target() {
+        // #3830: the missing-auth handoff drops the user onto the target
+        // provider's key prompt, not a dead-end error.
+        let config = Config::default();
+        let picker = ProviderPickerView::new_for_missing_auth(
+            ApiProvider::Deepseek,
+            ApiProvider::Anthropic,
+            &config,
+            None,
+        )
+        .expect("Anthropic has a picker row");
+        assert_eq!(picker.stage, Stage::KeyEntry);
+        assert_eq!(picker.selected_provider(), ApiProvider::Anthropic);
     }
 
     #[test]
@@ -2654,9 +3169,11 @@ mod tests {
         match action {
             ViewAction::EmitAndClose(ViewEvent::ProviderPickerApiKeySubmitted {
                 provider,
+                provider_id,
                 api_key,
             }) => {
                 assert_eq!(provider, ApiProvider::Novita);
+                assert_eq!(provider_id, None);
                 assert_eq!(api_key, "novita-key");
             }
             other => panic!("expected ProviderPickerApiKeySubmitted, got {other:?}"),
@@ -2721,7 +3238,7 @@ mod tests {
     }
 
     #[test]
-    fn tall_list_render_shows_all_providers_without_scrolling() {
+    fn tall_catalog_render_shows_selected_provider_details() {
         let config = Config::default();
         let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
         // "All providers" means the full catalog (#3830), not just configured.
@@ -2730,7 +3247,8 @@ mod tests {
         let rendered = render_text(&picker, 80, 23);
 
         assert!(rendered.contains("DeepSeek *"));
-        assert!(rendered.contains("Ollama"));
+        assert!(rendered.contains("Details"));
+        assert!(rendered.contains("Route:"));
     }
 
     /// The four terminal sizes the v0.8.66 modal blocker (#3732) requires every

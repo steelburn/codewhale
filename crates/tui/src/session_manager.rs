@@ -489,11 +489,21 @@ impl SessionManager {
 
     /// Clean up old sessions to stay within `MAX_SESSIONS` limit.
     pub fn cleanup_old_sessions(&self) -> std::io::Result<()> {
+        self.cleanup_old_sessions_keeping(None)
+    }
+
+    /// As [`Self::cleanup_old_sessions`], but never deletes `keep` — the
+    /// session being resumed at boot. Without this, a background cleanup that
+    /// races session restore can prune the just-resumed session when 50+
+    /// newer records exist (its `updated_at` is not bumped until first save).
+    pub fn cleanup_old_sessions_keeping(&self, keep: Option<&str>) -> std::io::Result<()> {
         let sessions = self.list_sessions()?;
 
         if sessions.len() > MAX_SESSIONS {
-            // Delete oldest sessions
             for session in sessions.iter().skip(MAX_SESSIONS) {
+                if keep.is_some_and(|id| id == session.id) {
+                    continue;
+                }
                 let _ = self.delete_session(&session.id);
             }
         }
@@ -521,11 +531,26 @@ impl SessionManager {
         &self,
         max_age: std::time::Duration,
     ) -> std::io::Result<usize> {
+        self.prune_sessions_older_than_keeping(max_age, None)
+    }
+
+    /// As [`Self::prune_sessions_older_than`], but never deletes `keep` — the
+    /// active session. A just-resumed session's `updated_at` is stale until
+    /// its first post-resume save, so an age prune could otherwise delete the
+    /// live session out from under the TUI.
+    pub fn prune_sessions_older_than_keeping(
+        &self,
+        max_age: std::time::Duration,
+        keep: Option<&str>,
+    ) -> std::io::Result<usize> {
         let cutoff = Utc::now()
             - chrono::Duration::from_std(max_age).unwrap_or(chrono::Duration::days(365 * 10));
         let sessions = self.list_sessions()?;
         let mut pruned = 0usize;
         for session in sessions {
+            if keep.is_some_and(|id| id == session.id) {
+                continue;
+            }
             if session.updated_at < cutoff {
                 if let Err(err) = self.delete_session(&session.id) {
                     tracing::warn!(

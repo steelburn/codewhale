@@ -269,6 +269,63 @@ pub fn sync_api_key_validation_status(app: &mut App, show_empty_error: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
+    use crate::localization::Locale;
+    use crate::tui::app::{App, TuiOptions};
+    use std::path::PathBuf;
+
+    fn test_app_with_locale(locale: Locale) -> App {
+        let options = TuiOptions {
+            model: "deepseek-v4-pro".to_string(),
+            workspace: PathBuf::from("."),
+            config_path: None,
+            config_profile: None,
+            allow_shell: false,
+            use_alt_screen: true,
+            use_mouse_capture: false,
+            use_bracketed_paste: true,
+            max_subagents: 1,
+            skills_dir: PathBuf::from("."),
+            memory_path: PathBuf::from("memory.md"),
+            notes_path: PathBuf::from("notes.txt"),
+            mcp_config_path: PathBuf::from("mcp.json"),
+            use_memory: false,
+            start_in_agent_mode: false,
+            skip_onboarding: true,
+            yolo: false,
+            resume_session_id: None,
+            initial_input: None,
+        };
+        let mut app = App::new(options, &Config::default());
+        app.ui_locale = locale;
+        app
+    }
+
+    fn flattened(lines: Vec<ratatui::text::Line<'static>>) -> String {
+        lines
+            .into_iter()
+            .flat_map(|line| {
+                line.spans
+                    .into_iter()
+                    .map(|span| span.content.to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn tips_copy_points_to_setup_and_constitution() {
+        let app = test_app_with_locale(Locale::En);
+        let body = flattened(tips_lines(&app));
+
+        assert!(body.contains("/setup"));
+        assert!(body.contains("/constitution"));
+        assert!(body.contains("/provider"));
+        assert!(body.contains("/model"));
+        assert!(body.contains("continue to setup"));
+        assert!(!body.contains("open the workspace"));
+    }
 
     #[test]
     fn fresh_install_marker_path_uses_codewhale_not_legacy() {

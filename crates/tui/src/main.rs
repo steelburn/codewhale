@@ -70,12 +70,12 @@ mod prefix_cache;
 mod pricing;
 mod project_context;
 mod project_context_cache;
-mod project_doc;
 mod prompt_zones;
 mod prompts;
 mod purge;
 mod remote_setup;
 pub mod repl;
+mod repo_law;
 mod request_tuning;
 mod resource_telemetry;
 mod retry_status;
@@ -98,6 +98,7 @@ mod skill_state;
 mod skills;
 mod slop_ledger;
 mod snapshot;
+mod startup_trace;
 mod task_manager;
 #[cfg(test)]
 mod test_support;
@@ -267,7 +268,7 @@ enum Commands {
     Fleet(FleetArgs),
     /// Run a code review over a git diff
     Review(ReviewArgs),
-    /// Open the TUI pre-seeded with a GitHub PR's title, body, and diff (#451)
+    /// Open the TUI pre-seeded with a GitHub PR's title, body, and diff
     Pr {
         /// PR number
         #[arg(value_name = "NUMBER")]
@@ -286,7 +287,7 @@ enum Commands {
     Apply(ApplyArgs),
     /// Run the offline evaluation harness (no network/LLM calls)
     Eval(EvalArgs),
-    /// Score a run's token/cache/cost from recorded turns; flag regressions vs a baseline (#3388)
+    /// Score a run's token/cache/cost from recorded turns; flag regressions vs a baseline
     Scorecard(ScorecardArgs),
     /// Manage MCP servers
     Mcp {
@@ -1116,6 +1117,7 @@ enum SandboxCommand {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    startup_trace::mark_process_start();
     configure_windows_console_utf8();
     install_rustls_crypto_provider();
 
@@ -2275,7 +2277,7 @@ fn run_setup(config: &Config, workspace: &Path, args: SetupArgs) -> Result<()> {
 
     println!(
         "{}",
-        "DeepSeek Setup".truecolor(aqua_r, aqua_g, aqua_b).bold()
+        "CodeWhale Setup".truecolor(aqua_r, aqua_g, aqua_b).bold()
     );
     println!("{}", "==============".truecolor(sky_r, sky_g, sky_b));
     println!("Workspace: {}", crate::utils::display_path(workspace));
@@ -2487,7 +2489,7 @@ fn run_setup_status(config: &Config, workspace: &Path) -> Result<()> {
 
     println!(
         "{}",
-        "DeepSeek Status".truecolor(aqua_r, aqua_g, aqua_b).bold()
+        "CodeWhale Status".truecolor(aqua_r, aqua_g, aqua_b).bold()
     );
     println!("{}", "===============".truecolor(sky_r, sky_g, sky_b));
     println!("workspace: {}", workspace.display());
@@ -2800,7 +2802,7 @@ async fn run_doctor(config: &Config, workspace: &Path, config_path_override: Opt
     println!("  active: {}", crate::utils::display_path(active_root));
     if active_root != &code_home {
         println!(
-            "  note: legacy {} found; migrate with `codewhale setup --migrate`",
+            "  note: legacy {} found; start CodeWhale once to trigger safe migration where available.",
             crate::utils::display_path(&legacy_home)
         );
     }
@@ -2814,6 +2816,16 @@ async fn run_doctor(config: &Config, workspace: &Path, config_path_override: Opt
     let legacy_state_report = doctor_legacy_state_report(&code_home, &legacy_home);
     print_doctor_legacy_state_report(
         &legacy_state_report,
+        (aqua_r, aqua_g, aqua_b),
+        (sky_r, sky_g, sky_b),
+    );
+
+    let (setup_state, setup_source) = doctor_setup_state(config, workspace);
+    print_doctor_setup_report(
+        config,
+        workspace,
+        &setup_state,
+        setup_source,
         (aqua_r, aqua_g, aqua_b),
         (sky_r, sky_g, sky_b),
     );
@@ -3698,7 +3710,7 @@ fn print_doctor_legacy_state_report(
         }
     }
     println!(
-        "    Run `codewhale setup --migrate` or start CodeWhale once to trigger safe migration where available."
+        "    Start CodeWhale once to trigger safe migration where available, then rerun `codewhale doctor`."
     );
 }
 
@@ -3739,6 +3751,445 @@ fn doctor_legacy_state_json(
         "dual_present_count": both,
         "entries": entries,
     })
+}
+
+fn doctor_setup_state(
+    config: &Config,
+    workspace: &Path,
+) -> (codewhale_config::SetupState, &'static str) {
+    if let Ok(Some(state)) = codewhale_config::SetupState::load() {
+        return (state, "persisted");
+    }
+
+    (
+        codewhale_config::SetupState::derive_inherited(&doctor_inherited_setup_facts(
+            config, workspace,
+        )),
+        "derived",
+    )
+}
+
+fn doctor_inherited_setup_facts(
+    config: &Config,
+    workspace: &Path,
+) -> codewhale_config::InheritedConfigFacts {
+    let user_constitution = codewhale_config::UserConstitution::load().ok();
+    let user_constitution_validity = user_constitution.as_ref().map_or(
+        codewhale_config::ConstitutionValidity::Unknown,
+        codewhale_config::UserConstitutionLoad::validity,
+    );
+    let has_user_constitution = user_constitution
+        .as_ref()
+        .is_some_and(|loaded| !matches!(loaded, codewhale_config::UserConstitutionLoad::Missing));
+    let has_expert_override = codewhale_config::codewhale_home()
+        .ok()
+        .map(|home| home.join(Path::new(crate::prompts::CONSTITUTION_OVERRIDE_FILE)))
+        .is_some_and(|path| path.exists());
+
+    codewhale_config::InheritedConfigFacts {
+        language: None,
+        has_provider_route: !config.default_model().trim().is_empty(),
+        has_credentials_or_local_runtime: doctor_has_credentials_or_local_runtime(config),
+        trust_chosen: !crate::tui::onboarding::needs_trust(workspace),
+        has_expert_override,
+        has_user_constitution,
+        user_constitution_validity,
+    }
+}
+
+fn doctor_has_credentials_or_local_runtime(config: &Config) -> bool {
+    if resolve_api_key_source(config) != ApiKeySource::Missing {
+        return true;
+    }
+
+    matches!(
+        config.api_provider(),
+        crate::config::ApiProvider::Sglang
+            | crate::config::ApiProvider::Vllm
+            | crate::config::ApiProvider::Ollama
+    )
+}
+
+fn print_doctor_setup_report(
+    config: &Config,
+    workspace: &Path,
+    state: &codewhale_config::SetupState,
+    source: &str,
+    ok_rgb: (u8, u8, u8),
+    warn_rgb: (u8, u8, u8),
+) {
+    use colored::Colorize;
+
+    let first_run_ready = state.first_run_ready();
+    let update_ready = state.update_ready(crate::tui::setup::CONSTITUTION_CHECKPOINT_VERSION);
+    let first_run_icon = if first_run_ready {
+        "✓".truecolor(ok_rgb.0, ok_rgb.1, ok_rgb.2)
+    } else {
+        "!".truecolor(warn_rgb.0, warn_rgb.1, warn_rgb.2)
+    };
+    let update_icon = if update_ready {
+        "✓".truecolor(ok_rgb.0, ok_rgb.1, ok_rgb.2)
+    } else {
+        "!".truecolor(warn_rgb.0, warn_rgb.1, warn_rgb.2)
+    };
+
+    println!();
+    println!("{}", "Setup State:".bold());
+    println!("  · source: {source}");
+    println!(
+        "  {first_run_icon} first-run: {}",
+        doctor_ready_label(first_run_ready)
+    );
+    println!(
+        "  {update_icon} update checkpoint {}: {}",
+        crate::tui::setup::CONSTITUTION_CHECKPOINT_VERSION,
+        doctor_ready_label(update_ready)
+    );
+    println!(
+        "  · constitution autonomy: {} (guidance only)",
+        doctor_constitution_autonomy_preference_id()
+    );
+    println!(
+        "  · runtime posture: {}",
+        doctor_runtime_posture_line(config, workspace)
+    );
+    let consistency = doctor_setup_consistency(state, source);
+    if consistency["status"] == "inconsistent" {
+        let issues = consistency["issues"]
+            .as_array()
+            .map(|issues| {
+                issues
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        println!(
+            "  {} consistency: half-applied setup detected ({issues}) — {}",
+            "!".truecolor(warn_rgb.0, warn_rgb.1, warn_rgb.2),
+            consistency["repair"].as_str().unwrap_or("/setup"),
+        );
+    }
+    println!(
+        "  · next actions: /constitution (standing law), /setup report (readiness), /provider or /model (route), /config (runtime posture)"
+    );
+    for step in codewhale_config::SetupStep::ALL {
+        let entry = state.steps.get(&step);
+        let required = entry.is_some_and(|entry| entry.required);
+        let version = entry.and_then(|entry| entry.version.as_deref());
+        let result = entry.and_then(|entry| entry.result.as_deref());
+        let required_label = if required { "required" } else { "optional" };
+        let version_label = version.unwrap_or("unversioned");
+        let result_label = result.unwrap_or("no result");
+        println!(
+            "    · {}: {} ({required_label}, {version_label}, {result_label})",
+            setup_step_id(step),
+            setup_status_id(state.status(step))
+        );
+    }
+}
+
+fn doctor_ready_label(ready: bool) -> &'static str {
+    if ready { "ready" } else { "needs action" }
+}
+
+/// Detect half-applied setup persistence (#3410).
+///
+/// The setup transaction writes `constitution.json` and `setup_state.json`
+/// together, so a persisted state that points at a user-global constitution
+/// which is missing or unusable on disk means a write was interrupted or a
+/// file was removed out-of-band. Stale `.tmp*` files in `$CODEWHALE_HOME`
+/// are the other fingerprint of an interrupted atomic write.
+fn doctor_setup_consistency(
+    state: &codewhale_config::SetupState,
+    source: &str,
+) -> serde_json::Value {
+    use serde_json::json;
+
+    let mut issues: Vec<&'static str> = Vec::new();
+
+    if source == "persisted"
+        && matches!(
+            state.constitution_source,
+            codewhale_config::ConstitutionSource::UserGlobal
+        )
+    {
+        match codewhale_config::UserConstitution::load() {
+            Ok(codewhale_config::UserConstitutionLoad::Missing) => {
+                issues.push("setup_state_points_at_missing_user_constitution");
+            }
+            Ok(codewhale_config::UserConstitutionLoad::Empty) => {
+                issues.push("user_constitution_empty");
+            }
+            Ok(codewhale_config::UserConstitutionLoad::Invalid(_)) => {
+                issues.push("user_constitution_invalid");
+            }
+            Ok(codewhale_config::UserConstitutionLoad::Unreadable(_)) | Err(_) => {
+                issues.push("user_constitution_unreadable");
+            }
+            Ok(codewhale_config::UserConstitutionLoad::Loaded(_)) => {}
+        }
+    }
+
+    if doctor_home_has_stale_setup_temp_files() {
+        issues.push("stale_setup_temp_files_in_codewhale_home");
+    }
+
+    json!({
+        "status": if issues.is_empty() { "consistent" } else { "inconsistent" },
+        "issues": issues,
+        "repair": "/constitution to rebuild standing law, /setup to re-run the checkpoint",
+    })
+}
+
+fn doctor_home_has_stale_setup_temp_files() -> bool {
+    let Ok(home) = codewhale_config::codewhale_home() else {
+        return false;
+    };
+    let Ok(entries) = std::fs::read_dir(&home) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        entry.file_name().to_string_lossy().starts_with(".tmp")
+            && entry.file_type().is_ok_and(|kind| kind.is_file())
+    })
+}
+
+fn doctor_constitution_autonomy_preference() -> codewhale_config::AutonomyPreference {
+    codewhale_config::UserConstitution::load()
+        .ok()
+        .and_then(|load| {
+            load.constitution()
+                .map(|constitution| constitution.autonomy_preference)
+        })
+        .unwrap_or(codewhale_config::AutonomyPreference::Unspecified)
+}
+
+fn doctor_constitution_autonomy_preference_id() -> &'static str {
+    autonomy_preference_id(doctor_constitution_autonomy_preference())
+}
+
+fn autonomy_preference_id(preference: codewhale_config::AutonomyPreference) -> &'static str {
+    match preference {
+        codewhale_config::AutonomyPreference::Unspecified => "unspecified",
+        codewhale_config::AutonomyPreference::Cautious => "cautious",
+        codewhale_config::AutonomyPreference::Balanced => "balanced",
+        codewhale_config::AutonomyPreference::Autonomous => "autonomous",
+    }
+}
+
+fn doctor_runtime_default_mode() -> (String, &'static str) {
+    match crate::settings::Settings::load() {
+        Ok(settings) => (settings.default_mode, "settings"),
+        Err(_) => (crate::settings::Settings::default().default_mode, "default"),
+    }
+}
+
+fn doctor_runtime_posture_line(config: &Config, workspace: &Path) -> String {
+    let (default_mode, default_mode_source) = doctor_runtime_default_mode();
+    let approval = config.approval_policy.as_deref().unwrap_or("on-request");
+    let approval_source = if config.approval_policy.is_some() {
+        "config"
+    } else {
+        "default"
+    };
+    let allow_shell = config.interactive_allow_shell();
+    let allow_shell_source = if config.allow_shell.is_some() {
+        "config"
+    } else {
+        "interactive default"
+    };
+    let sandbox = config.sandbox_mode.as_deref().unwrap_or("mode-derived");
+    let sandbox_source = if config.sandbox_mode.is_some() {
+        "config"
+    } else {
+        "default"
+    };
+    let network = config
+        .network
+        .as_ref()
+        .map_or("prompt", |policy| policy.default.as_str());
+    let network_source = if config.network.is_some() {
+        "config"
+    } else {
+        "default"
+    };
+    let trust = if crate::tui::onboarding::needs_trust(workspace) {
+        "workspace not elevated"
+    } else {
+        "workspace trusted"
+    };
+
+    format!(
+        "default_mode={default_mode} ({default_mode_source}), approval_policy={approval} ({approval_source}), allow_shell={allow_shell} ({allow_shell_source}), sandbox={sandbox} ({sandbox_source}), network.default={network} ({network_source}), trust={trust}"
+    )
+}
+
+fn doctor_setup_report_json(config: &Config, workspace: &Path) -> serde_json::Value {
+    use serde_json::json;
+
+    let (state, source) = doctor_setup_state(config, workspace);
+    let (default_mode, default_mode_source) = doctor_runtime_default_mode();
+    let approval_policy = config.approval_policy.as_deref().unwrap_or("on-request");
+    let approval_policy_source = if config.approval_policy.is_some() {
+        "config"
+    } else {
+        "default"
+    };
+    let allow_shell = config.interactive_allow_shell();
+    let allow_shell_source = if config.allow_shell.is_some() {
+        "config"
+    } else {
+        "interactive_default"
+    };
+    let sandbox_mode = config.sandbox_mode.as_deref().unwrap_or("mode-derived");
+    let sandbox_mode_source = if config.sandbox_mode.is_some() {
+        "config"
+    } else {
+        "default"
+    };
+    let network_default = config
+        .network
+        .as_ref()
+        .map_or("prompt", |policy| policy.default.as_str());
+    let network_source = if config.network.is_some() {
+        "config"
+    } else {
+        "default"
+    };
+    let workspace_trusted = !crate::tui::onboarding::needs_trust(workspace);
+    let steps: Vec<_> = codewhale_config::SetupStep::ALL
+        .into_iter()
+        .map(|step| {
+            let entry = state.steps.get(&step);
+            json!({
+                "step": setup_step_id(step),
+                "status": setup_status_id(state.status(step)),
+                "required": entry.is_some_and(|entry| entry.required),
+                "version": entry.and_then(|entry| entry.version.clone()),
+                "result": entry.and_then(|entry| entry.result.clone()),
+            })
+        })
+        .collect();
+
+    json!({
+        "source": source,
+        "schema_version": state.schema_version,
+        "inherited": state.inherited,
+        "checkpoint_version": crate::tui::setup::CONSTITUTION_CHECKPOINT_VERSION,
+        "first_run_ready": state.first_run_ready(),
+        "update_ready": state.update_ready(crate::tui::setup::CONSTITUTION_CHECKPOINT_VERSION),
+        "constitution": {
+            "choice": constitution_choice_id(state.constitution_choice),
+            "source": constitution_source_id(state.constitution_source),
+            "validity": constitution_validity_id(state.constitution_validity),
+            "checkpoint_completed_for": state.constitution_checkpoint_completed_for.clone(),
+            "language": state.constitution_language.clone(),
+            "preview_hash_present": state.constitution_preview_hash.is_some(),
+            "preview_version": state.constitution_preview_version,
+            "autonomy_preference": doctor_constitution_autonomy_preference_id(),
+        },
+        "runtime_posture_source": runtime_posture_source_id(state.runtime_posture_source),
+        "runtime_posture": {
+            "source": runtime_posture_source_id(state.runtime_posture_source),
+            "default_mode": {
+                "value": default_mode,
+                "source": default_mode_source,
+            },
+            "approval_policy": {
+                "value": approval_policy,
+                "source": approval_policy_source,
+            },
+            "allow_shell": {
+                "value": allow_shell,
+                "source": allow_shell_source,
+            },
+            "sandbox_mode": {
+                "value": sandbox_mode,
+                "source": sandbox_mode_source,
+            },
+            "network_default": {
+                "value": network_default,
+                "source": network_source,
+            },
+            "workspace_trust": {
+                "trusted": workspace_trusted,
+                "source": "workspace",
+            },
+        },
+        "consistency": doctor_setup_consistency(&state, source),
+        "next_actions": {
+            "constitution": "/constitution",
+            "setup_report": "/setup report",
+            "provider_model": "/provider or /model",
+            "runtime_posture": "/config",
+        },
+        "steps": steps,
+    })
+}
+
+fn setup_step_id(step: codewhale_config::SetupStep) -> &'static str {
+    match step {
+        codewhale_config::SetupStep::Language => "language",
+        codewhale_config::SetupStep::ProviderModel => "provider_model",
+        codewhale_config::SetupStep::TrustSandbox => "trust_sandbox",
+        codewhale_config::SetupStep::ToolsMcp => "tools_mcp",
+        codewhale_config::SetupStep::Hotbar => "hotbar",
+        codewhale_config::SetupStep::RemoteRuntime => "remote_runtime",
+        codewhale_config::SetupStep::Constitution => "constitution",
+        codewhale_config::SetupStep::Verification => "verification",
+    }
+}
+
+fn setup_status_id(status: codewhale_config::StepStatus) -> &'static str {
+    match status {
+        codewhale_config::StepStatus::NotStarted => "not_started",
+        codewhale_config::StepStatus::Recommended => "recommended",
+        codewhale_config::StepStatus::Optional => "optional",
+        codewhale_config::StepStatus::Deferred => "deferred",
+        codewhale_config::StepStatus::InProgress => "in_progress",
+        codewhale_config::StepStatus::Verified => "verified",
+        codewhale_config::StepStatus::NeedsAction => "needs_action",
+        codewhale_config::StepStatus::Failed => "failed",
+        codewhale_config::StepStatus::Skipped => "skipped",
+    }
+}
+
+fn constitution_choice_id(choice: codewhale_config::ConstitutionChoice) -> &'static str {
+    match choice {
+        codewhale_config::ConstitutionChoice::Unset => "unset",
+        codewhale_config::ConstitutionChoice::Bundled => "bundled",
+        codewhale_config::ConstitutionChoice::GuidedCustom => "guided_custom",
+        codewhale_config::ConstitutionChoice::ExpertOverride => "expert_override",
+        codewhale_config::ConstitutionChoice::Deferred => "deferred",
+    }
+}
+
+fn constitution_source_id(source: codewhale_config::ConstitutionSource) -> &'static str {
+    match source {
+        codewhale_config::ConstitutionSource::Bundled => "bundled",
+        codewhale_config::ConstitutionSource::UserGlobal => "user_global",
+        codewhale_config::ConstitutionSource::ExpertOverride => "expert_override",
+    }
+}
+
+fn constitution_validity_id(validity: codewhale_config::ConstitutionValidity) -> &'static str {
+    match validity {
+        codewhale_config::ConstitutionValidity::Unknown => "unknown",
+        codewhale_config::ConstitutionValidity::Valid => "valid",
+        codewhale_config::ConstitutionValidity::Invalid => "invalid",
+        codewhale_config::ConstitutionValidity::Empty => "empty",
+        codewhale_config::ConstitutionValidity::Unreadable => "unreadable",
+    }
+}
+
+fn runtime_posture_source_id(source: codewhale_config::RuntimePostureSource) -> &'static str {
+    match source {
+        codewhale_config::RuntimePostureSource::Unset => "unset",
+        codewhale_config::RuntimePostureSource::Inherited => "inherited",
+        codewhale_config::RuntimePostureSource::Confirmed => "confirmed",
+    }
 }
 
 /// Machine-readable counterpart to `run_doctor`. Skips the live API call so it
@@ -3892,6 +4343,7 @@ fn run_doctor_json(
         "config_present": config_path.exists(),
         "workspace": workspace.display().to_string(),
         "legacy_state": doctor_legacy_state_json(&code_home, &legacy_home, &legacy_state_report),
+        "setup": doctor_setup_report_json(config, workspace),
         "api_key": {
             "source": api_key_state,
         },
@@ -6498,37 +6950,48 @@ async fn run_interactive(
         logging::warn(format!("Failed to install system skills: {e}"));
     }
 
-    // Prune stale workspace snapshots from prior sessions (7-day default).
-    // Non-fatal: a flaky disk, missing `git`, or read-only home should
-    // never block the TUI from starting.
+    startup_trace::mark("interactive_config");
+
+    // Boot janitors — snapshot prune (7-day default), spillover prune
+    // (#422), and managed-session cleanup (v0.8.44) — are best-effort disk
+    // hygiene. On a large ~/.codewhale they were the dominant startup cost
+    // (a git object walk plus thousands of stat/read calls), so they run on
+    // a blocking worker while the TUI brings up its first frame (#3757).
+    // All three were already documented as non-fatal.
     let snapshots = config.snapshots_config();
-    if snapshots.enabled {
-        session_manager::prune_workspace_snapshots(&workspace, snapshots.max_age());
-    }
+    let janitor_snapshots_enabled = snapshots.enabled;
+    let janitor_max_age = snapshots.max_age();
+    let janitor_workspace = workspace.clone();
+    // Session cleanup races session restore: skip it entirely when a session
+    // is being resumed/continued this launch (the just-resumed session could
+    // be pruned before its first save bumps `updated_at`). It runs next
+    // clean launch. When we do run it, exclude the explicit resume id too.
+    let janitor_resume_id = resume_session_id.clone();
+    let janitor_skip_session_cleanup = resume_session_id.is_some() || cli.continue_session;
+    tokio::task::spawn_blocking(move || {
+        if janitor_snapshots_enabled {
+            session_manager::prune_workspace_snapshots(&janitor_workspace, janitor_max_age);
+        }
 
-    // Prune stale tool-output spillover files (#422). Non-fatal: home
-    // missing or directory unreadable just means nothing got pruned;
-    // we never block startup. Runs unconditionally because the
-    // spillover store is created lazily on first write — there's no
-    // user-facing setting to gate.
-    match crate::tools::truncate::prune_older_than(crate::tools::truncate::SPILLOVER_MAX_AGE) {
-        Ok(0) => {}
-        Ok(n) => tracing::debug!(
-            target: "spillover",
-            "boot prune removed {n} spillover file(s)"
-        ),
-        Err(err) => tracing::warn!(
-            target: "spillover",
-            ?err,
-            "spillover prune skipped on boot"
-        ),
-    }
+        match crate::tools::truncate::prune_older_than(crate::tools::truncate::SPILLOVER_MAX_AGE) {
+            Ok(0) => {}
+            Ok(n) => tracing::debug!(
+                target: "spillover",
+                "boot prune removed {n} spillover file(s)"
+            ),
+            Err(err) => tracing::warn!(
+                target: "spillover",
+                ?err,
+                "spillover prune skipped on boot"
+            ),
+        }
 
-    // v0.8.44: prune managed sessions on boot to prevent unbounded growth.
-    // Keeps at most MAX_SESSIONS (50) recent sessions; non-fatal on error.
-    if let Ok(manager) = session_manager::SessionManager::default_location() {
-        let _ = manager.cleanup_old_sessions();
-    }
+        if !janitor_skip_session_cleanup
+            && let Ok(manager) = session_manager::SessionManager::default_location()
+        {
+            let _ = manager.cleanup_old_sessions_keeping(janitor_resume_id.as_deref());
+        }
+    });
 
     // The `deepseek` launcher forwards `--yolo` to this binary via the
     // DEEPSEEK_YOLO env var (config.yolo), not as a CLI flag. Honour either.
@@ -7707,6 +8170,253 @@ mod doctor_legacy_state_tests {
         assert_eq!(json["needs_attention"], false);
         assert_eq!(json["legacy_only_count"], 0);
         assert_eq!(json["dual_present_count"], 0);
+    }
+}
+
+#[cfg(test)]
+mod doctor_setup_state_tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn prepare_env(tmp: &TempDir) -> (crate::test_support::EnvVarGuard, PathBuf) {
+        let codewhale_home = tmp.path().join(".codewhale");
+        fs::create_dir_all(&codewhale_home).expect("codewhale home");
+        (
+            crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", codewhale_home.as_os_str()),
+            codewhale_home,
+        )
+    }
+
+    fn provider_step(report: &serde_json::Value) -> &serde_json::Value {
+        report["steps"]
+            .as_array()
+            .expect("steps array")
+            .iter()
+            .find(|step| step["step"] == "provider_model")
+            .expect("provider/model step")
+    }
+
+    #[test]
+    fn doctor_setup_consistency_flags_missing_user_constitution() {
+        let _guard = crate::test_support::lock_test_env();
+        let tmp = TempDir::new().expect("tempdir");
+        let (_home_guard, _codewhale_home) = prepare_env(&tmp);
+        let _key = crate::test_support::EnvVarGuard::remove("DEEPSEEK_API_KEY");
+        let _source = crate::test_support::EnvVarGuard::remove("DEEPSEEK_API_KEY_SOURCE");
+        let workspace = tmp.path().join("workspace");
+        fs::create_dir_all(&workspace).expect("workspace");
+
+        let mut state = codewhale_config::SetupState::default();
+        state.constitution_source = codewhale_config::ConstitutionSource::UserGlobal;
+        state.save().expect("persist setup state");
+
+        let report = doctor_setup_report_json(&Config::default(), &workspace);
+
+        assert_eq!(report["source"], "persisted");
+        assert_eq!(report["consistency"]["status"], "inconsistent");
+        let issues = report["consistency"]["issues"].to_string();
+        assert!(
+            issues.contains("setup_state_points_at_missing_user_constitution"),
+            "{issues}"
+        );
+    }
+
+    #[test]
+    fn doctor_setup_consistency_flags_stale_temp_files() {
+        let _guard = crate::test_support::lock_test_env();
+        let tmp = TempDir::new().expect("tempdir");
+        let (_home_guard, codewhale_home) = prepare_env(&tmp);
+        let _key = crate::test_support::EnvVarGuard::remove("DEEPSEEK_API_KEY");
+        let _source = crate::test_support::EnvVarGuard::remove("DEEPSEEK_API_KEY_SOURCE");
+        let workspace = tmp.path().join("workspace");
+        fs::create_dir_all(&workspace).expect("workspace");
+        fs::write(codewhale_home.join(".tmpAbC123"), b"orphaned atomic write")
+            .expect("stale temp file");
+
+        let report = doctor_setup_report_json(&Config::default(), &workspace);
+
+        assert_eq!(report["consistency"]["status"], "inconsistent");
+        let issues = report["consistency"]["issues"].to_string();
+        assert!(
+            issues.contains("stale_setup_temp_files_in_codewhale_home"),
+            "{issues}"
+        );
+    }
+
+    #[test]
+    fn doctor_setup_consistency_reports_consistent_for_clean_home() {
+        let _guard = crate::test_support::lock_test_env();
+        let tmp = TempDir::new().expect("tempdir");
+        let (_home_guard, _codewhale_home) = prepare_env(&tmp);
+        let _key = crate::test_support::EnvVarGuard::remove("DEEPSEEK_API_KEY");
+        let _source = crate::test_support::EnvVarGuard::remove("DEEPSEEK_API_KEY_SOURCE");
+        let workspace = tmp.path().join("workspace");
+        fs::create_dir_all(&workspace).expect("workspace");
+
+        let report = doctor_setup_report_json(&Config::default(), &workspace);
+
+        assert_eq!(report["consistency"]["status"], "consistent");
+        assert_eq!(
+            report["consistency"]["issues"]
+                .as_array()
+                .map(Vec::len)
+                .unwrap_or_default(),
+            0
+        );
+    }
+
+    #[test]
+    fn doctor_setup_report_json_derives_state_without_sidecar() {
+        let _guard = crate::test_support::lock_test_env();
+        let tmp = TempDir::new().expect("tempdir");
+        let (_home_guard, _codewhale_home) = prepare_env(&tmp);
+        let _key = crate::test_support::EnvVarGuard::remove("DEEPSEEK_API_KEY");
+        let _source = crate::test_support::EnvVarGuard::remove("DEEPSEEK_API_KEY_SOURCE");
+        let workspace = tmp.path().join("workspace");
+        fs::create_dir_all(&workspace).expect("workspace");
+
+        let report = doctor_setup_report_json(&Config::default(), &workspace);
+
+        assert_eq!(report["source"], "derived");
+        assert_eq!(report["inherited"], true);
+        assert_eq!(report["next_actions"]["constitution"], "/constitution");
+        assert_eq!(report["next_actions"]["setup_report"], "/setup report");
+        assert_eq!(
+            report["next_actions"]["provider_model"],
+            "/provider or /model"
+        );
+        assert_eq!(report["next_actions"]["runtime_posture"], "/config");
+        assert_eq!(
+            report["checkpoint_version"],
+            crate::tui::setup::CONSTITUTION_CHECKPOINT_VERSION
+        );
+        assert_eq!(report["update_ready"], false);
+        assert_eq!(report["constitution"]["source"], "bundled");
+        assert_eq!(report["constitution"]["autonomy_preference"], "unspecified");
+        assert_eq!(report["runtime_posture"]["source"], "unset");
+        assert_eq!(report["runtime_posture"]["default_mode"]["value"], "agent");
+        assert_eq!(
+            report["runtime_posture"]["approval_policy"]["value"],
+            "on-request"
+        );
+        assert_eq!(report["runtime_posture"]["allow_shell"]["value"], true);
+        assert_eq!(
+            report["runtime_posture"]["sandbox_mode"]["value"],
+            "mode-derived"
+        );
+        assert_eq!(
+            report["runtime_posture"]["network_default"]["value"],
+            "prompt"
+        );
+        assert_eq!(provider_step(&report)["status"], "needs_action");
+    }
+
+    #[test]
+    fn doctor_setup_report_json_uses_persisted_state() {
+        let _guard = crate::test_support::lock_test_env();
+        let tmp = TempDir::new().expect("tempdir");
+        let (_home_guard, _codewhale_home) = prepare_env(&tmp);
+        let workspace = tmp.path().join("workspace");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let mut state = codewhale_config::SetupState::default();
+        state.set_step(
+            codewhale_config::SetupStep::Language,
+            codewhale_config::StepEntry::new(
+                codewhale_config::StepStatus::Verified,
+                true,
+                crate::tui::setup::CONSTITUTION_CHECKPOINT_VERSION,
+            ),
+        );
+        state.set_step(
+            codewhale_config::SetupStep::ProviderModel,
+            codewhale_config::StepEntry::new(
+                codewhale_config::StepStatus::Verified,
+                true,
+                crate::tui::setup::CONSTITUTION_CHECKPOINT_VERSION,
+            )
+            .with_result("deepseek/deepseek-chat"),
+        );
+        state.set_step(
+            codewhale_config::SetupStep::TrustSandbox,
+            codewhale_config::StepEntry::new(
+                codewhale_config::StepStatus::Verified,
+                true,
+                crate::tui::setup::CONSTITUTION_CHECKPOINT_VERSION,
+            ),
+        );
+        state
+            .complete_constitution_checkpoint(
+                crate::tui::setup::CONSTITUTION_CHECKPOINT_VERSION,
+                codewhale_config::ConstitutionChoice::Bundled,
+            )
+            .set_step(
+                codewhale_config::SetupStep::Constitution,
+                codewhale_config::StepEntry::new(
+                    codewhale_config::StepStatus::Verified,
+                    true,
+                    crate::tui::setup::CONSTITUTION_CHECKPOINT_VERSION,
+                ),
+            );
+        state.runtime_posture_source = codewhale_config::RuntimePostureSource::Confirmed;
+        state.save().expect("persist setup state");
+        codewhale_config::UserConstitution {
+            autonomy_preference: codewhale_config::AutonomyPreference::Balanced,
+            ..Default::default()
+        }
+        .save()
+        .expect("persist user constitution");
+        let config = Config {
+            approval_policy: Some("never".to_string()),
+            allow_shell: Some(false),
+            sandbox_mode: Some("read-only".to_string()),
+            network: Some(crate::config::NetworkPolicyToml {
+                default: "deny".to_string(),
+                ..Default::default()
+            }),
+            ..Config::default()
+        };
+
+        let report = doctor_setup_report_json(&config, &workspace);
+
+        assert_eq!(report["source"], "persisted");
+        assert_eq!(report["first_run_ready"], true);
+        assert_eq!(report["update_ready"], true);
+        assert_eq!(report["constitution"]["choice"], "bundled");
+        assert_eq!(
+            report["constitution"]["checkpoint_completed_for"],
+            crate::tui::setup::CONSTITUTION_CHECKPOINT_VERSION
+        );
+        assert_eq!(report["constitution"]["autonomy_preference"], "balanced");
+        assert_eq!(report["runtime_posture_source"], "confirmed");
+        assert_eq!(report["runtime_posture"]["source"], "confirmed");
+        assert_eq!(
+            report["runtime_posture"]["approval_policy"]["value"],
+            "never"
+        );
+        assert_eq!(
+            report["runtime_posture"]["approval_policy"]["source"],
+            "config"
+        );
+        assert_eq!(report["runtime_posture"]["allow_shell"]["value"], false);
+        assert_eq!(report["runtime_posture"]["allow_shell"]["source"], "config");
+        assert_eq!(
+            report["runtime_posture"]["sandbox_mode"]["value"],
+            "read-only"
+        );
+        assert_eq!(
+            report["runtime_posture"]["sandbox_mode"]["source"],
+            "config"
+        );
+        assert_eq!(
+            report["runtime_posture"]["network_default"]["value"],
+            "deny"
+        );
+        assert_eq!(
+            report["runtime_posture"]["network_default"]["source"],
+            "config"
+        );
+        assert_eq!(provider_step(&report)["result"], "deepseek/deepseek-chat");
     }
 }
 

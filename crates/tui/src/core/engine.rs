@@ -1463,6 +1463,9 @@ impl Engine {
                             self.session.reasoning_effort.clone(),
                             self.session.reasoning_effort_auto,
                         )
+                        .with_agent_tool_surface_options(self.agent_tool_surface_options(
+                            shell_policy_for_mode(AppMode::Agent, self.session.allow_shell),
+                        ))
                         .with_max_spawn_depth(self.config.max_spawn_depth)
                         .with_step_api_timeout(self.config.subagent_api_timeout)
                         .with_speech_output_dir(self.config.speech_output_dir.clone())
@@ -2512,6 +2515,9 @@ impl Engine {
                             self.session.reasoning_effort.clone(),
                             self.session.reasoning_effort_auto,
                         )
+                        .with_agent_tool_surface_options(self.agent_tool_surface_options(
+                            shell_policy_for_mode(AppMode::Agent, self.session.allow_shell),
+                        ))
                         .with_max_spawn_depth(self.config.max_spawn_depth)
                         .with_step_api_timeout(self.config.subagent_api_timeout)
                         .with_speech_output_dir(self.config.speech_output_dir.clone())
@@ -2949,13 +2955,23 @@ impl Engine {
             .min(target_budget.saturating_sub(1))
             .max(1);
 
+        // Preserve the working-set pins on the emergency/preflight path too.
+        // Previously this passed None/None, so a compaction routed here (which,
+        // on large windows, is the path that actually fires) could summarize
+        // away pinned errors, patches, and the files the user is editing.
+        let compaction_pins = self
+            .session
+            .working_set
+            .pinned_message_indices(&self.session.messages, &self.session.workspace);
+        let compaction_paths = self.session.working_set.top_paths(24);
+
         match compact_messages_safe(
             client,
             &self.session.messages,
             &forced_config,
             Some(&self.session.workspace),
-            None,
-            None,
+            Some(&compaction_pins),
+            Some(&compaction_paths),
         )
         .await
         {
@@ -3492,7 +3508,7 @@ fn effective_input_policy(
     let mut trust_mode = trust_mode;
     let mut auto_approve = auto_approve;
     let mut approval_mode = approval_mode;
-    let mut dynamic_active_tools = Vec::new();
+    let dynamic_active_tools = Vec::new();
     let mut status = None;
 
     if !provenance_can_inherit_standing_auto_authority(provenance) {
@@ -3517,13 +3533,20 @@ fn effective_input_policy(
                 provenance.as_str()
             ));
         }
-    } else if is_review_only_user_intent(content) {
-        // Advisory only: never silently override an explicitly chosen mode
-        // or strip its tools. Surface the question modal dynamically so the
-        // model can ask focused follow-ups without inflating every tool prompt.
-        dynamic_active_tools.push(REQUEST_USER_INPUT_NAME);
+    } else if matches!(provenance, UserInputProvenance::ExternalUser)
+        && is_review_only_user_intent(content)
+    {
+        mode = AppMode::Plan;
+        trust_mode = false;
+        auto_approve = false;
+        if matches!(
+            approval_mode,
+            crate::tui::approval::ApprovalMode::Auto | crate::tui::approval::ApprovalMode::Bypass
+        ) {
+            approval_mode = crate::tui::approval::ApprovalMode::Suggest;
+        }
         status = Some(
-            "Review/inspection request detected; keeping the current mode and exposing request_user_input for focused follow-up questions.".to_string(),
+            "Review/inspection request detected; using read-only Plan tools for this turn. Add an explicit fix/edit/commit instruction to allow writes.".to_string(),
         );
     }
 
@@ -3653,7 +3676,14 @@ pub(super) fn auto_review_plan_decision(
         crate::tui::auto_review::AutoReviewAction::Allow
         | crate::tui::auto_review::AutoReviewAction::AskUser => AutoReviewPlanDecision::NoChange,
         crate::tui::auto_review::AutoReviewAction::HoldForReview => {
-            let reason = format!("Auto-review policy requires approval: {}", decision.reason);
+            // HoldForReview only originates from the built-in safety floor
+            // (configured rules produce Allow/Block), so name the gate
+            // honestly instead of blaming an "auto-review policy" the user
+            // may never have configured (#3883).
+            let reason = format!(
+                "Built-in safety gate requires approval: {}",
+                decision.reason
+            );
             if matches!(approval_mode, crate::tui::approval::ApprovalMode::Never) {
                 AutoReviewPlanDecision::Block(reason)
             } else {

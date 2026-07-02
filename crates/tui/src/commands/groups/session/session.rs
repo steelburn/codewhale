@@ -385,7 +385,7 @@ pub fn sessions(app: &mut App, arg: Option<&str>) -> CommandResult {
 /// [`crate::session_manager::SessionManager::prune_sessions_older_than`]
 /// so users can run a safe cleanup without leaving the TUI. Skips
 /// the checkpoint subdirectory (the helper guarantees that already).
-fn prune(_app: &mut App, days_arg: Option<&str>) -> CommandResult {
+fn prune(app: &mut App, days_arg: Option<&str>) -> CommandResult {
     let days_str = match days_arg {
         Some(s) => s,
         None => {
@@ -411,7 +411,10 @@ fn prune(_app: &mut App, days_arg: Option<&str>) -> CommandResult {
     };
 
     let max_age = std::time::Duration::from_secs(days.saturating_mul(24 * 60 * 60));
-    match manager.prune_sessions_older_than(max_age) {
+    // Never prune the active session, even if its timestamp is stale (a
+    // just-resumed session isn't re-saved until its first post-resume write).
+    let keep = app.current_session_id.as_deref();
+    match manager.prune_sessions_older_than_keeping(max_age, keep) {
         Ok(0) => CommandResult::message(format!("no sessions older than {days}d to prune")),
         Ok(n) => CommandResult::message(format!(
             "pruned {n} session{} older than {days}d",

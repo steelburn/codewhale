@@ -1,10 +1,11 @@
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
 
 use crate::commands::{self, CommandInfo, CommandResult};
+use crate::config::{ApiProvider, Config, model_completion_names_for_provider};
 use crate::localization::Locale;
 use crate::tui::app::{App, AppAction, AppMode, SidebarFocus};
 use crate::tui::command_palette::{
@@ -27,6 +28,7 @@ pub enum HotbarDispatch {
 #[allow(dead_code)]
 pub enum HotbarActionCategory {
     App,
+    Route,
     Slash,
     Mcp,
     Skill,
@@ -38,6 +40,7 @@ impl HotbarActionCategory {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::App => "app",
+            Self::Route => "route",
             Self::Slash => "slash",
             Self::Mcp => "mcp",
             Self::Skill => "skill",
@@ -50,6 +53,7 @@ impl HotbarActionCategory {
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "app" => Some(Self::App),
+            "route" => Some(Self::Route),
             "slash" => Some(Self::Slash),
             "mcp" => Some(Self::Mcp),
             "skill" => Some(Self::Skill),
@@ -84,6 +88,7 @@ impl HotbarArgsBehavior {
 pub enum HotbarSafetyClass {
     LocalUi,
     LocalState,
+    ConfigChange,
     ExternalInput,
     ExistingCommand,
     RequiresApproval,
@@ -186,6 +191,8 @@ impl Default for HotbarRecommendationOptions {
 pub enum HotbarSourceDispatchBoundary {
     /// The action is handled directly by existing in-app state mutation.
     DirectApp,
+    /// The action routes through the existing provider/model picker apply path.
+    ModelRoute,
     /// The action routes through the slash command registry/dispatcher.
     SlashCommand,
     /// The source is visible as a future hotbar source, but binding/dispatch is
@@ -225,6 +232,7 @@ impl HotbarSourceDescriptor {
 }
 
 const HOTBAR_DIRECT_APP_SAFETY: &[HotbarSourceSafetyMode] = &[HotbarSourceSafetyMode::DirectFire];
+const HOTBAR_ROUTE_SAFETY: &[HotbarSourceSafetyMode] = &[HotbarSourceSafetyMode::DirectFire];
 const HOTBAR_SLASH_SAFETY: &[HotbarSourceSafetyMode] = &[
     HotbarSourceSafetyMode::DirectFire,
     HotbarSourceSafetyMode::ComposerPrefill,
@@ -240,6 +248,13 @@ const HOTBAR_SOURCE_DESCRIPTORS: &[HotbarSourceDescriptor] = &[
         boundary: HotbarSourceDispatchBoundary::DirectApp,
         safety_modes: HOTBAR_DIRECT_APP_SAFETY,
         dispatch_path: "AppHotbarAction::dispatch",
+        status: "dispatchable",
+    },
+    HotbarSourceDescriptor {
+        category: HotbarActionCategory::Route,
+        boundary: HotbarSourceDispatchBoundary::ModelRoute,
+        safety_modes: HOTBAR_ROUTE_SAFETY,
+        dispatch_path: "AppAction::SwitchModelRoute -> apply_model_picker_choice",
         status: "dispatchable",
     },
     HotbarSourceDescriptor {
@@ -296,7 +311,8 @@ pub trait HotbarAction: Send + Sync {
     /// Compact cell label. Built-ins keep this at seven characters or less.
     fn short_label(&self) -> &str;
 
-    /// Source category, such as `app`, `slash`, `mcp`, `skill`, or `plugin`.
+    /// Source category, such as `app`, `route`, `slash`, `mcp`, `skill`, or
+    /// `plugin`.
     fn category(&self) -> &str;
 
     /// Whether the action is currently active in the supplied app state.
@@ -427,6 +443,18 @@ impl HotbarActionRegistry {
         registry
     }
 
+    #[must_use]
+    pub fn with_configured_routes(
+        config: &Config,
+        active_provider: ApiProvider,
+        active_model: &str,
+        provider_models: &HashMap<String, String>,
+    ) -> Self {
+        let mut registry = Self::with_builtins();
+        registry.register_configured_routes(config, active_provider, active_model, provider_models);
+        registry
+    }
+
     pub fn register(&mut self, action: impl HotbarAction + 'static) {
         let id = action.id().to_string();
         assert!(!id.trim().is_empty(), "hotbar action id must not be empty");
@@ -466,6 +494,22 @@ impl HotbarActionRegistry {
 
     pub(crate) fn register_slash_commands(&mut self) {
         self.register_source(&SlashCommandHotbarActionSource);
+    }
+
+    pub(crate) fn register_configured_routes(
+        &mut self,
+        config: &Config,
+        active_provider: ApiProvider,
+        active_model: &str,
+        provider_models: &HashMap<String, String>,
+    ) {
+        let source = ConfiguredRouteHotbarActionSource {
+            config,
+            active_provider,
+            active_model,
+            provider_models,
+        };
+        self.register_source(&source);
     }
 }
 
@@ -568,6 +612,44 @@ impl HotbarActionSource for SlashCommandHotbarActionSource {
     fn register_actions(&self, registry: &mut HotbarActionRegistry) {
         for info in commands::command_infos() {
             registry.register(SlashHotbarAction::new(info));
+        }
+    }
+}
+
+struct ConfiguredRouteHotbarActionSource<'a> {
+    config: &'a Config,
+    active_provider: ApiProvider,
+    active_model: &'a str,
+    provider_models: &'a HashMap<String, String>,
+}
+
+impl HotbarActionSource for ConfiguredRouteHotbarActionSource<'_> {
+    fn descriptor(&self) -> HotbarSourceDescriptor {
+        HOTBAR_SOURCE_DESCRIPTORS
+            .iter()
+            .copied()
+            .find(|descriptor| descriptor.category == HotbarActionCategory::Route)
+            .expect("route hotbar source descriptor exists")
+    }
+
+    fn register_actions(&self, registry: &mut HotbarActionRegistry) {
+        for provider in ApiProvider::sorted_for_display() {
+            if !crate::config::provider_is_configured_for_active(
+                self.config,
+                provider,
+                self.active_provider,
+            ) {
+                continue;
+            }
+            for model in configured_route_models_for_provider(
+                self.config,
+                provider,
+                self.active_provider,
+                self.active_model,
+                self.provider_models,
+            ) {
+                registry.register(RouteHotbarAction::new(provider, model));
+            }
         }
     }
 }
@@ -921,9 +1003,125 @@ impl HotbarAction for SlashHotbarAction {
     }
 }
 
+#[allow(dead_code)]
+struct RouteHotbarAction {
+    provider: ApiProvider,
+    model: String,
+    id: String,
+    short_label: String,
+}
+
+impl RouteHotbarAction {
+    fn new(provider: ApiProvider, model: String) -> Self {
+        let trimmed_model = model.trim().to_string();
+        Self {
+            provider,
+            id: route_action_id(provider, &trimmed_model),
+            short_label: crate::tui::ui_text::truncate_line_to_width(
+                provider.as_str(),
+                HOTBAR_COMPACT_LABEL_MAX_WIDTH,
+            ),
+            model: trimmed_model,
+        }
+    }
+}
+
+impl HotbarAction for RouteHotbarAction {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn metadata(&self, _locale: Locale) -> HotbarActionMetadata {
+        HotbarActionMetadata {
+            id: self.id.clone(),
+            source_id: format!("route:{}", self.provider.as_str()),
+            display_name: format!("{} · {}", self.provider.display_name(), self.model),
+            compact_label: self.short_label.clone(),
+            description: format!(
+                "Switch to {} on {} through the existing /model route path.",
+                self.model,
+                self.provider.display_name()
+            ),
+            category: HotbarActionCategory::Route,
+            args: HotbarArgsBehavior::None,
+            safety: HotbarSafetyClass::ConfigChange,
+            recommendation: HotbarRecommendation::Eligible,
+        }
+    }
+
+    fn short_label(&self) -> &str {
+        &self.short_label
+    }
+
+    fn category(&self) -> &str {
+        "route"
+    }
+
+    fn is_active(&self, app: &App) -> bool {
+        !app.auto_model
+            && app.api_provider == self.provider
+            && app.model.trim().eq_ignore_ascii_case(self.model.trim())
+    }
+
+    fn dispatch(&self, _app: &mut App) -> Result<HotbarDispatch> {
+        Ok(HotbarDispatch::AppAction(AppAction::SwitchModelRoute {
+            provider: self.provider,
+            model: self.model.clone(),
+        }))
+    }
+}
+
+fn configured_route_models_for_provider(
+    config: &Config,
+    provider: ApiProvider,
+    active_provider: ApiProvider,
+    active_model: &str,
+    provider_models: &HashMap<String, String>,
+) -> Vec<String> {
+    let mut models = Vec::new();
+    if provider == active_provider {
+        push_route_model(&mut models, active_model);
+    }
+    if let Some(model) = provider_models.get(provider.as_str()) {
+        push_route_model(&mut models, model);
+    }
+    if let Some(model) = config
+        .provider_config_for(provider)
+        .and_then(|provider| provider.model.as_deref())
+    {
+        push_route_model(&mut models, model);
+    }
+    for model in model_completion_names_for_provider(provider)
+        .into_iter()
+        .filter(|model| !model.trim().eq_ignore_ascii_case("auto"))
+        .take(1)
+    {
+        push_route_model(&mut models, model);
+    }
+    models
+}
+
+fn push_route_model(models: &mut Vec<String>, model: &str) {
+    let trimmed = model.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("auto") {
+        return;
+    }
+    if models
+        .iter()
+        .any(|existing| existing.eq_ignore_ascii_case(trimmed))
+    {
+        return;
+    }
+    models.push(trimmed.to_string());
+}
+
+fn route_action_id(provider: ApiProvider, model: &str) -> String {
+    format!("route.{}.{}", provider.as_str(), model.trim())
+}
+
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeSet, HashMap};
     use std::path::PathBuf;
 
     use crate::config::{ApiProvider, Config};
@@ -1084,6 +1282,7 @@ mod tests {
             categories,
             BTreeSet::from([
                 HotbarActionCategory::App,
+                HotbarActionCategory::Route,
                 HotbarActionCategory::Slash,
                 HotbarActionCategory::Mcp,
                 HotbarActionCategory::Skill,
@@ -1102,6 +1301,21 @@ mod tests {
             Some((
                 HotbarSourceDispatchBoundary::DirectApp,
                 HOTBAR_DIRECT_APP_SAFETY,
+                true
+            ))
+        );
+        assert_eq!(
+            descriptors
+                .iter()
+                .find(|descriptor| descriptor.category == HotbarActionCategory::Route)
+                .map(|descriptor| (
+                    descriptor.boundary,
+                    descriptor.safety_modes,
+                    descriptor.registers_dispatchable_actions()
+                )),
+            Some((
+                HotbarSourceDispatchBoundary::ModelRoute,
+                HOTBAR_ROUTE_SAFETY,
                 true
             ))
         );
@@ -1424,13 +1638,60 @@ mod tests {
     #[test]
     fn app_starts_with_builtin_hotbar_registry() {
         let app = test_app();
-        assert_eq!(
-            app.hotbar_actions.len(),
-            HotbarActionRegistry::with_builtins().len()
-        );
+        assert!(app.hotbar_actions.len() > HotbarActionRegistry::with_builtins().len());
         assert!(app.hotbar_actions.get("mode.agent").is_some());
         assert!(app.hotbar_actions.get("slash.help").is_some());
         assert!(app.hotbar_actions.get("slash.mode").is_some());
+        assert!(
+            app.hotbar_actions
+                .iter()
+                .any(|action| action.metadata(Locale::En).category == HotbarActionCategory::Route)
+        );
+    }
+
+    #[test]
+    fn configured_routes_register_provider_model_actions() {
+        let mut config = Config::default();
+        config
+            .provider_config_for_mut(ApiProvider::Openrouter)
+            .model = Some("anthropic/claude-sonnet-4".to_string());
+        let mut provider_models = HashMap::new();
+        provider_models.insert(
+            ApiProvider::Openrouter.as_str().to_string(),
+            "openai/gpt-4o".to_string(),
+        );
+        let registry = HotbarActionRegistry::with_configured_routes(
+            &config,
+            ApiProvider::Deepseek,
+            "deepseek-v4-pro",
+            &provider_models,
+        );
+
+        let active = registry
+            .get("route.deepseek.deepseek-v4-pro")
+            .expect("active DeepSeek route");
+        assert_eq!(active.category(), "route");
+        assert_eq!(
+            active.metadata(Locale::En).safety,
+            HotbarSafetyClass::ConfigChange
+        );
+
+        let openrouter = registry
+            .get("route.openrouter.anthropic/claude-sonnet-4")
+            .expect("configured OpenRouter route");
+        let metadata = openrouter.metadata(Locale::En);
+        assert_eq!(metadata.category, HotbarActionCategory::Route);
+        assert!(metadata.display_name.contains("OpenRouter"));
+        assert!(metadata.display_name.contains("anthropic/claude-sonnet-4"));
+
+        let mut app = test_app();
+        assert_eq!(
+            openrouter.dispatch(&mut app).expect("dispatch route"),
+            HotbarDispatch::AppAction(AppAction::SwitchModelRoute {
+                provider: ApiProvider::Openrouter,
+                model: "anthropic/claude-sonnet-4".to_string(),
+            })
+        );
     }
 
     #[test]

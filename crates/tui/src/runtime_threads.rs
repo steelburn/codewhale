@@ -412,6 +412,15 @@ impl RuntimeThreadStore {
 
     pub fn list_turns_for_thread(&self, thread_id: &str) -> Result<Vec<TurnRecord>> {
         validated_record_id(thread_id, "thread id")?;
+        let mut out = self.list_all_turns()?;
+        out.retain(|turn| turn.thread_id == thread_id);
+        Ok(out)
+    }
+
+    /// Every turn in the store, sorted by creation time. One directory scan;
+    /// callers that need multiple threads' turns (boot recovery) use this
+    /// instead of paying a full scan per thread (#3757).
+    pub fn list_all_turns(&self) -> Result<Vec<TurnRecord>> {
         let mut out = Vec::new();
         let turns_dir = checked_existing_runtime_store_dir(&self.turns_dir)?;
         for entry in fs::read_dir(&turns_dir)
@@ -433,9 +442,7 @@ impl RuntimeThreadStore {
                     CURRENT_RUNTIME_SCHEMA_VERSION
                 );
             }
-            if turn.thread_id == thread_id {
-                out.push(turn);
-            }
+            out.push(turn);
         }
         out.sort_by_key(|a| a.created_at);
         Ok(out)
@@ -3732,16 +3739,31 @@ impl RuntimeThreadManager {
 
     fn recover_interrupted_state(&self) -> Result<()> {
         let now = Utc::now();
+        // One scan of the turns store, filtered to the interrupted-candidate
+        // statuses, grouped by thread. The previous shape re-read and
+        // re-parsed every turn file once per thread — O(threads x turns) on
+        // the boot path (#3757).
+        let mut turns_by_thread: HashMap<String, Vec<TurnRecord>> = HashMap::new();
+        for turn in self.store.list_all_turns()? {
+            if matches!(
+                turn.status,
+                RuntimeTurnStatus::Queued | RuntimeTurnStatus::InProgress
+            ) {
+                turns_by_thread
+                    .entry(turn.thread_id.clone())
+                    .or_default()
+                    .push(turn);
+            }
+        }
+        if turns_by_thread.is_empty() {
+            return Ok(());
+        }
         for mut thread in self.store.list_threads()? {
+            let Some(turns) = turns_by_thread.remove(&thread.id) else {
+                continue;
+            };
             let mut thread_changed = false;
-            for mut turn in self.store.list_turns_for_thread(&thread.id)? {
-                if !matches!(
-                    turn.status,
-                    RuntimeTurnStatus::Queued | RuntimeTurnStatus::InProgress
-                ) {
-                    continue;
-                }
-
+            for mut turn in turns {
                 turn.status = RuntimeTurnStatus::Interrupted;
                 turn.error = Some(RUNTIME_RESTART_REASON.to_string());
                 turn.ended_at = Some(now);

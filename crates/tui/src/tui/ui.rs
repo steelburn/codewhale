@@ -74,7 +74,7 @@ use crate::task_manager::{
 use crate::tools::goal::{GoalSnapshot, GoalStatus};
 use crate::tools::shell::{ShellJobSnapshot, ShellStatus};
 use crate::tools::spec::{RuntimeToolServices, ToolResult};
-use crate::tools::subagent::SubAgentStatus;
+use crate::tools::subagent::{MailboxMessage, SubAgentStatus};
 use crate::tui::auto_router;
 use crate::tui::color_compat::ColorCompatBackend;
 use crate::tui::command_palette::{
@@ -108,9 +108,9 @@ use crate::tui::streaming_thinking;
 #[cfg(test)]
 use crate::tui::subagent_routing::reconcile_subagent_activity_state_at;
 use crate::tui::subagent_routing::{
-    format_task_list, handle_subagent_mailbox, open_task_pager, reconcile_subagent_activity_state,
-    running_agent_count, sort_subagents_in_place, subagent_message_refreshes_workspace_context,
-    task_mode_label, task_summary_to_panel_entry,
+    apply_subagent_terminal_projection, format_task_list, handle_subagent_mailbox, open_task_pager,
+    reconcile_subagent_activity_state, running_agent_count, sort_subagents_in_place,
+    subagent_message_refreshes_workspace_context, task_mode_label, task_summary_to_panel_entry,
 };
 #[cfg(test)]
 use crate::tui::tool_routing::exploring_label;
@@ -579,6 +579,22 @@ fn drain_terminal_input_queue(
     Ok(())
 }
 
+fn open_setup_checkpoint_if_due(app: &mut App, config: &Config, skip_onboarding: bool) -> bool {
+    if skip_onboarding
+        || app.onboarding != crate::tui::app::OnboardingState::None
+        || app.view_stack.top_kind() == Some(ModalKind::SetupWizard)
+        || !crate::tui::setup::should_open_update_checkpoint(app, config)
+    {
+        return false;
+    }
+
+    // A fresh wizard invalidates any in-flight model draft from a prior one.
+    let _ = app.next_draft_gen();
+    app.view_stack
+        .push(crate::tui::setup::SetupWizardView::new_for_app(app, config));
+    true
+}
+
 /// Run the interactive TUI event loop.
 ///
 /// # Examples
@@ -731,13 +747,18 @@ pub async fn run_tui(config: &Config, options: TuiOptions) -> Result<()> {
     let mut config = config.clone();
     let config = &mut config;
     let mut app = App::new(options.clone(), config);
+    crate::startup_trace::mark("app_constructed");
     sync_config_provider_from_app(config, &app);
 
-    // One-time Fleet + Hotbar intro for returning (non-resuming) users. First-
-    // time users see it when they finish onboarding. Gated by a persisted flag,
-    // so it shows exactly once and never inside a resumed session transcript.
     if options.resume_session_id.is_none() {
-        app.maybe_show_feature_intro();
+        let opened_setup = open_setup_checkpoint_if_due(&mut app, config, options.skip_onboarding);
+        // One-time Fleet + Hotbar intro for returning (non-resuming) users.
+        // First-time users see it when they finish onboarding. Gated by a
+        // persisted flag, so it shows exactly once and never inside a resumed
+        // session transcript or behind the constitution checkpoint.
+        if !opened_setup {
+            app.maybe_show_feature_intro();
+        }
     }
 
     // Load existing session if resuming.
@@ -862,12 +883,14 @@ pub async fn run_tui(config: &Config, options: TuiOptions) -> Result<()> {
         handle_store: app.runtime_services.handle_store.clone(),
         rlm_sessions: app.runtime_services.rlm_sessions.clone(),
     };
+    crate::startup_trace::mark("task_manager_ready");
     refresh_active_task_panel(&mut app, &task_manager).await;
 
     let engine_config = build_engine_config(&app, config);
 
     // Spawn the Engine - it will handle all API communication
     let engine_handle = spawn_engine(engine_config, config);
+    crate::startup_trace::mark("engine_spawned");
     // The translation client is optional: it never crashes the TUI on
     // startup, even when the API key is missing, the base URL is malformed,
     // or the network is unavailable.
@@ -912,6 +935,7 @@ pub async fn run_tui(config: &Config, options: TuiOptions) -> Result<()> {
 
     submit_initial_input_if_ready(&mut app, config, &engine_handle).await?;
 
+    crate::startup_trace::log_summary();
     let result = run_event_loop(
         &mut terminal,
         &mut app,
@@ -1110,6 +1134,53 @@ fn subagent_completion_status(result: &str) -> Option<String> {
         Some("interrupted".to_string())
     } else {
         None
+    }
+}
+
+fn subagent_status_from_completion_result(result: &str) -> SubAgentStatus {
+    let reason = result
+        .lines()
+        .find_map(|line| {
+            let trimmed = line.trim();
+            (!trimmed.is_empty() && !trimmed.starts_with("<codewhale:subagent.done>"))
+                .then_some(trimmed.to_string())
+        })
+        .unwrap_or_else(|| "sub-agent finished".to_string());
+    match subagent_completion_status(result).as_deref() {
+        Some("completed") => SubAgentStatus::Completed,
+        Some("cancelled" | "canceled") => SubAgentStatus::Cancelled,
+        Some("failed") => SubAgentStatus::Failed(reason),
+        Some("interrupted") => SubAgentStatus::Interrupted(reason),
+        Some("budget_exhausted") => SubAgentStatus::BudgetExhausted,
+        _ => SubAgentStatus::Completed,
+    }
+}
+
+fn subagent_terminal_projection_from_mailbox(
+    message: &MailboxMessage,
+) -> Option<(&str, SubAgentStatus, Option<String>)> {
+    match message {
+        MailboxMessage::Completed { agent_id, summary } => Some((
+            agent_id.as_str(),
+            SubAgentStatus::Completed,
+            Some(summary.clone()),
+        )),
+        MailboxMessage::Failed { agent_id, error } => Some((
+            agent_id.as_str(),
+            SubAgentStatus::Failed(error.clone()),
+            Some(error.clone()),
+        )),
+        MailboxMessage::Interrupted { agent_id, reason } => Some((
+            agent_id.as_str(),
+            SubAgentStatus::Interrupted(reason.clone()),
+            Some(reason.clone()),
+        )),
+        MailboxMessage::Cancelled { agent_id } => Some((
+            agent_id.as_str(),
+            SubAgentStatus::Cancelled,
+            Some("cancelled".to_string()),
+        )),
+        _ => None,
     }
 }
 
@@ -1410,7 +1481,7 @@ pub(crate) fn select_work_sidebar_tasks(
         .collect()
 }
 
-async fn refresh_active_task_panel(app: &mut App, task_manager: &SharedTaskManager) {
+async fn refresh_active_task_panel(app: &mut App, task_manager: &SharedTaskManager) -> bool {
     let tasks = task_manager.list_tasks(None).await;
     let session_started_at = app.session_started_at;
     let now = chrono::Utc::now();
@@ -1464,7 +1535,12 @@ async fn refresh_active_task_panel(app: &mut App, task_manager: &SharedTaskManag
     };
     entries.extend(shell_entries);
 
+    // Report whether anything visible changed so the idle tick can skip the
+    // redraw: an unconditional 2.5 s repaint kept the app from ever going
+    // quiescent (#3757).
+    let changed = app.task_panel != entries;
     app.task_panel = entries;
+    changed
 }
 
 fn refresh_shell_exec_live_output(app: &mut App) -> bool {
@@ -1692,6 +1768,7 @@ async fn run_event_loop(
     let mut pending_translations = 0usize;
     let mut pending_thinking_translations = 0usize;
     let mut last_queue_state = (app.queued_messages.clone(), app.queued_draft.clone());
+    let mut last_queue_was_empty = app.queued_messages.is_empty() && app.queued_draft.is_none();
     let mut last_task_refresh = Instant::now()
         .checked_sub(Duration::from_secs(2))
         .unwrap_or_else(Instant::now);
@@ -1750,6 +1827,8 @@ async fn run_event_loop(
         }
         app.balance_initiated = true;
     }
+
+    let mut pending_subagent_list_refresh = false;
 
     loop {
         // Drain the version-check handle once; re-assign None so we
@@ -1858,12 +1937,13 @@ async fn run_event_loop(
         }
 
         if last_task_refresh.elapsed() >= Duration::from_millis(2500) {
-            refresh_active_task_panel(app, &task_manager).await;
+            if refresh_active_task_panel(app, &task_manager).await {
+                app.needs_redraw = true;
+            }
             if refresh_shell_exec_live_output(app) {
                 app.needs_redraw = true;
             }
             last_task_refresh = Instant::now();
-            app.needs_redraw = true;
         }
 
         // Clear suggestion when the user modifies the input.
@@ -1882,6 +1962,31 @@ async fn run_event_loop(
                     .load(std::sync::atomic::Ordering::Relaxed)
         {
             app.prompt_suggestion = Some(suggestion);
+        }
+
+        // Poll the fleet-profile model-draft cell filled by the background
+        // drafting task (#3757 review: the draft must not park the loop).
+        let fleet_draft_delivery = app
+            .fleet_draft_cell
+            .try_lock()
+            .ok()
+            .and_then(|mut guard| guard.take());
+        if let Some((draft_gen, model_label, outcome)) = fleet_draft_delivery {
+            if draft_gen == app.current_draft_gen() {
+                deliver_fleet_draft_result(app, model_label, outcome, app.ui_locale);
+            }
+        }
+
+        // Poll the constitution model-draft cell (same background pattern).
+        let constitution_draft_delivery = app
+            .constitution_draft_cell
+            .try_lock()
+            .ok()
+            .and_then(|mut guard| guard.take());
+        if let Some((draft_gen, model_label, draft_locale, outcome)) = constitution_draft_delivery {
+            if draft_gen == app.current_draft_gen() {
+                deliver_constitution_draft_result(app, model_label, draft_locale, outcome);
+            }
         }
 
         // First, poll for engine events (non-blocking)
@@ -2867,6 +2972,13 @@ async fn run_event_loop(
                                 });
                         app.agent_progress.remove(&id);
                         app.agent_progress_meta.remove(&id);
+                        let terminal_status = subagent_status_from_completion_result(&result);
+                        apply_subagent_terminal_projection(
+                            app,
+                            &id,
+                            terminal_status,
+                            Some(summarize_tool_output(&result)),
+                        );
                         // #3030: stable label with raw-id fallback.
                         let label = app.agent_display_label(&id);
                         app.status_message = Some(format!(
@@ -2927,6 +3039,12 @@ async fn run_event_loop(
                         let should_refresh_subagents =
                             subagent_message_refreshes_workspace_context(&message);
                         let updated_transcript = handle_subagent_mailbox(app, seq, &message);
+                        if let Some((agent_id, status, result)) =
+                            subagent_terminal_projection_from_mailbox(&message)
+                        {
+                            apply_subagent_terminal_projection(app, agent_id, status, result);
+                            subagent_list_refresh_requested = true;
+                        }
                         if should_refresh_subagents {
                             subagent_list_refresh_requested = true;
                         }
@@ -3170,13 +3288,28 @@ async fn run_event_loop(
         if received_engine_event {
             app.needs_redraw = true;
         }
+        if subagent_list_refresh_requested {
+            pending_subagent_list_refresh = true;
+        }
         // #freeze: one trailing-edge sub-agent list refresh per drain, no
         // matter how many spawn/complete/mailbox events arrived this batch.
-        // #3802: non-blocking send — ListSubAgents is a refresh op that can
-        // be dropped when the op channel is full; the next drain cycle
-        // will re-request.
-        if subagent_list_refresh_requested {
-            let _ = engine_handle.try_send(Op::ListSubAgents);
+        // #3837: keep a sticky pending bit when the op channel is full so a
+        // terminal lifecycle event cannot permanently lose the authoritative
+        // ListSubAgents refresh.
+        if pending_subagent_list_refresh {
+            match engine_handle.try_send(Op::ListSubAgents) {
+                Ok(()) => pending_subagent_list_refresh = false,
+                Err(err) => {
+                    if err
+                        .downcast_ref::<tokio::sync::mpsc::error::TrySendError<Op>>()
+                        .is_some_and(|send_err| {
+                            matches!(send_err, tokio::sync::mpsc::error::TrySendError::Closed(_))
+                        })
+                    {
+                        pending_subagent_list_refresh = false;
+                    }
+                }
+            }
         }
 
         if let Some(next) = queued_to_send {
@@ -3192,11 +3325,20 @@ async fn run_event_loop(
             app.needs_redraw = true;
         }
 
-        let queue_state = (app.queued_messages.clone(), app.queued_draft.clone());
-        if queue_state != last_queue_state {
-            persist_offline_queue_state(app);
-            last_queue_state = queue_state;
-            app.needs_redraw = true;
+        // Avoid cloning the queued messages/draft every loop iteration
+        // (~20-40 Hz) purely for change detection. When the queue is empty and
+        // was empty last time — the overwhelmingly common case — there is
+        // nothing to compare, so skip the clone entirely. A multi-KB queued
+        // draft is only cloned while one is actually pending.
+        let queue_now_empty = app.queued_messages.is_empty() && app.queued_draft.is_none();
+        if !(queue_now_empty && last_queue_was_empty) {
+            let queue_state = (app.queued_messages.clone(), app.queued_draft.clone());
+            if queue_state != last_queue_state {
+                persist_offline_queue_state(app);
+                last_queue_state = queue_state;
+                app.needs_redraw = true;
+            }
+            last_queue_was_empty = queue_now_empty;
         }
 
         if !app.view_stack.is_empty() {
@@ -3771,7 +3913,10 @@ async fn run_event_loop(
                         }
                         OnboardingState::TrustDirectory => {}
                         OnboardingState::Tips => {
-                            app.finish_onboarding();
+                            app.finish_onboarding_without_feature_intro();
+                            if !open_setup_checkpoint_if_due(app, config, false) {
+                                app.maybe_show_feature_intro();
+                            }
                         }
                         OnboardingState::None => {}
                     },
@@ -3970,10 +4115,10 @@ async fn run_event_loop(
                 && key_shortcuts::has_control_like_modifier(key.modifiers)
                 && app.view_stack.is_empty()
             {
-                // #3032: Ctrl+B directly backgrounds the active foreground
-                // shell command instead of opening a two-step shell-control
-                // menu.  When nothing is backgroundable, the status message
-                // tells the user what's going on.
+                // #3032/#3859: Ctrl+B moves the active foreground shell wait
+                // into /jobs instead of opening a two-step shell-control menu.
+                // When nothing is movable, the status message tells the user
+                // what's going on.
                 request_foreground_shell_background(app);
                 app.needs_redraw = true;
                 continue;
@@ -5318,6 +5463,230 @@ async fn run_cache_warmup(app: &App, config: &Config) -> Result<(Usage, String, 
     let response =
         tokio::time::timeout(Duration::from_secs(45), client.create_message(warmup)).await??;
     Ok((response.usage, base_url, inspection))
+}
+
+/// One-shot "draft my constitution" call against the user's first configured
+/// model, requested by `A` on the setup Constitution card. Runs inline in the
+/// event loop like [`fetch_available_models`] (the wizard modal stays open
+/// underneath) with a hard timeout so a slow provider cannot wedge setup.
+///
+/// On success the sanitized, bounded draft is installed into the open wizard
+/// and its ratification preview opens on top — nothing persists until the
+/// user ratifies with `G`. Every failure (no client, timeout, request error,
+/// invalid or empty JSON) is a status line, never an error state: the
+/// deterministic guided draft remains the standing fallback.
+async fn handle_setup_constitution_model_draft(
+    app: &mut App,
+    config: &Config,
+    draft: crate::tui::setup::GuidedConstitutionDraft,
+    locale: crate::localization::Locale,
+) {
+    // Spawn the draft off the event loop (same pattern as the fleet drafter,
+    // #3757 review): awaiting it inline parked the whole TUI for up to the
+    // timeout. The loop polls constitution_draft_cell and delivers the result.
+    const DRAFT_TIMEOUT: Duration = Duration::from_secs(20);
+    let model_label = app.model_display_label();
+    let client = match DeepSeekClient::new(config) {
+        Ok(client) => client,
+        Err(err) => {
+            deliver_constitution_draft_result(
+                app,
+                model_label.clone(),
+                locale,
+                Err(format!("provider not ready: {err:#}")),
+            );
+            return;
+        }
+    };
+    let request_model = app.model.clone();
+    let cell = app.constitution_draft_cell.clone();
+    let spawn_label = model_label.clone();
+    let request_gen = app.next_draft_gen();
+    app.status_message = Some(match locale {
+        crate::localization::Locale::ZhHans => {
+            format!(
+                "{model_label} 正在起草宪法……（最多 {}s）",
+                DRAFT_TIMEOUT.as_secs()
+            )
+        }
+        _ => format!(
+            "{model_label} is drafting your constitution… (up to {}s)",
+            DRAFT_TIMEOUT.as_secs()
+        ),
+    });
+    app.needs_redraw = true;
+    tokio::spawn(async move {
+        let outcome = match tokio::time::timeout(
+            DRAFT_TIMEOUT,
+            crate::tui::setup::draft_constitution_with_model(
+                &client,
+                &request_model,
+                draft,
+                locale,
+            ),
+        )
+        .await
+        {
+            Err(_) => Err(format!("timed out after {}s", DRAFT_TIMEOUT.as_secs())),
+            Ok(result) => result,
+        };
+        if let Ok(mut guard) = cell.lock() {
+            *guard = Some((request_gen, spawn_label, locale, outcome));
+        }
+    });
+}
+
+/// Install a completed constitution draft into the setup wizard (if still on
+/// top) and open its ratification preview, or surface a failure. Called from
+/// the event loop when the background draft lands, and directly on the
+/// pre-spawn provider-construction failure.
+fn deliver_constitution_draft_result(
+    app: &mut App,
+    model_label: String,
+    locale: crate::localization::Locale,
+    outcome: Result<Box<codewhale_config::UserConstitution>, String>,
+) {
+    match outcome {
+        Ok(constitution) => {
+            if app.view_stack.top_kind() == Some(ModalKind::SetupWizard)
+                && let Some(mut boxed) = app.view_stack.pop()
+            {
+                let preview = boxed
+                    .as_any_mut()
+                    .downcast_mut::<crate::tui::setup::SetupWizardView>()
+                    .map(|wizard| wizard.install_model_draft(constitution, model_label.clone()));
+                app.view_stack.push_boxed(boxed);
+                if let Some((title, content)) = preview {
+                    open_text_pager(app, title, content);
+                    app.status_message = Some(crate::tui::setup::model_draft_ready_message(
+                        locale,
+                        &model_label,
+                    ));
+                }
+            }
+        }
+        Err(reason) => {
+            app.status_message = Some(crate::tui::setup::model_draft_failed_message(
+                locale,
+                &model_label,
+                &reason,
+            ));
+        }
+    }
+    app.needs_redraw = true;
+}
+/// One-shot fleet-profile draft: same contract as the constitution drafter —
+/// minimal payload out, untrusted gate in, preview before ratify, degrade to
+/// the manual authoring flow on any failure.
+async fn handle_fleet_profile_model_draft(
+    app: &mut App,
+    config: &Config,
+    role: String,
+    model_class: String,
+    locale: crate::localization::Locale,
+) {
+    // Do NOT await the network call on the event loop — that parks the whole
+    // TUI for up to the timeout (#3757 review). Spawn it into the shared
+    // fleet_draft_cell and let the loop poll + deliver the result, keeping
+    // the wizard interactive with a drafting status.
+    const DRAFT_TIMEOUT: Duration = Duration::from_secs(20);
+    let model_label = app.model_display_label();
+    let client = match DeepSeekClient::new(config) {
+        Ok(client) => client,
+        Err(err) => {
+            deliver_fleet_draft_result(
+                app,
+                model_label.clone(),
+                Err(format!("provider not ready: {err:#}")),
+                locale,
+            );
+            return;
+        }
+    };
+    let request_model = app.model.clone();
+    let cell = app.fleet_draft_cell.clone();
+    let spawn_label = model_label.clone();
+    let request_gen = app.next_draft_gen();
+    app.status_message = Some(match locale {
+        crate::localization::Locale::ZhHans => {
+            format!(
+                "{model_label} 正在起草配置……（最多 {}s）",
+                DRAFT_TIMEOUT.as_secs()
+            )
+        }
+        _ => format!(
+            "{model_label} is drafting the profile… (up to {}s)",
+            DRAFT_TIMEOUT.as_secs()
+        ),
+    });
+    app.needs_redraw = true;
+    tokio::spawn(async move {
+        let outcome = match tokio::time::timeout(
+            DRAFT_TIMEOUT,
+            crate::tui::setup::draft_fleet_profile_with_model(
+                &client,
+                &request_model,
+                &role,
+                &model_class,
+                locale,
+            ),
+        )
+        .await
+        {
+            Err(_) => Err(format!("timed out after {}s", DRAFT_TIMEOUT.as_secs())),
+            Ok(result) => result,
+        };
+        if let Ok(mut guard) = cell.lock() {
+            *guard = Some((request_gen, spawn_label, outcome));
+        }
+    });
+}
+
+/// Install a completed fleet-profile draft into the wizard (if it is still on
+/// top) and open its preview, or surface a failure. Called from the event
+/// loop when the background draft lands, and directly on the pre-spawn
+/// provider-construction failure.
+fn deliver_fleet_draft_result(
+    app: &mut App,
+    model_label: String,
+    outcome: Result<Box<crate::fleet::profile::FleetProfileDraft>, String>,
+    locale: crate::localization::Locale,
+) {
+    match outcome {
+        Ok(draft) => {
+            if app.view_stack.top_kind() == Some(ModalKind::FleetSetup)
+                && let Some(mut boxed) = app.view_stack.pop()
+            {
+                let preview = boxed
+                    .as_any_mut()
+                    .downcast_mut::<crate::tui::views::fleet_setup::FleetSetupView>()
+                    .map(|wizard| wizard.install_model_draft(draft, model_label.clone()));
+                app.view_stack.push_boxed(boxed);
+                if let Some((title, content)) = preview {
+                    open_text_pager(app, title, content);
+                    app.status_message = Some(match locale {
+                        crate::localization::Locale::ZhHans => {
+                            format!("{model_label} 已起草配置。请查看 TOML，然后按 g 批准。")
+                        }
+                        _ => format!(
+                            "{model_label} drafted the profile. Review the TOML, then press g to ratify."
+                        ),
+                    });
+                }
+            }
+        }
+        Err(reason) => {
+            app.status_message = Some(match locale {
+                crate::localization::Locale::ZhHans => {
+                    format!("{model_label} 未能起草配置（{reason}）。按 Enter 仍会插入编写提示。")
+                }
+                _ => format!(
+                    "{model_label} could not draft the profile ({reason}). Enter still inserts the authoring prompt."
+                ),
+            });
+        }
+    }
+    app.needs_redraw = true;
 }
 
 // `format_*` chip/message builders moved to `tui/format_helpers.rs`.
@@ -6968,6 +7337,31 @@ async fn switch_provider(
         Ok(route) => route,
         Err(reason) => {
             app.pending_provider_switch = None;
+            // #3830: if the switch failed only because the target provider has
+            // no key or local runtime, hand off to /provider already focused
+            // on that provider's key prompt instead of dead-ending with an
+            // error the user has to translate into an action.
+            if !crate::config::has_api_key_for(config, target)
+                && app.view_stack.top_kind() != Some(ModalKind::ProviderPicker)
+            {
+                let runtime_status = query_provider_runtime_status(engine_handle).await;
+                if let Some(picker) =
+                    crate::tui::provider_picker::ProviderPickerView::new_for_missing_auth(
+                        previous_provider,
+                        target,
+                        config,
+                        runtime_status,
+                    )
+                {
+                    app.view_stack.push(picker);
+                    app.status_message = Some(format!(
+                        "{} needs a key or local runtime — enter one to switch.",
+                        target.display_name()
+                    ));
+                    app.needs_redraw = true;
+                    return;
+                }
+            }
             app.add_message(HistoryCell::System {
                 content: format!(
                     "Cannot switch to {}: {reason}\nProvider unchanged ({}).",
@@ -7053,14 +7447,15 @@ async fn switch_provider(
         .await;
 
     let persist_warning = (|| -> anyhow::Result<()> {
+        let provider_key = provider_persistence_key(config, target);
         crate::config_persistence::persist_root_string_key(
             app.config_path.as_deref(),
             "provider",
-            target.as_str(),
+            &provider_key,
         )?;
 
         let mut settings = crate::settings::Settings::load()?;
-        settings.default_provider = Some(target.as_str().to_string());
+        settings.default_provider = Some(provider_key);
         if model_override.is_some() {
             settings.set_model_for_provider(target.as_str(), &new_model);
             if matches!(target, ApiProvider::Deepseek | ApiProvider::DeepseekCN) {
@@ -7095,6 +7490,24 @@ async fn switch_provider(
         status_message.push_str(" (not fully persisted)");
     }
     app.status_message = Some(status_message);
+}
+
+fn provider_persistence_key(config: &Config, provider: ApiProvider) -> String {
+    if provider == ApiProvider::Custom
+        && let Some(provider_id) = config
+            .provider
+            .as_deref()
+            .map(str::trim)
+            .filter(|provider_id| !provider_id.is_empty())
+        && config
+            .providers
+            .as_ref()
+            .and_then(|providers| providers.custom_provider_config(provider_id))
+            .is_some()
+    {
+        return provider_id.to_string();
+    }
+    provider.as_str().to_string()
 }
 
 async fn apply_provider_fallback_switch(
@@ -7453,6 +7866,25 @@ async fn apply_command_result(
                     }
                 }
             }
+            AppAction::SwitchModelRoute { provider, model } => {
+                let previous_model = if app.auto_model {
+                    "auto".to_string()
+                } else {
+                    app.model.clone()
+                };
+                let previous_effort = app.reasoning_effort;
+                apply_model_picker_choice(
+                    app,
+                    engine_handle,
+                    config,
+                    model,
+                    Some(provider),
+                    previous_effort.normalize_for_provider(provider),
+                    previous_model,
+                    previous_effort,
+                )
+                .await;
+            }
             AppAction::UpdateCompaction(compaction) => {
                 apply_model_and_compaction_update(
                     engine_handle,
@@ -7614,6 +8046,7 @@ async fn apply_command_result(
             }
             AppAction::OpenFleetSetup => {
                 if app.view_stack.top_kind() != Some(ModalKind::FleetSetup) {
+                    let _ = app.next_draft_gen();
                     app.view_stack
                         .push(crate::tui::views::fleet_setup::FleetSetupView::new(
                             app, config,
@@ -7626,6 +8059,23 @@ async fn apply_command_result(
                         .push(crate::tui::hotbar::setup::HotbarSetupView::new(app, config));
                 }
             }
+            AppAction::OpenSetupWizard => {
+                if app.view_stack.top_kind() != Some(ModalKind::SetupWizard) {
+                    let _ = app.next_draft_gen();
+                    app.view_stack
+                        .push(crate::tui::setup::SetupWizardView::new_for_app(app, config));
+                }
+            }
+            AppAction::OpenSetupWizardAt { step } => {
+                if app.view_stack.top_kind() != Some(ModalKind::SetupWizard) {
+                    let _ = app.next_draft_gen();
+                    app.view_stack
+                        .push(crate::tui::setup::SetupWizardView::new_for_app_at(
+                            app, config, step,
+                        ));
+                }
+            }
+            AppAction::UseBundledConstitution => use_bundled_constitution(app, config),
             AppAction::DisableHotbar => disable_hotbar(app, config),
             AppAction::RestoreHotbarDefaults => restore_hotbar_defaults(app, config),
             AppAction::OpenExternalUrl { url, label } => match open_external_url(&url) {
@@ -8081,14 +8531,17 @@ fn mcp_ui_action_refreshes_discovery(action: &crate::tui::app::McpUiAction) -> b
 
 fn handle_shell_job_action(app: &mut App, action: crate::tui::app::ShellJobAction) {
     let Some(shell_manager) = app.runtime_services.shell_manager.clone() else {
-        add_shell_job_message(app, "Command center is not attached.".to_string());
+        add_shell_job_message(app, "No shell session is active.".to_string());
         return;
     };
 
     let mut manager = match shell_manager.lock() {
         Ok(manager) => manager,
         Err(_) => {
-            add_shell_job_message(app, "Command center lock is poisoned.".to_string());
+            add_shell_job_message(
+                app,
+                "Shell tracking hit an internal error — restart CodeWhale to recover.".to_string(),
+            );
             return;
         }
     };
@@ -9113,6 +9566,42 @@ fn apply_hotbar_setup_saved(
     app.needs_redraw = true;
 }
 
+fn use_bundled_constitution(app: &mut App, config: &Config) {
+    let mut state = crate::tui::setup::load_setup_state_for_app(app, config);
+    state.complete_constitution_checkpoint(
+        crate::tui::setup::CONSTITUTION_CHECKPOINT_VERSION,
+        codewhale_config::ConstitutionChoice::Bundled,
+    );
+    state.constitution_source = codewhale_config::ConstitutionSource::Bundled;
+    state.constitution_validity = codewhale_config::ConstitutionValidity::Unknown;
+    state.constitution_preview_hash = None;
+    state.set_step(
+        codewhale_config::SetupStep::Constitution,
+        codewhale_config::StepEntry::new(
+            codewhale_config::StepStatus::Verified,
+            true,
+            crate::tui::setup::CONSTITUTION_CHECKPOINT_VERSION,
+        )
+        .with_result("bundled/default constitution"),
+    );
+
+    match state.save() {
+        Ok(()) => {
+            app.status_message = Some(
+                "Using the bundled/default constitution; custom user-global law is inactive."
+                    .to_string(),
+            );
+        }
+        Err(err) => {
+            app.status_message = Some(format!("Failed to save constitution choice: {err}"));
+            app.add_message(HistoryCell::System {
+                content: format!("Failed to save constitution choice: {err}"),
+            });
+        }
+    }
+    app.needs_redraw = true;
+}
+
 /// Hide the Hotbar: persist `hotbar = []` (the canonical "disabled" state) and
 /// clear the live in-memory slots so the panel disappears immediately. The
 /// explicit empty array — not a missing key — is what disables defaults, so we
@@ -9451,6 +9940,173 @@ async fn handle_view_events(
             ViewEvent::HotbarSetupSaved { bindings } => {
                 apply_hotbar_setup_saved(app, config, bindings);
             }
+            ViewEvent::SetupStateCommitRequested { state, message } => match state.save() {
+                Ok(()) => {
+                    app.status_message = Some(message);
+                }
+                Err(err) => {
+                    app.status_message = Some(format!("Setup state could not be saved: {err}"));
+                }
+            },
+            ViewEvent::SetupConstitutionCommitRequested {
+                constitution,
+                state,
+                message,
+            } => match crate::tui::setup::persist_user_constitution_choice(&constitution, &state) {
+                Ok(()) => {
+                    app.status_message = Some(message);
+                }
+                Err(err) => {
+                    app.status_message =
+                        Some(format!("User constitution could not be saved: {err}"));
+                }
+            },
+            ViewEvent::SetupConstitutionModelDraftRequested { draft, locale } => {
+                handle_setup_constitution_model_draft(app, config, draft, locale).await;
+            }
+            ViewEvent::FleetProfileModelDraftRequested {
+                role,
+                model_class,
+                locale,
+            } => {
+                handle_fleet_profile_model_draft(app, config, role, model_class, locale).await;
+            }
+            ViewEvent::FleetProfileDraftCommitRequested { draft } => {
+                // The TOML is rendered deterministically from the validated
+                // draft and written atomically; the target path is derived
+                // from the sanitized id, never model-chosen.
+                let target = app
+                    .workspace
+                    .join(crate::fleet::profile::WORKSPACE_AGENT_PROFILE_DIR)
+                    .join(draft.file_name());
+                // A ratified profile must not silently clobber a differently
+                // named existing profile that shares this id (which would also
+                // make the whole agents dir fail to load on the duplicate).
+                // Overwriting the SAME file is fine — that is an intentional
+                // re-draft of this profile.
+                // Fail CLOSED: if the agents dir can't be read/parsed we
+                // cannot prove there's no id collision, so refuse rather than
+                // write into a dir that already fails to load.
+                let existing_profiles =
+                    crate::fleet::profile::load_workspace_agent_profiles(&app.workspace);
+                if let Err(err) = &existing_profiles {
+                    let zh = app.ui_locale == crate::localization::Locale::ZhHans;
+                    app.status_message = Some(if zh {
+                        format!(
+                            "无法校验现有配置（.codewhale/agents 中有文件无法读取：{err}）；请先修复再保存。"
+                        )
+                    } else {
+                        format!(
+                            "Could not verify existing profiles (a file in .codewhale/agents is unreadable: {err}); fix it before saving."
+                        )
+                    });
+                    app.needs_redraw = true;
+                    continue;
+                }
+                let id_conflict = existing_profiles
+                    .into_iter()
+                    .flatten()
+                    .find(|p| p.id == draft.id && p.source != target);
+                if let Some(existing) = id_conflict {
+                    let zh = app.ui_locale == crate::localization::Locale::ZhHans;
+                    app.status_message = Some(if zh {
+                        format!(
+                            "配置 id `{}` 已被 {} 占用；请重新起草为不同的角色或先移除旧文件。",
+                            draft.id,
+                            existing.source.display()
+                        )
+                    } else {
+                        format!(
+                            "Profile id `{}` is already used by {}; redraft with a different role or remove the old file first.",
+                            draft.id,
+                            existing.source.display()
+                        )
+                    });
+                    app.needs_redraw = true;
+                    continue;
+                }
+                let mut txn = codewhale_config::persistence::SetupTransaction::new();
+                txn.stage(target.clone(), draft.render_toml().into_bytes());
+                match txn.commit() {
+                    Ok(()) => {
+                        let zh = app.ui_locale == crate::localization::Locale::ZhHans;
+                        app.add_message(HistoryCell::System {
+                            content: if zh {
+                                format!("已批准并保存 Fleet 配置：{}", target.display())
+                            } else {
+                                format!("Fleet profile ratified and saved: {}", target.display())
+                            },
+                        });
+                        app.status_message = Some(if zh {
+                            format!("已保存 Fleet 配置：{}", draft.file_name())
+                        } else {
+                            format!("Fleet profile saved: {}", draft.file_name())
+                        });
+                    }
+                    Err(err) => {
+                        app.status_message =
+                            Some(if app.ui_locale == crate::localization::Locale::ZhHans {
+                                format!("无法保存 Fleet 配置：{err:#}")
+                            } else {
+                                format!("Fleet profile could not be saved: {err:#}")
+                            });
+                    }
+                }
+                app.needs_redraw = true;
+            }
+            ViewEvent::SetupRuntimePresetApplyRequested {
+                preset,
+                state,
+                message,
+            } => match apply_setup_runtime_preset(app, config, preset, state) {
+                Ok(summary) => {
+                    app.status_message = Some(format!("{message} {summary}"));
+                }
+                Err(err) => {
+                    app.status_message =
+                        Some(format!("Runtime preset could not be applied: {err:#}"));
+                }
+            },
+            ViewEvent::SetupOpenProviderRequested => {
+                if app.view_stack.top_kind() != Some(ModalKind::ProviderPicker) {
+                    let runtime_status = query_provider_runtime_status(engine_handle).await;
+                    app.view_stack.push(
+                        crate::tui::provider_picker::ProviderPickerView::new_with_runtime_status(
+                            app.api_provider,
+                            config,
+                            runtime_status,
+                        ),
+                    );
+                    app.status_message =
+                        Some("Provider setup opened from /setup readiness.".to_string());
+                }
+            }
+            ViewEvent::SetupOpenModelRequested => {
+                if app.view_stack.top_kind() != Some(ModalKind::ModelPicker) {
+                    app.view_stack
+                        .push(crate::tui::model_picker::ModelPickerView::new(app, config));
+                    app.status_message =
+                        Some("Model route picker opened from /setup readiness.".to_string());
+                }
+            }
+            ViewEvent::SetupOpenModeRequested => {
+                if app.view_stack.top_kind() != Some(ModalKind::ModePicker) {
+                    app.view_stack
+                        .push(crate::tui::views::mode_picker::ModePickerView::new(
+                            app.mode,
+                            app.ui_locale,
+                        ));
+                    app.status_message =
+                        Some("Work mode picker opened from /setup runtime posture.".to_string());
+                }
+            }
+            ViewEvent::SetupOpenConfigRequested => {
+                if app.view_stack.top_kind() != Some(ModalKind::Config) {
+                    app.view_stack.push(ConfigView::new_for_app(app));
+                    app.status_message =
+                        Some("Config view opened from /setup runtime posture.".to_string());
+                }
+            }
             ViewEvent::HotbarDisableRequested => {
                 disable_hotbar(app, config);
             }
@@ -9498,12 +10154,42 @@ async fn handle_view_events(
                 )
                 .await;
             }
-            ViewEvent::ProviderPickerApplied { provider } => {
+            ViewEvent::ProviderPickerApplied {
+                provider,
+                provider_id,
+            } => {
+                if let Some(provider_id) = provider_id {
+                    set_active_custom_provider_in_memory(config, &provider_id);
+                }
                 let model_override = provider_picker_model_override(app, provider);
                 switch_provider(app, engine_handle, config, provider, model_override).await;
             }
-            ViewEvent::ProviderPickerApiKeySubmitted { provider, api_key } => {
+            ViewEvent::ProviderPickerApiKeySubmitted {
+                provider,
+                provider_id,
+                api_key,
+            } => {
+                if let Some(provider_id) = provider_id {
+                    set_active_custom_provider_in_memory(config, &provider_id);
+                }
                 apply_provider_picker_api_key(app, engine_handle, config, provider, api_key).await;
+            }
+            ViewEvent::ProviderPickerCustomProviderSubmitted {
+                provider_id,
+                base_url,
+                model,
+                api_key_env,
+            } => {
+                apply_provider_picker_custom_provider(
+                    app,
+                    engine_handle,
+                    config,
+                    provider_id,
+                    base_url,
+                    model,
+                    api_key_env,
+                )
+                .await;
             }
             ViewEvent::ProviderPickerKimiOAuthEnabled { provider } => {
                 apply_provider_picker_auth_mode(
@@ -9516,7 +10202,13 @@ async fn handle_view_events(
                 )
                 .await;
             }
-            ViewEvent::ProviderPickerOpenModels { provider } => {
+            ViewEvent::ProviderPickerOpenModels {
+                provider,
+                provider_id,
+            } => {
+                if let Some(provider_id) = provider_id {
+                    set_active_custom_provider_in_memory(config, &provider_id);
+                }
                 open_model_picker_for_provider(app, config, provider);
             }
             ViewEvent::ModeSelected { mode } => {
@@ -9661,6 +10353,67 @@ async fn apply_approval_decision(
     }
 }
 
+fn apply_setup_runtime_preset(
+    app: &mut App,
+    config: &mut Config,
+    preset: crate::tui::setup::SetupRuntimePreset,
+    state: codewhale_config::SetupState,
+) -> Result<String> {
+    let mut settings = Settings::load().context("failed to load settings")?;
+    settings.default_mode = preset.default_mode().to_string();
+    settings.save().context("failed to save settings")?;
+
+    let config_path = app.config_path.as_deref();
+    if let Some(policy) = preset.approval_policy() {
+        crate::config_persistence::persist_root_string_key(config_path, "approval_policy", policy)
+            .context("failed to persist approval_policy")?;
+        config.approval_policy = Some(policy.to_string());
+    }
+    crate::config_persistence::persist_root_bool_key(
+        config_path,
+        "allow_shell",
+        preset.allow_shell(),
+    )
+    .context("failed to persist allow_shell")?;
+    config.allow_shell = Some(preset.allow_shell());
+    crate::config_persistence::persist_root_string_key(
+        config_path,
+        "sandbox_mode",
+        preset.sandbox_mode(),
+    )
+    .context("failed to persist sandbox_mode")?;
+    config.sandbox_mode = Some(preset.sandbox_mode().to_string());
+
+    let mode = AppMode::from_setting(preset.default_mode());
+    app.set_mode(mode);
+    app.allow_shell = preset.allow_shell();
+    if let Some(policy) = preset.approval_policy() {
+        app.approval_mode =
+            ApprovalMode::from_config_value(policy).unwrap_or(ApprovalMode::Suggest);
+    }
+    match preset {
+        crate::tui::setup::SetupRuntimePreset::AskFirst => {
+            app.trust_mode = false;
+            app.yolo = false;
+        }
+        crate::tui::setup::SetupRuntimePreset::NormalAgent => {
+            app.yolo = false;
+        }
+        crate::tui::setup::SetupRuntimePreset::HighTrustLocal => {
+            app.approval_mode = ApprovalMode::Bypass;
+            app.trust_mode = true;
+            app.yolo = true;
+        }
+    }
+    app.needs_redraw = true;
+
+    state
+        .save()
+        .context("failed to persist setup runtime posture state")?;
+
+    Ok(format!("Applied {}.", preset.result_summary()))
+}
+
 fn persist_ask_rules_from_approval(
     app: &mut App,
     config: &mut Config,
@@ -9796,6 +10549,27 @@ fn find_user_cell_index_from_tail(app: &App, depth: usize) -> Option<usize> {
 /// the overlay, and surface a status hint. The cycle counter is bumped
 /// so any persistent indices clear; the engine's in-flight context is
 /// re-synced via `Op::SyncSession` so the next turn starts fresh.
+/// Index in `api_messages` to truncate to for a backtrack of `depth` visible
+/// user prompts from the tail. Counts only messages that yield a
+/// `HistoryCell::User` (a real prompt), NOT tool-result messages which are
+/// also stored with `role == "user"`. Returns `None` if fewer than `depth`
+/// user prompts exist.
+fn backtrack_api_cut_index(api_messages: &[Message], depth: usize) -> Option<usize> {
+    let mut user_seen = 0usize;
+    for (idx, msg) in api_messages.iter().enumerate().rev() {
+        let yields_user = history_cells_from_message(msg)
+            .iter()
+            .any(|cell| matches!(cell, HistoryCell::User { .. }));
+        if yields_user {
+            if user_seen == depth {
+                return Some(idx);
+            }
+            user_seen += 1;
+        }
+    }
+    None
+}
+
 fn apply_backtrack(app: &mut App, depth: usize) {
     let Some(history_idx) = find_user_cell_index_from_tail(app, depth) else {
         app.status_message = Some("Backtrack target no longer present".to_string());
@@ -9814,22 +10588,15 @@ fn apply_backtrack(app: &mut App, depth: usize) {
     // `App::truncate_history_to`.
     app.truncate_history_to(history_idx);
 
-    // Trim the API-message log at the matching user message. We
-    // re-walk `api_messages` from the tail, counting role=="user"
-    // boundaries so the depth aligns with what the model sees on the
-    // next turn.
-    let mut user_seen = 0usize;
-    let mut cut = None;
-    for (idx, msg) in app.api_messages.iter().enumerate().rev() {
-        if msg.role == "user" {
-            if user_seen == depth {
-                cut = Some(idx);
-                break;
-            }
-            user_seen += 1;
-        }
-    }
-    if let Some(idx) = cut {
+    // Trim the API-message log at the matching user PROMPT. `depth` counts
+    // visible `HistoryCell::User` cells (real prompts), but a naive
+    // `role == "user"` walk over `api_messages` over-counts: tool results are
+    // stored as `role == "user"` messages too, so in any turn with tool calls
+    // the cut would land mid-turn on a tool_result — leaving a dangling
+    // assistant tool_use with no matching result and a transcript the provider
+    // rejects. Count only messages that actually yield a User cell, the same
+    // predicate `apply_loaded_session` uses.
+    if let Some(idx) = backtrack_api_cut_index(&app.api_messages, depth) {
         app.api_messages.truncate(idx);
     }
 
@@ -9850,6 +10617,71 @@ fn apply_backtrack(app: &mut App, depth: usize) {
 
 /// Persist the typed API key to `~/.codewhale/config.toml`, refresh the
 /// in-memory config so the engine can see it, then switch to the provider.
+fn set_active_custom_provider_in_memory(config: &mut Config, provider_id: &str) {
+    let provider_id = provider_id.trim();
+    if provider_id.is_empty() {
+        return;
+    }
+    config.provider = Some(provider_id.to_string());
+    config
+        .providers
+        .get_or_insert_with(ProvidersConfig::default)
+        .custom
+        .entry(provider_id.to_string())
+        .or_default();
+}
+
+async fn apply_provider_picker_custom_provider(
+    app: &mut App,
+    engine_handle: &mut EngineHandle,
+    config: &mut Config,
+    provider_id: String,
+    base_url: String,
+    model: Option<String>,
+    api_key_env: Option<String>,
+) {
+    let written = match crate::config_persistence::persist_custom_provider(
+        app.config_path.as_deref(),
+        &provider_id,
+        &base_url,
+        model.as_deref(),
+        api_key_env.as_deref(),
+    ) {
+        Ok(path) => path,
+        Err(err) => {
+            app.add_message(HistoryCell::System {
+                content: format!("Failed to save custom provider {provider_id}: {err}"),
+            });
+            app.status_message = Some("Custom provider was not saved.".to_string());
+            return;
+        }
+    };
+
+    config.provider = Some(provider_id.clone());
+    let entry = config
+        .providers
+        .get_or_insert_with(ProvidersConfig::default)
+        .custom
+        .entry(provider_id.clone())
+        .or_default();
+    entry.kind = Some("openai-compatible".to_string());
+    entry.base_url = Some(base_url.trim().trim_end_matches('/').to_string());
+    entry.model = model.clone().and_then(|value| {
+        let value = value.trim().to_string();
+        (!value.is_empty()).then_some(value)
+    });
+    entry.api_key_env = api_key_env.and_then(|value| {
+        let value = value.trim().to_string();
+        (!value.is_empty()).then_some(value)
+    });
+
+    app.status_message = Some(format!(
+        "Custom provider {provider_id} saved to {}",
+        written.display()
+    ));
+    switch_provider(app, engine_handle, config, ApiProvider::Custom, model).await;
+}
+
 async fn apply_provider_picker_api_key(
     app: &mut App,
     engine_handle: &mut EngineHandle,
@@ -10545,7 +11377,7 @@ fn render_toast_stack_overlay(
 
 pub(crate) fn request_foreground_shell_background(app: &mut App) {
     if !app.is_loading {
-        app.status_message = Some("No foreground shell command to background".to_string());
+        app.status_message = Some("No foreground shell wait to move to /jobs".to_string());
         return;
     }
     if !active_foreground_shell_running(app) {
@@ -10564,23 +11396,25 @@ pub(crate) fn request_foreground_shell_background(app: &mut App) {
             "no foreground shell command is running"
         };
         app.status_message = Some(format!(
-            "Cannot background: {reason}. Press Ctrl+C to cancel the turn, or wait for completion."
+            "Cannot move to /jobs: {reason}. Press Ctrl+C to cancel the turn, or wait for completion."
         ));
         return;
     }
 
     let Some(shell_manager) = app.runtime_services.shell_manager.clone() else {
-        app.status_message = Some("Shell manager is not attached".to_string());
+        app.status_message = Some("No shell session is active.".to_string());
         return;
     };
 
     match shell_manager.lock() {
         Ok(mut manager) => {
             manager.request_foreground_background();
-            app.status_message = Some("Backgrounding current shell command...".to_string());
+            app.status_message = Some("Moving current shell command to /jobs...".to_string());
         }
         Err(_) => {
-            app.status_message = Some("Shell manager lock is poisoned".to_string());
+            app.status_message = Some(
+                "Shell tracking hit an internal error — restart CodeWhale to recover.".to_string(),
+            );
         }
     }
 }

@@ -357,10 +357,12 @@ fn render_preserved_output_mode(
         return lines;
     }
 
+    // Hash once; reuse for both the rows cache and the indices cache below.
     let content_hash = crate::tui::output_rows_cache::hash_str(output);
-    let all_lines = crate::tui::output_rows_cache::get_or_compute_rows(output, width, || {
-        output_rows(output, width)
-    });
+    let all_lines =
+        crate::tui::output_rows_cache::get_or_compute_rows_with_hash(content_hash, width, || {
+            output_rows(output, width)
+        });
 
     if matches!(mode, RenderMode::Transcript) {
         // Full-content path: emit every wrapped line with no head/tail split,

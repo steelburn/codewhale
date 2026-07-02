@@ -11,7 +11,7 @@
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent, MouseEventKind};
 use ratatui::{
     buffer::Buffer,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Widget},
@@ -22,7 +22,7 @@ use crate::model_registry;
 use crate::palette;
 use crate::tui::app::{App, ReasoningEffort};
 use crate::tui::views::{
-    ActionHint, ModalKind, ModalView, ViewAction, ViewEvent, centered_modal_area,
+    ActionHint, ListDetailLayout, ModalKind, ModalView, ViewAction, ViewEvent, centered_modal_area,
     render_modal_footer, render_modal_surface,
 };
 
@@ -218,6 +218,17 @@ impl ModelPickerView {
                 .show_custom_model_row
                 .then(|| (self.initial_model.clone(), self.initial_provider));
         }
+        if let Some((provider, model)) = self.provider_qualified_custom_query(query) {
+            if visible_rows.iter().any(|row| {
+                row.provider == Some(provider) && row.id.eq_ignore_ascii_case(model.trim())
+            }) {
+                return None;
+            }
+            if self.provider_accepts_custom_model(provider, &model) {
+                return Some((model, provider));
+            }
+            return None;
+        }
         if !self.active_accepts_custom_model_ids {
             return None;
         }
@@ -227,6 +238,28 @@ impl ModelPickerView {
             return None;
         }
         Some((query.to_string(), self.initial_provider))
+    }
+
+    fn provider_qualified_custom_query(&self, query: &str) -> Option<(ApiProvider, String)> {
+        for (provider_key, model) in provider_query_splits(query) {
+            let Some(provider) = ApiProvider::parse(provider_key) else {
+                continue;
+            };
+            if provider != self.initial_provider && !self.configured_providers.contains(&provider) {
+                continue;
+            }
+            let model = model.trim();
+            if model.is_empty() {
+                continue;
+            }
+            return Some((provider, model.to_string()));
+        }
+        None
+    }
+
+    fn provider_accepts_custom_model(&self, provider: ApiProvider, model: &str) -> bool {
+        (provider == self.initial_provider && self.active_accepts_custom_model_ids)
+            || crate::config::normalize_model_name_for_provider(provider, model).is_some()
     }
 
     fn clamp_model_selection(&mut self) {
@@ -378,6 +411,19 @@ impl ModelPickerView {
                 hint_style,
             );
             lines.push(Line::from(spans));
+        }
+        if rows.is_empty() {
+            // A search that matches nothing must say so, not render a bare
+            // empty box (#3757 UX review).
+            let message = if self.query.is_empty() {
+                "No models available.".to_string()
+            } else {
+                format!("No models match \"{}\" — Backspace to clear.", self.query)
+            };
+            lines.push(Line::from(Span::styled(
+                message,
+                Style::default().fg(palette::TEXT_MUTED),
+            )));
         }
         Paragraph::new(lines).render(inner, buf);
     }
@@ -569,6 +615,19 @@ fn push_model_id(models: &mut Vec<String>, model: &str) {
     {
         models.push(model.to_string());
     }
+}
+
+fn provider_query_splits(query: &str) -> Vec<(&str, &str)> {
+    let trimmed = query.trim();
+    let mut splits = Vec::new();
+    if let Some((provider, model)) = trimmed.split_once(':') {
+        splits.push((provider.trim(), model.trim()));
+    }
+    if let Some(idx) = trimmed.find(char::is_whitespace) {
+        let (provider, model) = trimmed.split_at(idx);
+        splits.push((provider.trim(), model.trim()));
+    }
+    splits
 }
 
 fn push_model_row(
@@ -842,10 +901,7 @@ impl ModelPickerView {
             ],
         );
 
-        let columns = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
-            .split(content);
+        let layout = ListDetailLayout::split(content, 24);
 
         let mut model_rows: Vec<(String, String)> = self
             .visible_model_rows()
@@ -876,7 +932,7 @@ impl ModelPickerView {
             format!("Model: {}", self.query.trim())
         };
         self.render_pane(
-            columns[0],
+            layout.list,
             buf,
             &model_title,
             model_rows,
@@ -913,7 +969,7 @@ impl ModelPickerView {
             })
             .collect();
         self.render_pane(
-            columns[1],
+            layout.detail,
             buf,
             "Thinking",
             effort_rows,
@@ -1067,6 +1123,25 @@ mod tests {
         assert!(
             hint.contains("priced"),
             "hint should include pricing availability: {hint}"
+        );
+    }
+
+    #[test]
+    fn provider_query_splits_support_colon_and_space_forms() {
+        assert_eq!(
+            provider_query_splits("openrouter:anthropic/claude-sonnet-4"),
+            vec![("openrouter", "anthropic/claude-sonnet-4")]
+        );
+        assert_eq!(
+            provider_query_splits("openrouter anthropic/claude-sonnet-4"),
+            vec![("openrouter", "anthropic/claude-sonnet-4")]
+        );
+        assert_eq!(
+            provider_query_splits("openrouter anthropic/foo:bar"),
+            vec![
+                ("openrouter anthropic/foo", "bar"),
+                ("openrouter", "anthropic/foo:bar")
+            ]
         );
     }
 
@@ -1414,6 +1489,47 @@ mod tests {
             }) => {
                 assert_eq!(model, "custom-org/custom-model");
                 assert_eq!(provider, None, "active-provider custom row is not a switch");
+            }
+            other => panic!("expected ModelPickerApplied EmitAndClose, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn picker_query_provider_qualified_custom_row_targets_configured_provider() {
+        let (mut app, _default_config, _lock) = create_test_app();
+        app.api_provider = crate::config::ApiProvider::Deepseek;
+        app.model_ids_passthrough = false;
+        app.model = "deepseek-v4-pro".to_string();
+        app.auto_model = false;
+        let config = Config {
+            providers: Some(crate::config::ProvidersConfig {
+                openrouter: crate::config::ProviderConfig {
+                    api_key: Some("test-openrouter-key".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Config::default()
+        };
+
+        let mut view = ModelPickerView::new(&app, &config);
+        type_model_query(&mut view, "openrouter:anthropic/custom-sonnet");
+
+        assert_eq!(view.resolved_model(), "anthropic/custom-sonnet");
+        assert_eq!(
+            view.resolved_provider(),
+            Some(crate::config::ApiProvider::Openrouter)
+        );
+        let action = view.handle_key(KeyEvent::new(
+            KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        match action {
+            ViewAction::EmitAndClose(ViewEvent::ModelPickerApplied {
+                model, provider, ..
+            }) => {
+                assert_eq!(model, "anthropic/custom-sonnet");
+                assert_eq!(provider, Some(crate::config::ApiProvider::Openrouter));
             }
             other => panic!("expected ModelPickerApplied EmitAndClose, got {other:?}"),
         }
@@ -2059,6 +2175,11 @@ mod tests {
             // Footer keeps every action (it wraps instead of clipping).
             for label in ["move", "switch", "filter", "apply", "cancel"] {
                 assert!(text.contains(label), "{w}x{h}: missing '{label}' hint");
+            }
+            // The shared list/detail layout keeps both picker panes visible;
+            // narrow blocker sizes stack them instead of squeezing columns.
+            for label in ["Model", "Thinking"] {
+                assert!(text.contains(label), "{w}x{h}: missing '{label}' pane");
             }
             // Composited frame is fully opaque: no sentinel survives and the
             // center cell carries the modal ink background.

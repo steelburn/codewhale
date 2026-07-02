@@ -24,7 +24,7 @@ use crate::tui::footer_ui::{
 use crate::tui::history::{
     ExecCell, ExecSource, GenericToolCell, HistoryCell, SubAgentCell, ToolCell, ToolStatus,
 };
-use crate::tui::hotbar::actions::HotbarDispatch;
+use crate::tui::hotbar::actions::{HotbarActionCategory, HotbarDispatch};
 use crate::tui::views::{HelpView, ModalView, ViewAction};
 use crate::working_set::Workspace;
 use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
@@ -1729,6 +1729,16 @@ fn create_test_app() -> App {
     // Pin locale and currency for deterministic tests regardless of host locale.
     app.cost_currency = crate::pricing::CostCurrency::Usd;
     app.ui_locale = crate::localization::Locale::En;
+    // Pin the route identity too: App::new consults the developer's real
+    // saved settings (provider/model maps, auto-model, route limits), so on
+    // a machine with customized settings the context-window tests computed
+    // against a different model than the requested deepseek-v4-pro.
+    app.api_provider = crate::config::ApiProvider::Deepseek;
+    app.model = "deepseek-v4-pro".to_string();
+    app.auto_model = false;
+    app.last_effective_model = None;
+    app.active_route_limits = None;
+    app.active_context_window_override = None;
     app
 }
 
@@ -1984,6 +1994,99 @@ fn create_test_options() -> TuiOptions {
         resume_session_id: None,
         initial_input: None,
     }
+}
+
+#[test]
+fn setup_checkpoint_opens_after_onboarding_when_due() {
+    let _home = SettingsHomeGuard::new();
+    let config = Config::default();
+    let mut app = App::new(create_test_options(), &config);
+    app.onboarding = OnboardingState::None;
+
+    assert!(open_setup_checkpoint_if_due(&mut app, &config, false));
+    assert_eq!(app.view_stack.top_kind(), Some(ModalKind::SetupWizard));
+    assert!(
+        !open_setup_checkpoint_if_due(&mut app, &config, false),
+        "setup wizard should not be stacked twice"
+    );
+}
+
+#[test]
+fn setup_checkpoint_waits_for_onboarding_and_skip_flag() {
+    let _home = SettingsHomeGuard::new();
+    let config = Config::default();
+    let mut app = App::new(create_test_options(), &config);
+    app.onboarding = OnboardingState::Tips;
+
+    assert!(!open_setup_checkpoint_if_due(&mut app, &config, false));
+    assert!(app.view_stack.is_empty());
+
+    app.onboarding = OnboardingState::None;
+    assert!(!open_setup_checkpoint_if_due(&mut app, &config, true));
+    assert!(app.view_stack.is_empty());
+}
+
+#[test]
+fn setup_runtime_preset_apply_persists_settings_config_and_state() {
+    let _home = SettingsHomeGuard::new();
+    let config_path = crate::config_persistence::config_toml_path(None).expect("config path");
+    std::fs::create_dir_all(config_path.parent().expect("config parent"))
+        .expect("config parent exists");
+    std::fs::write(
+        &config_path,
+        "# preserve this comment\nmodel = \"deepseek-v4-pro\"\n",
+    )
+    .expect("seed config");
+
+    let mut app = create_test_app();
+    app.config_path = Some(config_path.clone());
+    let mut config = Config::default();
+    let preset = crate::tui::setup::SetupRuntimePreset::AskFirst;
+    let mut state = codewhale_config::SetupState::default();
+    state.runtime_posture_source = codewhale_config::RuntimePostureSource::Confirmed;
+    state.set_step(
+        codewhale_config::SetupStep::TrustSandbox,
+        codewhale_config::StepEntry::new(
+            codewhale_config::StepStatus::Verified,
+            true,
+            crate::tui::setup::CONSTITUTION_CHECKPOINT_VERSION,
+        )
+        .with_result(preset.result_summary()),
+    );
+
+    let summary =
+        apply_setup_runtime_preset(&mut app, &mut config, preset, state).expect("apply preset");
+
+    assert!(summary.contains("preset=ask-first"));
+    let settings = Settings::load().expect("load saved settings");
+    assert_eq!(settings.default_mode, "plan");
+    assert_eq!(app.mode, AppMode::Plan);
+    assert!(!app.allow_shell);
+    assert_eq!(app.approval_mode, ApprovalMode::Suggest);
+    assert_eq!(config.allow_shell, Some(false));
+    assert_eq!(config.approval_policy.as_deref(), Some("on-request"));
+    assert_eq!(config.sandbox_mode.as_deref(), Some("read-only"));
+
+    let body = std::fs::read_to_string(&config_path).expect("read saved config");
+    assert!(
+        body.contains("# preserve this comment"),
+        "comment lost: {body}"
+    );
+    assert!(body.contains("approval_policy = \"on-request\""));
+    assert!(body.contains("allow_shell = false"));
+    assert!(body.contains("sandbox_mode = \"read-only\""));
+
+    let saved_state = codewhale_config::SetupState::load()
+        .expect("load setup state")
+        .expect("setup state exists");
+    assert_eq!(
+        saved_state.status(codewhale_config::SetupStep::TrustSandbox),
+        codewhale_config::StepStatus::Verified
+    );
+    assert_eq!(
+        saved_state.runtime_posture_source,
+        codewhale_config::RuntimePostureSource::Confirmed
+    );
 }
 
 #[tokio::test]
@@ -4280,6 +4383,42 @@ fn hotbar_dispatches_slash_command_slot() {
 }
 
 #[test]
+fn hotbar_dispatches_route_switch_slot() {
+    let mut app = create_test_app();
+    app.onboarding = OnboardingState::None;
+    let route_metadata = app
+        .hotbar_actions
+        .iter()
+        .map(|action| action.metadata(crate::localization::Locale::En))
+        .find(|metadata| metadata.category == HotbarActionCategory::Route)
+        .expect("test app should register at least the active provider route");
+    let route_id = route_metadata.id.clone();
+    let route_suffix = route_metadata
+        .id
+        .strip_prefix("route.")
+        .expect("route id prefix");
+    let (provider_key, model) = route_suffix.split_once('.').expect("route id shape");
+    let provider = ApiProvider::parse(provider_key).expect("provider key parses");
+    let model = model.to_string();
+    let config = Config {
+        hotbar: Some(vec![codewhale_config::HotbarBindingToml {
+            slot: 1,
+            label: Some(route_metadata.compact_label),
+            action: route_id,
+        }]),
+        ..Config::default()
+    };
+
+    assert_eq!(
+        dispatch_hotbar_slot(&mut app, &config, 1).expect("route slot dispatch"),
+        Some(HotbarDispatch::AppAction(AppAction::SwitchModelRoute {
+            provider,
+            model,
+        }))
+    );
+}
+
+#[test]
 fn hotbar_bound_disabled_action_reports_reason_without_dispatching() {
     let mut app = create_test_app();
     app.onboarding = OnboardingState::None;
@@ -4822,6 +4961,100 @@ fn subagent_completion_status_reads_summary_fallbacks() {
     assert_eq!(
         subagent_completion_status("Interrupted: process restarted").as_deref(),
         Some("interrupted")
+    );
+}
+
+#[test]
+fn subagent_status_from_completion_result_maps_terminal_sentinels() {
+    let failed = r#"Tool timed out
+<codewhale:subagent.done>{"agent_id":"agent_x","status":"failed"}</codewhale:subagent.done>"#;
+    match subagent_status_from_completion_result(failed) {
+        crate::tools::subagent::SubAgentStatus::Failed(reason) => {
+            assert_eq!(reason, "Tool timed out")
+        }
+        status => panic!("expected failed status, got {status:?}"),
+    }
+
+    let interrupted = r#"Waiting for follow-up
+<codewhale:subagent.done>{"agent_id":"agent_x","status":"interrupted"}</codewhale:subagent.done>"#;
+    match subagent_status_from_completion_result(interrupted) {
+        crate::tools::subagent::SubAgentStatus::Interrupted(reason) => {
+            assert_eq!(reason, "Waiting for follow-up")
+        }
+        status => panic!("expected interrupted status, got {status:?}"),
+    }
+
+    let budget = r#"Token budget exhausted
+<codewhale:subagent.done>{"agent_id":"agent_x","status":"budget_exhausted"}</codewhale:subagent.done>"#;
+    assert_eq!(
+        subagent_status_from_completion_result(budget),
+        crate::tools::subagent::SubAgentStatus::BudgetExhausted
+    );
+
+    let cancelled = r#"Cancelled
+<codewhale:subagent.done>{"agent_id":"agent_x","status":"cancelled"}</codewhale:subagent.done>"#;
+    assert_eq!(
+        subagent_status_from_completion_result(cancelled),
+        crate::tools::subagent::SubAgentStatus::Cancelled
+    );
+
+    assert_eq!(
+        subagent_status_from_completion_result("plain successful summary"),
+        crate::tools::subagent::SubAgentStatus::Completed
+    );
+}
+
+#[test]
+fn subagent_terminal_projection_from_mailbox_maps_terminal_messages() {
+    let completed = crate::tools::subagent::MailboxMessage::Completed {
+        agent_id: "agent_done".to_string(),
+        summary: "all set".to_string(),
+    };
+    let (agent_id, status, result) =
+        subagent_terminal_projection_from_mailbox(&completed).expect("completed projection");
+    assert_eq!(agent_id, "agent_done");
+    assert_eq!(status, crate::tools::subagent::SubAgentStatus::Completed);
+    assert_eq!(result.as_deref(), Some("all set"));
+
+    let failed = crate::tools::subagent::MailboxMessage::Failed {
+        agent_id: "agent_fail".to_string(),
+        error: "tool failed".to_string(),
+    };
+    let (_, status, result) =
+        subagent_terminal_projection_from_mailbox(&failed).expect("failed projection");
+    assert_eq!(result.as_deref(), Some("tool failed"));
+    assert!(matches!(
+        status,
+        crate::tools::subagent::SubAgentStatus::Failed(ref reason)
+            if reason == "tool failed"
+    ));
+
+    let interrupted = crate::tools::subagent::MailboxMessage::Interrupted {
+        agent_id: "agent_wait".to_string(),
+        reason: "needs input".to_string(),
+    };
+    let (_, status, result) =
+        subagent_terminal_projection_from_mailbox(&interrupted).expect("interrupted projection");
+    assert_eq!(result.as_deref(), Some("needs input"));
+    assert!(matches!(
+        status,
+        crate::tools::subagent::SubAgentStatus::Interrupted(ref reason)
+            if reason == "needs input"
+    ));
+
+    let cancelled = crate::tools::subagent::MailboxMessage::Cancelled {
+        agent_id: "agent_stop".to_string(),
+    };
+    let (_, status, result) =
+        subagent_terminal_projection_from_mailbox(&cancelled).expect("cancelled projection");
+    assert_eq!(status, crate::tools::subagent::SubAgentStatus::Cancelled);
+    assert_eq!(result.as_deref(), Some("cancelled"));
+
+    assert!(
+        subagent_terminal_projection_from_mailbox(
+            &crate::tools::subagent::MailboxMessage::progress("agent_live", "step 1/2")
+        )
+        .is_none()
     );
 }
 
@@ -11979,4 +12212,59 @@ fn terminal_input_child_pause_drains_codewhale_events_before_editor_handoff() {
     input.resume_after_child_terminal();
     assert!(!input.paused.load(std::sync::atomic::Ordering::Acquire));
     assert!(!input.paused_ack.load(std::sync::atomic::Ordering::Acquire));
+}
+
+#[test]
+fn backtrack_cut_index_skips_tool_result_user_messages() {
+    use crate::models::{ContentBlock, Message};
+    // A turn with tools: user prompt, assistant tool_use, tool_result (role=user),
+    // assistant text; then a second user prompt.
+    let msgs = vec![
+        Message {
+            role: "user".into(),
+            content: vec![ContentBlock::Text {
+                text: "first".into(),
+                cache_control: None,
+            }],
+        },
+        Message {
+            role: "assistant".into(),
+            content: vec![ContentBlock::ToolUse {
+                id: "t1".into(),
+                name: "read_file".into(),
+                input: serde_json::json!({"path":"x"}),
+                caller: None,
+            }],
+        },
+        Message {
+            role: "user".into(),
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "t1".into(),
+                content: "data".into(),
+                is_error: None,
+                content_blocks: None,
+            }],
+        },
+        Message {
+            role: "assistant".into(),
+            content: vec![ContentBlock::Text {
+                text: "answer".into(),
+                cache_control: None,
+            }],
+        },
+        Message {
+            role: "user".into(),
+            content: vec![ContentBlock::Text {
+                text: "second".into(),
+                cache_control: None,
+            }],
+        },
+    ];
+    // depth 0 = cut at the last real user prompt ("second", idx 4).
+    assert_eq!(super::backtrack_api_cut_index(&msgs, 0), Some(4));
+    // depth 1 = cut at the first real user prompt ("first", idx 0) — NOT the
+    // tool_result at idx 2 that a naive role=="user" count would have hit.
+    assert_eq!(super::backtrack_api_cut_index(&msgs, 1), Some(0));
+    // depth beyond available prompts.
+    assert_eq!(super::backtrack_api_cut_index(&msgs, 2), None);
 }

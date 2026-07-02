@@ -660,8 +660,12 @@ fn build_list_lines(
 
     if sessions.is_empty() {
         lines.push(Line::from(Span::styled(
-            "No sessions available.",
+            "No saved sessions yet.",
             Style::default().fg(palette::TEXT_MUTED),
+        )));
+        lines.push(Line::from(Span::styled(
+            "Send a message to start one; it is saved automatically.",
+            Style::default().fg(palette::TEXT_HINT),
         )));
         return lines;
     }

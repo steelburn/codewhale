@@ -7,7 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+
+- Added a website localization matrix with a locale registry and drift checks.
+  Harvested from #3763 by @idling11.
+
+### Changed
+
+- Documented the Homebrew rollout strategy and added a distribution-channel
+  check to the release checklist. Harvested from #3760 by @idling11.
+
+### Removed
+
+- Removed unused model-registry helpers. Harvested from #3872 by @cyq1017.
+- Removed unused request-tuning metadata. Harvested from #3871 by @cyq1017.
 
 ## [0.8.66] - 2026-06-29
 

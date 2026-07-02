@@ -302,7 +302,7 @@ impl FooterProps {
 fn mode_style(app: &App) -> (&'static str, Color) {
     let label = match app.mode {
         AppMode::Agent => "agent",
-        AppMode::Auto => "auto",
+        AppMode::Auto => "agent",
         AppMode::Yolo => "yolo",
         AppMode::Plan => "plan",
     };

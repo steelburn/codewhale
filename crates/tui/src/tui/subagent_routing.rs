@@ -3,7 +3,7 @@
 use std::time::{Duration, Instant};
 
 use crate::task_manager::{TaskRecord, TaskStatus, TaskSummary};
-use crate::tools::subagent::{MailboxMessage, SubAgentResult, SubAgentStatus};
+use crate::tools::subagent::{AgentWorkerStatus, MailboxMessage, SubAgentResult, SubAgentStatus};
 use crate::tui::app::{AgentProgressMeta, App, AppMode, TaskPanelEntry, TaskPanelEntryKind};
 use crate::tui::history::{HistoryCell, SubAgentCell, summarize_tool_output};
 use crate::tui::pager::PagerView;
@@ -48,6 +48,43 @@ pub(super) fn active_fanout_counts(app: &App) -> Option<(usize, usize)> {
 
 pub(super) fn reconcile_subagent_activity_state(app: &mut App) {
     reconcile_subagent_activity_state_at(app, Instant::now());
+}
+
+pub(super) fn apply_subagent_terminal_projection(
+    app: &mut App,
+    agent_id: &str,
+    status: SubAgentStatus,
+    result: Option<String>,
+) -> bool {
+    app.agent_progress.remove(agent_id);
+    app.agent_progress_meta.remove(agent_id);
+
+    let Some(agent) = app
+        .subagent_cache
+        .iter_mut()
+        .find(|agent| agent.agent_id == agent_id)
+    else {
+        reconcile_subagent_activity_state(app);
+        return false;
+    };
+
+    agent.worker_status = Some(worker_status_for_terminal_projection(&status));
+    agent.status = status;
+    if let Some(result) = result {
+        agent.result = Some(result);
+    }
+    reconcile_subagent_activity_state(app);
+    true
+}
+
+fn worker_status_for_terminal_projection(status: &SubAgentStatus) -> AgentWorkerStatus {
+    match status {
+        SubAgentStatus::Running => AgentWorkerStatus::Running,
+        SubAgentStatus::Completed => AgentWorkerStatus::Completed,
+        SubAgentStatus::Interrupted(_) => AgentWorkerStatus::Interrupted,
+        SubAgentStatus::Failed(_) | SubAgentStatus::BudgetExhausted => AgentWorkerStatus::Failed,
+        SubAgentStatus::Cancelled => AgentWorkerStatus::Cancelled,
+    }
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -538,8 +575,9 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::task_manager::{TaskStatus, TaskSummary};
-    use crate::tools::subagent::SubAgentType;
+    use crate::tools::subagent::{SubAgentAssignment, SubAgentType};
     use crate::tui::app::{InitialInput, TuiOptions};
+    use crate::tui::widgets::agent_card::AgentLifecycle;
     use chrono::Utc;
     use std::path::PathBuf;
 
@@ -582,6 +620,34 @@ mod tests {
             error: None,
             thread_id: None,
             turn_id: None,
+        }
+    }
+
+    fn subagent_result(id: &str, status: SubAgentStatus) -> SubAgentResult {
+        SubAgentResult {
+            name: id.to_string(),
+            agent_id: id.to_string(),
+            context_mode: "fresh".to_string(),
+            fork_context: false,
+            workspace: None,
+            git_branch: None,
+            agent_type: SubAgentType::General,
+            assignment: SubAgentAssignment {
+                objective: format!("objective-{id}"),
+                role: Some("worker".to_string()),
+            },
+            model: "deepseek-v4-flash".to_string(),
+            nickname: None,
+            status,
+            worker_status: None,
+            parent_run_id: None,
+            spawn_depth: 0,
+            result: None,
+            steps_taken: 0,
+            checkpoint: None,
+            needs_input: None,
+            duration_ms: 0,
+            from_prior_session: false,
         }
     }
 
@@ -639,5 +705,55 @@ mod tests {
             handle_subagent_mailbox(&mut app, 3, &tool),
             "tool progress still updates the visible transcript card"
         );
+    }
+
+    #[test]
+    fn apply_subagent_terminal_projection_clears_live_progress_and_card_state() {
+        let mut app = App::new(test_options(), &Config::default());
+        let started = MailboxMessage::started("agent_done", SubAgentType::General);
+        assert!(handle_subagent_mailbox(&mut app, 1, &started));
+        let card_idx = app.subagent_card_index["agent_done"];
+        let initial_revision = app.history_revisions[card_idx];
+
+        app.subagent_cache
+            .push(subagent_result("agent_done", SubAgentStatus::Running));
+        app.agent_progress
+            .insert("agent_done".to_string(), "step 4/10".to_string());
+        app.agent_progress_meta.insert(
+            "agent_done".to_string(),
+            AgentProgressMeta {
+                parent_run_id: None,
+                spawn_depth: 0,
+            },
+        );
+
+        assert!(apply_subagent_terminal_projection(
+            &mut app,
+            "agent_done",
+            SubAgentStatus::Cancelled,
+            Some("cancelled by user".to_string())
+        ));
+
+        assert!(!app.agent_progress.contains_key("agent_done"));
+        assert!(!app.agent_progress_meta.contains_key("agent_done"));
+        let agent = app
+            .subagent_cache
+            .iter()
+            .find(|agent| agent.agent_id == "agent_done")
+            .expect("projected agent remains cached");
+        assert_eq!(agent.status, SubAgentStatus::Cancelled);
+        assert_eq!(agent.worker_status, Some(AgentWorkerStatus::Cancelled));
+        assert_eq!(agent.result.as_deref(), Some("cancelled by user"));
+        assert_eq!(running_agent_count(&app), 0);
+        assert_ne!(
+            app.history_revisions[card_idx], initial_revision,
+            "terminal projection should invalidate the stale running card"
+        );
+        match &app.history[card_idx] {
+            HistoryCell::SubAgent(SubAgentCell::Delegate(card)) => {
+                assert_eq!(card.status, AgentLifecycle::Cancelled);
+            }
+            cell => panic!("expected delegate card, got {cell:?}"),
+        }
     }
 }

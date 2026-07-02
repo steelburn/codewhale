@@ -463,7 +463,7 @@ mod tests {
     use crate::localization::Locale;
 
     fn test_app() -> App {
-        App::new(
+        let mut app = App::new(
             TuiOptions {
                 model: "unknown-model".to_string(),
                 workspace: PathBuf::from("/tmp/project"),
@@ -486,7 +486,16 @@ mod tests {
                 initial_input: None,
             },
             &Config::default(),
-        )
+        );
+        // Pin the route identity: App::new consults the developer's real
+        // saved settings, so on a machine with customized provider/model
+        // the context-window assertions computed against a different route.
+        app.api_provider = crate::config::ApiProvider::Deepseek;
+        app.auto_model = false;
+        app.last_effective_model = None;
+        app.active_route_limits = None;
+        app.active_context_window_override = None;
+        app
     }
 
     #[test]

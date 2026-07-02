@@ -163,14 +163,18 @@ codewhale exec --allowed-tools read_file,exec_shell --max-turns 10 "fix the fail
 
 1. **用户意图至上。** 你当前的请求高于过期的仓库指引、记忆、先前的交接和
    人格叠加层。
-2. **仓库法律必须显式。** 添加 `.codewhale/constitution.json`，声明项目的
+2. **用户全局宪法由 `/constitution` 管理。** 正常设置会把结构化个人常驻法写到
+   `$CODEWHALE_HOME/constitution.json`，再渲染成模型可读的 prose block；这不是裸
+   prompt 编辑器。
+3. **仓库法律必须显式。** 添加 `.codewhale/constitution.json`，声明项目的
    持久权威：受保护的不变量、分支策略、验证规则。
-3. **证据高于叙述。** 工具输出胜过自信的猜测。`cargo test` 失败就如实报告
+4. **证据高于叙述。** 工具输出胜过自信的猜测。`cargo test` 失败就如实报告
    `cargo test` 失败，绝不被总结成乐观措辞。验证是任务的一部分，不是尾声。
-4. **记忆排在最后。** 有用，但永不具备权威。
+5. **记忆排在最后。** 有用，但永不具备权威。
 
 真正起作用的策略由代码强制执行，而非靠提示词：审批门、沙箱、快照、回滚和
-工具 schema 都是模型无法靠话术绕过的运行时机制。
+工具 schema 都是模型无法靠话术绕过的运行时机制。宪法可以表达偏好，但不会静默
+改变审批、沙箱、网络、信任或 MCP 权限。
 
 而这些法律没有一条住在模型里——这正是模型可以随时更换的原因。运行框架承载
 宪法；模型提供推理。DeepSeek 和开放权重世界是一等公民，你局域网里那台跑着
@@ -186,7 +190,7 @@ README 承载理念和最快路径，细节放在文档和 [codewhale.net](https
 
 - [用户指南](docs/GUIDE.md) —— 上手 CodeWhale 的第一个小时。
 - [安装指南](docs/INSTALL.md) —— 所有安装路径与故障排查。
-- [配置](docs/CONFIGURATION.md) —— 配置文件、仓库 constitution 和 provider 设置。
+- [配置](docs/CONFIGURATION.md) —— `/constitution`、用户全局宪法、仓库 constitution 和 provider 设置。
 - [Provider 注册表](docs/PROVIDERS.md) —— 模型路由、凭据、base URL 与能力边界。
 - [子 Agent](docs/SUBAGENTS.md) —— 角色、生命周期、输出契约与恢复行为。
 - [MCP](docs/MCP.md) —— 接入外部工具服务器，或让 CodeWhale 自己作为 MCP 服务器运行。

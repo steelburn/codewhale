@@ -237,6 +237,59 @@ pub fn visible_mention_menu_entries(app: &mut App, limit: usize) -> Vec<String> 
         return cache.entries.clone();
     }
 
+    // Fast path (#3757): for non-path-like partials the candidate set is
+    // needle-independent, so one cached walk serves every keystroke of the
+    // mention token and ranking happens in memory. Path-like and browser
+    // partials fall through to the background walk (#3899) because local
+    // path-reference completions are needle-gated
+    // (see `should_try_local_reference_completion`).
+    let path_like =
+        key.partial.starts_with('.') || key.partial.contains('/') || key.partial.contains('\\');
+    if key.behavior != "browser" && !path_like {
+        const CANDIDATE_TTL: std::time::Duration = std::time::Duration::from_secs(4);
+        let fresh = app
+            .composer
+            .mention_candidate_cache
+            .as_ref()
+            .is_some_and(|c| {
+                c.workspace == key.workspace
+                    && c.cwd == key.cwd
+                    && c.walk_depth == key.walk_depth
+                    && c.follow_links == key.follow_links
+                    && c.collected_at.elapsed() < CANDIDATE_TTL
+            });
+        if !fresh {
+            let ws = Workspace::with_cwd_depth_and_follow_links(
+                key.workspace.clone(),
+                key.cwd.clone(),
+                key.walk_depth,
+                key.follow_links,
+            );
+            app.composer.mention_candidate_cache = Some(crate::tui::app::MentionCandidateCache {
+                workspace: key.workspace.clone(),
+                cwd: key.cwd.clone(),
+                walk_depth: key.walk_depth,
+                follow_links: key.follow_links,
+                collected_at: std::time::Instant::now(),
+                candidates: ws.completion_candidates(),
+            });
+        }
+        let ranked = match app.composer.mention_candidate_cache.as_ref() {
+            Some(cache) => crate::working_set::rank_completion_candidates(
+                &cache.candidates,
+                &key.partial,
+                key.limit,
+            ),
+            None => Vec::new(),
+        };
+        let entries = super::file_frecency::rerank_by_frecency(ranked);
+        app.composer.mention_completion_cache = Some(MentionCompletionCache {
+            key,
+            entries: entries.clone(),
+        });
+        return entries;
+    }
+
     // Drain a completed background walk: promote it when it still matches
     // the live key, discard it when the needle has moved on (#3899).
     if let Some(pending) = app.composer.mention_completion_pending.take() {

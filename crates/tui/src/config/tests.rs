@@ -7181,6 +7181,9 @@ fn api_provider_returns_custom_for_custom_name_and_deepseek_for_junk() {
         ..Config::default()
     };
     assert_eq!(config.api_provider(), ApiProvider::Custom);
+    config
+        .validate()
+        .expect("named custom providers should pass config validation");
 
     // Genuine junk that matches no built-in provider AND no custom table →
     // falls back to DeepSeek, exactly as before this slice.
@@ -7189,6 +7192,10 @@ fn api_provider_returns_custom_for_custom_name_and_deepseek_for_junk() {
         ..Config::default()
     };
     assert_eq!(junk.api_provider(), ApiProvider::Deepseek);
+    assert!(
+        junk.validate().is_err(),
+        "invalid provider names should still fail validation"
+    );
 }
 
 #[test]

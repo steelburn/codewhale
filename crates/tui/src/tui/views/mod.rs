@@ -4,7 +4,7 @@ use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Clear, Paragraph, Widget},
+    widgets::{Block, Clear, Paragraph, Widget, Wrap},
 };
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
@@ -45,6 +45,7 @@ pub enum ModalKind {
     ModePicker,
     FleetSetup,
     HotbarSetup,
+    SetupWizard,
     FilePicker,
     StatusPicker,
     FeedbackPicker,
@@ -303,6 +304,155 @@ pub(crate) fn render_modal_text_footer(
     place_footer_lines(inner, buf, lines)
 }
 
+/// Shared list/detail geometry for modal managers and pickers.
+///
+/// Wide modals get a stable left list and a right detail pane. Narrow modals
+/// stack the list over the detail so neither side becomes unreadably thin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ListDetailLayout {
+    pub(crate) list: Rect,
+    pub(crate) detail: Rect,
+    pub(crate) stacked: bool,
+}
+
+impl ListDetailLayout {
+    #[must_use]
+    pub(crate) fn split(area: Rect, min_detail_width: u16) -> Self {
+        if area.width == 0 || area.height == 0 {
+            return Self {
+                list: area,
+                detail: area,
+                stacked: true,
+            };
+        }
+
+        let gap = 1;
+        let min_list_width = 30.min(area.width);
+        let can_split = area.width >= 96
+            && area
+                .width
+                .saturating_sub(gap)
+                .saturating_sub(min_list_width)
+                >= min_detail_width;
+        if can_split {
+            let max_list_width = area.width.saturating_sub(gap + min_detail_width);
+            let preferred = area.width.saturating_mul(42) / 100;
+            let list_width = preferred.clamp(min_list_width, max_list_width.min(52));
+            let detail_width = area.width.saturating_sub(list_width + gap);
+            return Self {
+                list: Rect {
+                    x: area.x,
+                    y: area.y,
+                    width: list_width,
+                    height: area.height,
+                },
+                detail: Rect {
+                    x: area.x + list_width + gap,
+                    y: area.y,
+                    width: detail_width,
+                    height: area.height,
+                },
+                stacked: false,
+            };
+        }
+
+        let gap = if area.height >= 8 { 1 } else { 0 };
+        let min_detail_height = 4.min(area.height);
+        let max_list_height = area.height.saturating_sub(gap + min_detail_height);
+        let preferred = area.height.saturating_mul(3) / 5;
+        let list_height = preferred.clamp(1, max_list_height.max(1));
+        let detail_height = area.height.saturating_sub(list_height + gap);
+        Self {
+            list: Rect {
+                x: area.x,
+                y: area.y,
+                width: area.width,
+                height: list_height,
+            },
+            detail: Rect {
+                x: area.x,
+                y: area.y + list_height + gap,
+                width: area.width,
+                height: detail_height,
+            },
+            stacked: true,
+        }
+    }
+}
+
+/// Plain empty-state copy for modal list/detail bodies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EmptyState {
+    title: Cow<'static, str>,
+    body: Cow<'static, str>,
+    primary_action: Option<(Cow<'static, str>, Cow<'static, str>)>,
+    secondary_action: Option<(Cow<'static, str>, Cow<'static, str>)>,
+}
+
+impl EmptyState {
+    pub(crate) fn new(
+        title: impl Into<Cow<'static, str>>,
+        body: impl Into<Cow<'static, str>>,
+    ) -> Self {
+        Self {
+            title: title.into(),
+            body: body.into(),
+            primary_action: None,
+            secondary_action: None,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn primary_action(
+        mut self,
+        key: impl Into<Cow<'static, str>>,
+        label: impl Into<Cow<'static, str>>,
+    ) -> Self {
+        self.primary_action = Some((key.into(), label.into()));
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn secondary_action(
+        mut self,
+        key: impl Into<Cow<'static, str>>,
+        label: impl Into<Cow<'static, str>>,
+    ) -> Self {
+        self.secondary_action = Some((key.into(), label.into()));
+        self
+    }
+
+    pub(crate) fn render(&self, area: Rect, buf: &mut Buffer) {
+        let mut lines = vec![
+            Line::from(Span::styled(
+                self.title.clone().into_owned(),
+                Style::default()
+                    .fg(palette::TEXT_PRIMARY)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                self.body.clone().into_owned(),
+                Style::default().fg(palette::TEXT_MUTED),
+            )),
+        ];
+        if self.primary_action.is_some() || self.secondary_action.is_some() {
+            lines.push(Line::from(""));
+        }
+        for (key, label) in [self.primary_action.as_ref(), self.secondary_action.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            let hint = ActionHint::new(key.clone(), label.clone());
+            lines.push(Line::from(hint.spans().to_vec()));
+        }
+        Paragraph::new(lines)
+            .style(Style::default().fg(palette::TEXT_PRIMARY))
+            .wrap(Wrap { trim: true })
+            .render(area, buf);
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum CommandPaletteAction {
     ExecuteCommand { command: String },
@@ -423,13 +573,24 @@ pub enum ViewEvent {
     /// switch as `AppAction::SwitchProvider`.
     ProviderPickerApplied {
         provider: crate::config::ApiProvider,
+        provider_id: Option<String>,
     },
     /// Emitted by the `/provider` picker after the user types an API key
     /// inline for a provider that lacked one. The handler should persist
     /// the key via `save_api_key_for` and then perform the provider switch.
     ProviderPickerApiKeySubmitted {
         provider: crate::config::ApiProvider,
+        provider_id: Option<String>,
         api_key: String,
+    },
+    /// Emitted by the `/provider` picker after the custom provider form is
+    /// completed. The handler persists a named OpenAI-compatible provider
+    /// table and switches to it without storing raw secrets.
+    ProviderPickerCustomProviderSubmitted {
+        provider_id: String,
+        base_url: String,
+        model: Option<String>,
+        api_key_env: Option<String>,
     },
     /// Emitted by the `/provider` picker when Kimi CLI OAuth credentials can
     /// be reused for Moonshot/Kimi dispatch.
@@ -440,6 +601,7 @@ pub enum ViewEvent {
     /// the `/model` picker pre-filtered to the highlighted provider (#3083).
     ProviderPickerOpenModels {
         provider: crate::config::ApiProvider,
+        provider_id: Option<String>,
     },
     /// Emitted by the `/mode` picker when the user chooses a mode.
     ModeSelected {
@@ -459,6 +621,69 @@ pub enum ViewEvent {
     HotbarSetupSaved {
         bindings: Vec<codewhale_config::HotbarBindingToml>,
     },
+    /// Emitted by the constitution-first setup shell when a staged setup-state
+    /// record should be committed atomically to `$CODEWHALE_HOME/setup_state.json`.
+    SetupStateCommitRequested {
+        state: codewhale_config::SetupState,
+        message: String,
+    },
+    /// Emitted by the constitution-first setup shell when accepting a guided
+    /// structured user-global constitution. The host commits the constitution
+    /// and matching setup-state record together.
+    SetupConstitutionCommitRequested {
+        constitution: codewhale_config::UserConstitution,
+        state: codewhale_config::SetupState,
+        message: String,
+    },
+    /// Emitted by the setup Constitution card (`A`, provider route ready) to
+    /// ask the user's first configured model to draft the constitution from
+    /// the guided answers. The host performs the one-shot call, pushes the
+    /// sanitized/bounded draft back into the wizard, and opens the
+    /// ratification preview; on any failure it reports why and leaves the
+    /// deterministic guided draft standing. Nothing is persisted by this
+    /// event — saving still goes through the ratify keypress and
+    /// [`SetupConstitutionCommitRequested`](Self::SetupConstitutionCommitRequested).
+    SetupConstitutionModelDraftRequested {
+        draft: crate::tui::setup::GuidedConstitutionDraft,
+        locale: crate::localization::Locale,
+    },
+    /// Emitted by the fleet setup Review step (`m`) to ask the configured
+    /// model to draft the agent profile the wizard describes. The host
+    /// performs the one-shot call, pushes the sanitized/bounded draft back
+    /// into the wizard, and opens the rendered-TOML preview; on failure it
+    /// reports why and the manual authoring flow stands. Nothing is
+    /// persisted by this event.
+    FleetProfileModelDraftRequested {
+        role: String,
+        model_class: String,
+        locale: crate::localization::Locale,
+    },
+    /// Emitted by the fleet setup Review step after the user previewed a
+    /// model-drafted profile and pressed the explicit ratify key. The host
+    /// renders TOML deterministically from the validated draft and persists
+    /// it atomically under `.codewhale/agents/`.
+    FleetProfileDraftCommitRequested {
+        draft: Box<crate::fleet::profile::FleetProfileDraft>,
+    },
+    /// Emitted by the setup Runtime Posture card after the user has previewed
+    /// and confirmed an explicit preset/config diff.
+    SetupRuntimePresetApplyRequested {
+        preset: crate::tui::setup::SetupRuntimePreset,
+        state: codewhale_config::SetupState,
+        message: String,
+    },
+    /// Emitted by the setup Provider/Model readiness card to hand off to the
+    /// existing provider manager instead of duplicating provider auth UI.
+    SetupOpenProviderRequested,
+    /// Emitted by the setup Provider/Model readiness card to hand off to the
+    /// existing provider-qualified model route picker.
+    SetupOpenModelRequested,
+    /// Emitted by the setup Runtime Posture card to hand off to the existing
+    /// work-mode picker.
+    SetupOpenModeRequested,
+    /// Emitted by the setup Runtime Posture card to hand off to the existing
+    /// config view for approval/sandbox/network details.
+    SetupOpenConfigRequested,
     /// Emitted by the `/hotbar` setup wizard when the user chooses "Disable
     /// Hotbar". The host persists `hotbar = []` and hides the panel.
     HotbarDisableRequested,
@@ -1509,14 +1734,14 @@ fn experimental_config_rows(config: &Config) -> Vec<ConfigRow> {
     rows.push(ConfigRow {
         section: ConfigSection::Experimental,
         key: "goal_command".to_string(),
-        value: "preview placeholder (not stable; see #1976/#891)".to_string(),
+        value: "preview placeholder (not stable)".to_string(),
         editable: false,
         scope: ConfigScope::Saved,
     });
     rows.push(ConfigRow {
         section: ConfigSection::Experimental,
         key: "whaleflow".to_string(),
-        value: "preview overlay for workflow/fleet runs (not stable; see #3154/#3178)".to_string(),
+        value: "preview overlay for workflow/fleet runs (not stable)".to_string(),
         editable: false,
         scope: ConfigScope::Saved,
     });
@@ -2614,9 +2839,9 @@ fn truncate_view_text(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActionHint, ConfigListItem, ConfigView, HelpView, ModalKind, ModalView, ViewAction,
-        ViewEvent, ViewStack, action_footer_lines, centered_modal_area, render_modal_footer,
-        subagent_view_agents, truncate_view_text,
+        ActionHint, ConfigListItem, ConfigView, EmptyState, HelpView, ListDetailLayout, ModalKind,
+        ModalView, ViewAction, ViewEvent, ViewStack, action_footer_lines, centered_modal_area,
+        render_modal_footer, subagent_view_agents, truncate_view_text,
     };
     use crate::config::Config;
     use crate::localization::{Locale, MessageId, tr};
@@ -2786,6 +3011,49 @@ mod tests {
         assert_eq!(body.y, inner.y);
         assert_eq!(body.height, inner.height - 1);
         assert_eq!(body.y + body.height, inner.y + inner.height - 1);
+    }
+
+    #[test]
+    fn list_detail_layout_splits_wide_and_stacks_narrow() {
+        let wide = ListDetailLayout::split(Rect::new(0, 0, 120, 24), 34);
+        assert!(!wide.stacked);
+        assert!(wide.list.width >= 30);
+        assert!(wide.detail.width >= 34);
+        assert_eq!(wide.list.height, 24);
+        assert_eq!(wide.detail.height, 24);
+        assert!(wide.list.right() < wide.detail.left());
+
+        let narrow = ListDetailLayout::split(Rect::new(0, 0, 80, 20), 34);
+        assert!(narrow.stacked);
+        assert_eq!(narrow.list.width, 80);
+        assert_eq!(narrow.detail.width, 80);
+        assert!(narrow.list.bottom() <= narrow.detail.top());
+        assert!(narrow.list.height > 0);
+    }
+
+    #[test]
+    fn empty_state_renders_copy_and_actions() {
+        let area = Rect::new(0, 0, 48, 8);
+        let mut buf = Buffer::empty(area);
+        EmptyState::new("Nothing here", "Use search or switch categories.")
+            .primary_action("/", "filter")
+            .secondary_action("Esc", "cancel")
+            .render(area, &mut buf);
+
+        let text = (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        for expected in ["Nothing here", "Use search", "filter", "cancel"] {
+            assert!(
+                text.contains(expected),
+                "empty state missing {expected:?}: {text:?}"
+            );
+        }
     }
 
     struct ConfigSettingsEnvGuard {

@@ -1543,6 +1543,7 @@ fn exec_cell_renders_live_shell_output_before_final_output() {
     assert!(text.contains("running line 1"));
     assert!(text.contains("running line 2"));
     assert!(!text.contains("Ctrl+B backgrounds this command"));
+    assert!(!text.contains("Ctrl+B moves this shell wait to /jobs"));
 }
 
 #[test]

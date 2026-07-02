@@ -1629,8 +1629,17 @@ impl Engine {
                     )));
                 }
 
+                // Fail closed: a tool with no execution path — not MCP, not
+                // code/js/search, and with no registry spec — must be blocked,
+                // NOT run unguarded. Previously this only checked
+                // `tool_def.is_none()`, so a tool present in the model-facing
+                // catalog but absent from the execution registry (or when the
+                // registry itself is None) fell through every approval branch
+                // with approval_required=false and executed with no gate.
+                let registry_has_spec =
+                    tool_registry.is_some_and(|registry| registry.get(&tool_name).is_some());
                 if blocked_error.is_none()
-                    && tool_def.is_none()
+                    && !registry_has_spec
                     && !McpPool::is_mcp_tool(&tool_name)
                     && tool_name != CODE_EXECUTION_TOOL_NAME
                     && tool_name != JS_EXECUTION_TOOL_NAME
@@ -1812,18 +1821,52 @@ impl Engine {
                     match decision {
                         AutoReviewPlanDecision::NoChange => {}
                         AutoReviewPlanDecision::ForcePrompt(reason) => {
-                            // #3790: the Tab-selected mode is the sole authority.
-                            // YOLO (auto_approve) suppresses every review-driven
-                            // prompt — there is no longer any "force prompt past
-                            // YOLO" path. A Block decision (a typed deny rule)
-                            // still hard-blocks below, in every mode.
-                            if !self.session.auto_approve {
-                                approval_required = true;
-                                approval_description = reason;
-                                approval_force_prompt = true;
-                            }
+                            // The built-in safety floor is deliberately
+                            // non-bypassable: YOLO auto-approves ordinary tool
+                            // calls, but publish-like and background/headless
+                            // destructive holds still require review.
+                            approval_required = true;
+                            approval_description = reason;
+                            approval_force_prompt = true;
                         }
                         AutoReviewPlanDecision::Block(reason) => {
+                            approval_required = false;
+                            approval_force_prompt = false;
+                            blocked_error = Some(ToolError::permission_denied(reason));
+                        }
+                    }
+                }
+
+                // Repo law: protected invariants with path globs compile into
+                // mechanical write holds. Like the safety floor, law is not
+                // bypassable by mode — it can only add holds, never remove
+                // one, so this cannot weaken any gate above.
+                if blocked_error.is_none()
+                    && let Some(decision) = crate::repo_law::repo_law_plan_decision(
+                        &self.session.workspace,
+                        &tool_name,
+                        &tool_input,
+                    )
+                {
+                    emit_tool_audit(json!({
+                        "event": "tool.repo_law_decision",
+                        "tool_id": tool_id.clone(),
+                        "decision": match &decision {
+                            crate::repo_law::RepoLawPlanDecision::ForcePrompt(_) => "force_prompt",
+                            crate::repo_law::RepoLawPlanDecision::Block(_) => "block",
+                        },
+                        "reason": match &decision {
+                            crate::repo_law::RepoLawPlanDecision::ForcePrompt(reason)
+                            | crate::repo_law::RepoLawPlanDecision::Block(reason) => reason.clone(),
+                        },
+                    }));
+                    match decision {
+                        crate::repo_law::RepoLawPlanDecision::ForcePrompt(reason) => {
+                            approval_required = true;
+                            approval_description = reason;
+                            approval_force_prompt = true;
+                        }
+                        crate::repo_law::RepoLawPlanDecision::Block(reason) => {
                             approval_required = false;
                             approval_force_prompt = false;
                             blocked_error = Some(ToolError::permission_denied(reason));
@@ -2907,7 +2950,19 @@ pub(super) fn command_allows_tool(allowed_tools: Option<&[String]>, tool_name: &
     let Some(allowed_tools) = allowed_tools else {
         return true;
     };
-    allowed_tools.contains(&tool_name.to_ascii_lowercase())
+    // Symmetric with `command_denies_tool`: support a trailing `*` wildcard
+    // and lowercase both sides, so `allowed_tools = ["mcp_*"]` or `["ReadFile"]`
+    // work instead of silently matching nothing (which strips the whole
+    // catalog).
+    let tool_name = tool_name.to_ascii_lowercase();
+    allowed_tools.iter().any(|rule| {
+        let rule = rule.to_ascii_lowercase();
+        if let Some(prefix) = rule.strip_suffix('*') {
+            tool_name.starts_with(prefix)
+        } else {
+            tool_name == rule
+        }
+    })
 }
 
 /// Folded outcome of all `tool_call_before` hook results for one tool call
@@ -3361,6 +3416,16 @@ mod tests {
     fn review_regression_allowed_tools_gate_blocks_all_tools_when_empty() {
         let allowed = Vec::new();
         assert!(!command_allows_tool(Some(&allowed), "bash"));
+    }
+
+    #[test]
+    fn allowed_tools_gate_supports_wildcard_and_case() {
+        // Symmetric with the deny list: `mcp_*` and mixed-case rules match.
+        let allowed = vec!["mcp_*".to_string(), "ReadFile".to_string()];
+        assert!(command_allows_tool(Some(&allowed), "mcp_slack_send"));
+        assert!(command_allows_tool(Some(&allowed), "readfile"));
+        assert!(command_allows_tool(Some(&allowed), "ReadFile"));
+        assert!(!command_allows_tool(Some(&allowed), "exec_shell"));
     }
 
     #[test]

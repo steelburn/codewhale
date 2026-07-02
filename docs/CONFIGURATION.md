@@ -5,14 +5,63 @@ At process startup it also loads a workspace-local `.env` file when present.
 Use the tracked `.env.example` as the template; copy it to `.env`, then edit
 only the provider and safety knobs you need.
 
-## Project instructions & repo authority
+## Constitution, project instructions, and repo authority
 
-Each repo can carry two distinct, complementary files:
+CodeWhale has several instruction surfaces. They are deliberately separate so a
+personal constitution, repo policy, project instructions, and runtime security
+controls do not blur together.
 
+- **Bundled global Constitution** — the compiled base law in the binary. It is
+  the default floor for every session.
+- **User-global constitution** — the normal guided setup output. Manage it with
+  `/constitution` or `/setup`; CodeWhale stores structured data at
+  `$CODEWHALE_HOME/constitution.json` (default `~/.codewhale/constitution.json`)
+  and renders it into a separate `<codewhale_user_constitution>` prose block.
+  This can express preferences and stop conditions, but it does not change
+  runtime approval policy, sandbox, shell, network, trust, or MCP permissions.
+- **Repo-local constitution** — optional project policy in
+  `.codewhale/constitution.json`, described below.
 - **`AGENTS.md`** — cross-agent **project instructions** (prose). This is the
   canonical file for "how should an agent work in this repo." Run `/init` to
   scaffold one. `CLAUDE.md` and `.claude/instructions.md` are read as
   compatibility fallbacks.
+- **Memory and handoffs** — recalled state. Useful, but lower authority than
+  constitutions and project instructions.
+
+Release verification for these surfaces lives in
+[`docs/evidence/v0867-constitution-setup-qa-matrix.md`](evidence/v0867-constitution-setup-qa-matrix.md).
+Use it when checking `/setup`, `/constitution`, doctor, context reports, and
+the update checkpoint agree.
+
+### Managing the user-global constitution (`/setup` and `/constitution`)
+
+On first launch CodeWhale runs a short **constitution-first** setup path:
+language → provider/model readiness → runtime posture → create or confirm your
+constitution. The bundled/default constitution is always valid, so you can
+defer; reopen the hub any time with `/setup`.
+
+On the **Constitution** step:
+
+- **`1`–`6`** tune the guided draft. **`G`** previews it, and **`G`** again
+  ratifies and saves a fresh structured `constitution.json`.
+- **`A`** (shown only when a provider is configured) asks your first configured
+  model to draft the constitution. Drafting is **not** saving: the draft is
+  rendered through the same preview and you still press **`G`** to ratify
+  before anything persists.
+- **`K`** keeps your existing loaded constitution unchanged (shown only when a
+  valid file is already present).
+- **`U`** (or `/constitution bundled`) records the bundled/default law.
+
+`/constitution` (alias `/law`) is the primary management surface once you are
+set up. Subcommands: `status` (the default), `preview`, `review`, `repo` (the
+repo-local law block), `explain`, `edit`/`guided`, `repair`, `posture`, and
+`bundled`. Managing the constitution never changes runtime approval, sandbox,
+shell, network, trust, default mode, or MCP authority — those stay in runtime
+posture/config.
+
+Each repo can carry two distinct, complementary files:
+
+- **`AGENTS.md`** — ordinary project working instructions.
 - **`.codewhale/constitution.json`** — CodeWhale-specific **repo authority /
   prioritization policy**: when local sources conflict, which should CodeWhale
   trust first, and what to verify before claiming a task is done. `.codewhale/`
@@ -43,32 +92,102 @@ Each repo can carry two distinct, complementary files:
   ```
 
   All fields are optional. When present, the file is rendered into the system
-  prompt as concise prose in a higher-authority block and takes precedence over
-  a legacy `WHALE.md`.
+  prompt as concise prose in a higher-authority block. Legacy `WHALE.md` files
+  are ignored and reported as migration-only diagnostics.
 
-  This is the **local-law** layer in CodeWhale's hierarchy: *base myth & global
-  Constitution* (the model prompt in `prompts/constitution.md`, including the Brother
-  Whale identity anchor) → *repo constitution* (`.codewhale/constitution.json`,
-  this file) → *task packet* (the current objective) → *runtime policy*
-  (permissions/sandbox/cost limits enforced in code). The repo constitution
-  gives decision rules; it does not replace the global Constitution or the
-  current user request.
+  Each `protected_invariants` entry may be either a plain string (advisory
+  prose, the historical shape) or an object carrying path globs, which is
+  additionally **mechanically enforced** in the tool gate. See
+  [Enforced repo-law invariants](#enforced-repo-law-invariants) below.
+
+  This is the **repo-local law** layer in CodeWhale's hierarchy: *bundled global
+  Constitution* → *user-global constitution* (`$CODEWHALE_HOME/constitution.json`,
+  rendered as prose) → *repo constitution* (`.codewhale/constitution.json`, this
+  file) → *AGENTS/project instructions* → *memory and handoffs* → *current
+  request and live evidence for the active turn*. Runtime policy
+  (permissions/sandbox/cost limits enforced in code) is separate from all of
+  these prompt layers. The repo constitution gives project decision rules; it
+  does not replace the bundled Constitution, the user-global constitution, or
+  the current user request.
 
 > **`WHALE.md` is deprecated.** It overlapped confusingly with `AGENTS.md`.
-> CodeWhale still **reads** an existing `WHALE.md` (below `AGENTS.md`) so old
-> repos keep working, and emits a deprecation notice, but it is no longer
-> created or recommended and will be dropped from default discovery after a
-> deprecation window. Move ordinary instructions to `AGENTS.md` and
-> CodeWhale-specific authority policy to `.codewhale/constitution.json`. (The
-> global CodeWhale Constitution shipped in the model prompt is a separate thing
-> and is unaffected.)
+> CodeWhale no longer reads `WHALE.md` as project or global context. If one is
+> present, setup/context diagnostics report it as ignored so you can migrate it.
+> Move ordinary instructions to `AGENTS.md` and CodeWhale-specific authority
+> policy to `.codewhale/constitution.json`. Personal standing guidance belongs
+> in `/constitution` / `$CODEWHALE_HOME/constitution.json`. (The global
+> CodeWhale Constitution shipped in the model prompt is a separate thing and is
+> unaffected.)
 
-### Overriding the global base prompt (#3638)
+### Enforced repo-law invariants
+
+By default a `protected_invariants` entry is advisory prose: it is rendered into
+the prompt as guidance the agent should honor, but nothing stops a write. An
+entry written as an **object with `paths`** is different — it compiles into a
+mechanical write hold that the engine's tool gate evaluates before the write
+runs. The law becomes mechanism, not just a request.
+
+An enforced entry has this shape:
+
+```json
+{
+  "schema_version": 1,
+  "protected_invariants": [
+    "Keep DeepSeek support first-class.",
+    {
+      "text": "The wire format is frozen; protocol changes need a human.",
+      "paths": ["crates/protocol/**"],
+      "action": "block"
+    },
+    {
+      "text": "Release notes need human review.",
+      "paths": ["CHANGELOG.md"],
+      "action": "ask"
+    }
+  ]
+}
+```
+
+- `text` — required. The reason surfaced on the hold. An empty `text` is skipped.
+- `paths` — workspace-relative globs (globset syntax, e.g. `crates/protocol/**`,
+  `**/secrets.toml`, `CHANGELOG.md`). An object with no usable `paths` stays
+  advisory-only despite the object shape.
+- `action` — optional, defaults to `ask`. `ask` **force-prompts** for approval;
+  `block` **denies the write outright**.
+
+Semantics:
+
+- **Tighten-only.** The schema has no allow/widen shape, so law can only *add*
+  holds — a crafted constitution can never grant authority or weaken a gate
+  above it.
+- **Not bypassable by mode.** Like the built-in safety floor, an `ask` hold
+  force-prompts in every mode, including YOLO; `block` always denies. Mode
+  cannot turn a hold off.
+- **Repo-local only.** Only the repo's `.codewhale/constitution.json`
+  participates. The user-global constitution stays advisory prose and never
+  reaches this mechanism.
+- **Fails safe.** A missing file, parse error, or invalid glob degrades to
+  fewer or zero rules — never a hold on unprotected paths and never a poisoned
+  gate. Across matches the strongest action wins, so `block` outranks `ask`.
+- **Leaves a receipt.** Every hold emits a `tool.repo_law_decision` tool-audit
+  event naming the invariant, the matched path, and the source file; the
+  approval/denial reason names the invariant too.
+
+**Coverage is deliberately limited.** Holds are evaluated only for the write
+tools `write_file`, `edit_file`, and `apply_patch`, and only against the
+filesystem targets named in their inputs (`path`/`target`/`destination`/
+`file_path`, `changes[].path`, and unified-diff / `apply_patch`-envelope
+headers). A shell command that writes a protected path is **not** held by
+repo law — those writes are still governed by the ordinary approval, sandbox,
+and shell-write gates, not by this mechanism.
+
+### Expert full base-prompt override (#3638)
 
 The global Constitution (the base system prompt, normally compiled in from
-`prompts/constitution.md`) can be replaced per-user without rebuilding. Because
-this is a prompt trust boundary, it takes **two deliberate steps** — a file
-alone is not enough:
+`prompts/constitution.md`) can be replaced per-user without rebuilding. This is
+an expert escape hatch, not the normal `/constitution` guided setup output.
+Because this is a prompt trust boundary, it takes **two deliberate steps** — a
+file alone is not enough:
 
 1. Drop the replacement at `~/.codewhale/prompts/constitution.md` (under
    `$CODEWHALE_HOME` when set).
@@ -86,8 +205,9 @@ Scope is deliberately narrow: only the byte-stable **base prompt segment** is
 overridable. Mode deltas, the approval policy, the tool taxonomy, Context
 Management, and the Compaction Relay are still owned by CodeWhale's runtime
 assembly, so an override **cannot remove safety-relevant guidance** (sandbox,
-approvals) — it only swaps the task/voice framing. To customize per-repo
-behavior instead, prefer `AGENTS.md` + `.codewhale/constitution.json` above.
+approvals) — it only swaps the task/voice framing. To customize ordinary
+personal behavior, prefer `/constitution`; to customize per-repo behavior,
+prefer `AGENTS.md` + `.codewhale/constitution.json` above.
 
 ## Where It Looks
 
@@ -1155,7 +1275,7 @@ If you are upgrading from older releases:
   `unknown`; invalid names fail config validation instead of becoming broad
   rules. `natural_language_guidance` is recorded on the runtime policy and audit
   event, but deterministic rules and the built-in safety floor are the enforced
-  behavior in v0.8.65.
+  behavior in current builds.
 
   Auto-review decisions emit `tool.auto_review_decision` audit events when tool
   audit logging is enabled. Future PreToolUse/PostToolUse hooks can add

@@ -393,11 +393,17 @@ impl ExecPolicyEngine {
         // Deny rules use word-boundary prefix matching: the command must either
         // equal the rule or start with the rule followed by a space, so "rm"
         // blocks "rm -rf /" but NOT "rmdir" or "rmview".
+        let segments = command_segments(ctx.command);
         if let Some(rule) = denied_prefixes.iter().find(|rule| {
             let norm_rule = normalize_command(rule);
-            normalized == norm_rule
-                || (normalized.starts_with(&norm_rule)
-                    && normalized.as_bytes().get(norm_rule.len()) == Some(&b' '))
+            // Match the whole command OR any chained segment (word-boundary).
+            std::iter::once(normalized.clone())
+                .chain(segments.iter().map(|seg| normalize_command(seg)))
+                .any(|hay| {
+                    hay == norm_rule
+                        || (hay.starts_with(&norm_rule)
+                            && hay.as_bytes().get(norm_rule.len()) == Some(&b' '))
+                })
         }) {
             return Ok(ExecPolicyDecision {
                 allow: false,
@@ -413,11 +419,44 @@ impl ExecPolicyEngine {
         // Allow (trusted) rules use arity-aware prefix matching so that
         // `auto_allow = ["git status"]` matches `git status -s` but NOT
         // `git push origin main`.
-        let trusted_rule = trusted_prefixes
-            .iter()
-            .find(|rule| self.arity_dict.allow_rule_matches(rule, ctx.command))
-            .cloned();
+        // A trusted/allow prefix auto-approves only a SINGLE-segment command;
+        // it must not sweep a chained destructive suffix (`git log ; rm -rf /`)
+        // into "trusted" (#security). Chained commands fall through to the
+        // normal ask/mode gate.
+        let trusted_rule = if command_is_chained(ctx.command) {
+            None
+        } else {
+            trusted_prefixes
+                .iter()
+                .find(|rule| self.arity_dict.allow_rule_matches(rule, ctx.command))
+                .cloned()
+        };
         let is_trusted = trusted_rule.is_some();
+
+        // Segment-aware typed Deny: a Deny ask-rule matching ANY chained
+        // segment must block, mirroring the denied-prefix fix above.
+        if command_is_chained(ctx.command) {
+            for seg in &segments {
+                let mut seg_ctx = ctx.clone();
+                seg_ctx.command = seg.as_str();
+                if let Some(rule) = self.matching_ask_rule(&seg_ctx) {
+                    if rule.action == PermissionAction::Deny {
+                        return Ok(ExecPolicyDecision {
+                            allow: false,
+                            requires_approval: false,
+                            matched_rule: Some(rule.label()),
+                            matched_action: Some(PermissionAction::Deny),
+                            requirement: ExecApprovalRequirement::Forbidden {
+                                reason: format!(
+                                    "Permission rule '{}' explicitly denies a chained segment of this invocation.",
+                                    rule.label()
+                                ),
+                            },
+                        });
+                    }
+                }
+            }
+        }
 
         let ask_rule = self.matching_ask_rule(&ctx);
 
@@ -551,6 +590,30 @@ impl ExecPolicyEngine {
     }
 }
 
+/// Split a shell command into its top-level segments on the chaining/pipe
+/// operators (`&&`, `||`, `;`, `|`, and newlines). Deny rules must match a
+/// target command in ANY segment, not just when it leads the command — a
+/// leading benign command (`ls && npm publish`) must not shield a denied
+/// suffix. Over-splitting is safe here: it only makes deny matching stricter.
+fn command_segments(command: &str) -> Vec<String> {
+    command
+        .replace("&&", "\n")
+        .replace("||", "\n")
+        .replace(['|', ';'], "\n")
+        .lines()
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+/// True when the command chains multiple top-level segments — a trusted/allow
+/// rule that matches one segment must NOT auto-approve the whole chain
+/// (`git log ; rm -rf /` is not "just git log").
+fn command_is_chained(command: &str) -> bool {
+    command_segments(command).len() > 1
+}
+
 fn normalize_command(value: &str) -> String {
     // Normalize: lowercase, collapse internal whitespace to single spaces.
     // This prevents bypass via "git  status" (double space) vs "git status".
@@ -674,6 +737,69 @@ mod tests {
             ask_for_approval,
             sandbox_mode: Some("workspace-write"),
         }
+    }
+
+    #[test]
+    fn denied_prefix_blocks_a_chained_segment() {
+        // #security: a leading benign command must not shield a denied suffix.
+        let engine = ExecPolicyEngine::new(vec![], vec!["npm publish".to_string()]);
+        for cmd in [
+            "ls && npm publish",
+            "true; npm publish",
+            "echo hi || npm publish",
+            "cat x | npm publish",
+        ] {
+            let decision = engine
+                .check(ctx(cmd, AskForApproval::UnlessTrusted))
+                .unwrap();
+            assert!(!decision.allow, "{cmd} should be denied");
+            assert!(
+                matches!(
+                    decision.requirement,
+                    ExecApprovalRequirement::Forbidden { .. }
+                ),
+                "{cmd}"
+            );
+        }
+        // And the leading form still blocks.
+        let d = engine
+            .check(ctx(
+                "npm publish --tag latest",
+                AskForApproval::UnlessTrusted,
+            ))
+            .unwrap();
+        assert!(!d.allow);
+    }
+
+    #[test]
+    fn denied_prefix_does_not_over_match_unrelated_commands() {
+        let engine = ExecPolicyEngine::new(vec![], vec!["npm publish".to_string()]);
+        // Word-boundary: "npm publishx" / a segment that merely mentions it
+        // as an argument must not falsely deny.
+        let d = engine
+            .check(ctx("ls && echo npm publish", AskForApproval::UnlessTrusted))
+            .unwrap();
+        // "echo npm publish" segment does not START with "npm publish", so no deny.
+        assert!(d.allow || d.requires_approval, "unexpected deny: {d:?}");
+    }
+
+    #[test]
+    fn trusted_prefix_does_not_auto_approve_a_chained_command() {
+        // #security: `git log ; rm -rf /` must not be "trusted" because git log is.
+        let engine = ExecPolicyEngine::new(vec!["git log".to_string()], vec![]);
+        let decision = engine
+            .check(ctx("git log ; rm -rf /", AskForApproval::UnlessTrusted))
+            .unwrap();
+        // Not auto-skipped as trusted (chained); falls through to require approval.
+        assert!(
+            !matches!(decision.requirement, ExecApprovalRequirement::Skip { .. }),
+            "chained command wrongly trusted: {decision:?}"
+        );
+        // The single-segment form is still trusted.
+        let single = engine
+            .check(ctx("git log --oneline", AskForApproval::UnlessTrusted))
+            .unwrap();
+        assert!(single.allow && !single.requires_approval);
     }
 
     #[test]

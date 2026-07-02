@@ -732,7 +732,7 @@ impl ExecCell {
                 ));
             } else if self.status == ToolStatus::Running && self.source == ExecSource::Assistant {
                 lines.extend(wrap_plain_line(
-                    "  Ctrl+B backgrounds this command.",
+                    "  Ctrl+B moves this shell wait to /jobs.",
                     Style::default().fg(palette::TEXT_MUTED),
                     width,
                 ));

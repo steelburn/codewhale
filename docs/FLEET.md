@@ -36,6 +36,30 @@ Fleet state is stored under the workspace in `.codewhale/fleet.jsonl`. Worker
 logs and adapter logs are stored under `.codewhale/fleet/` and
 `.codewhale/fleet-host/`.
 
+## Authoring agent profiles (`/fleet setup`)
+
+`/fleet setup` (also `/fleet`, or the `roles`/`profiles`/`loadout`/`party`
+aliases) opens an in-TUI wizard for authoring a reusable agent-team profile.
+`/fleet status` opens the worker-status view instead; `/subagents` is a
+compatibility shortcut for that status view.
+
+The wizard is progressive: you make one focused choice at a time — a **role**,
+then a **model class** — and then review the full posture (model/route,
+permissions, tools, workspace/org scope, and review policy) before doing
+anything. Pressing **Enter** ("start") on the review step inserts a safe
+profile-authoring prompt into the composer; it does not write a file itself.
+
+When a provider is configured, the review step also offers model-assisted
+drafting behind a ratify gate:
+
+- Press **`m`** to have your first configured model draft the profile. The
+  draft arrives sanitized and bounded — permissions stay at the **fleet floor**
+  (no shell, no trust, approval required) regardless of what the model
+  proposes.
+- **Drafting is not ratifying.** The exact rendered TOML preview is shown and
+  nothing is saved until you press **`g`** to ratify (or press `m` again to
+  redraft). Ratifying writes the profile to `.codewhale/agents/<role>`.
+
 ## Naming: Modes, WhaleFlow, Fleet, and Swarm
 
 These names describe different layers, not competing systems. Agent, Plan, and

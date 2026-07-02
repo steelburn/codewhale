@@ -228,6 +228,14 @@ pub fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     std::io::Write::write_all(&mut tmp, contents)?;
     tmp.as_file().sync_all()?;
     tmp.persist(path)?;
+    // Fsync the parent directory so the rename (the new directory entry) is
+    // itself durable — otherwise a power loss right after the rename can lose
+    // it even though the file data was synced, silently dropping a
+    // crash-recovery checkpoint. Best-effort: not all platforms permit
+    // opening a directory for sync, so a failure here is not fatal.
+    if let Ok(dir) = std::fs::File::open(parent) {
+        let _ = dir.sync_all();
+    }
     Ok(())
 }
 
