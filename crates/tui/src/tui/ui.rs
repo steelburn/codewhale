@@ -3,8 +3,10 @@
 use std::cell::Cell;
 use std::collections::{HashSet, VecDeque};
 use std::fmt::Write as _;
+use std::future::Future;
 use std::io::{self, Stdout, Write};
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::{
     Arc, LazyLock,
     atomic::{AtomicBool, Ordering},
@@ -10745,7 +10747,92 @@ async fn apply_provider_picker_api_key(
     provider: ApiProvider,
     api_key: String,
 ) {
+    apply_provider_picker_api_key_with_verifier(
+        app,
+        engine_handle,
+        config,
+        provider,
+        api_key,
+        &LiveProviderKeyVerifier,
+    )
+    .await;
+}
+
+type ProviderKeyVerification<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+
+trait ProviderKeyVerifier {
+    fn verify<'a>(
+        &'a self,
+        provider: ApiProvider,
+        api_key: &'a str,
+        base_url: &'a str,
+    ) -> ProviderKeyVerification<'a>;
+}
+
+struct LiveProviderKeyVerifier;
+
+impl ProviderKeyVerifier for LiveProviderKeyVerifier {
+    fn verify<'a>(
+        &'a self,
+        provider: ApiProvider,
+        api_key: &'a str,
+        base_url: &'a str,
+    ) -> ProviderKeyVerification<'a> {
+        Box::pin(crate::client::verify_provider_api_key(
+            provider, api_key, base_url,
+        ))
+    }
+}
+
+async fn apply_provider_picker_api_key_with_verifier(
+    app: &mut App,
+    engine_handle: &mut EngineHandle,
+    config: &mut Config,
+    provider: ApiProvider,
+    api_key: String,
+    verifier: &dyn ProviderKeyVerifier,
+) {
     use crate::config::save_api_key_for;
+
+    // #3875: verify the key against the provider before persisting.
+    // Use the provider's configured base URL (or the default) for the
+    // models-endpoint probe so custom endpoints are also verified.
+    let base_url = config
+        .provider_config_for(provider)
+        .and_then(|entry| entry.base_url.as_deref())
+        .filter(|url| !url.trim().is_empty())
+        .unwrap_or_else(|| provider.default_base_url());
+    match verifier.verify(provider, &api_key, base_url).await {
+        Ok(()) => { /* key is valid, proceed to persist */ }
+        Err(reason) => {
+            // Verification failed - keep the picker open at the key-entry
+            // stage with the provider's actual error so the user can fix
+            // the key instead of dead-ending with a status toast.
+            let runtime_status = query_provider_runtime_status(engine_handle).await;
+            if let Some(picker) =
+                crate::tui::provider_picker::ProviderPickerView::new_for_key_entry_with_error(
+                    app.api_provider,
+                    provider,
+                    config,
+                    runtime_status,
+                    reason,
+                )
+            {
+                app.view_stack.push(picker);
+                app.status_message = Some(format!(
+                    "{} API key verification failed - check the key and try again.",
+                    provider.as_str()
+                ));
+            } else {
+                app.status_message = Some(format!(
+                    "{} API key verification failed, but the provider could not be re-opened.",
+                    provider.as_str()
+                ));
+            }
+            app.needs_redraw = true;
+            return;
+        }
+    }
 
     match save_api_key_for(provider, &api_key) {
         Ok(path) => {
@@ -12707,6 +12794,230 @@ fn parse_semver(v: &str) -> Option<(u32, u32, u32)> {
     let minor = parts.next()?.parse::<u32>().ok()?;
     let patch = parts.next().unwrap_or("0").parse::<u32>().ok()?;
     Some((major, minor, patch))
+}
+
+#[cfg(test)]
+mod provider_key_validation_tests {
+    use super::*;
+    use crate::core::engine::mock_engine_handle;
+    use ratatui::{buffer::Buffer, layout::Rect};
+    use std::ffi::OsString;
+    use std::sync::MutexGuard;
+    use tempfile::TempDir;
+
+    struct ConfigPathEnvGuard {
+        _tmp: TempDir,
+        previous: Option<OsString>,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl ConfigPathEnvGuard {
+        fn new() -> Self {
+            let lock = crate::test_support::lock_test_env();
+            let tmp = TempDir::new().expect("config tempdir");
+            let config_path = tmp.path().join(".codewhale").join("config.toml");
+            std::fs::create_dir_all(config_path.parent().expect("config parent"))
+                .expect("config dir");
+            let previous = std::env::var_os("DEEPSEEK_CONFIG_PATH");
+            // Safety: test-only environment mutation guarded by a global mutex.
+            unsafe {
+                std::env::set_var("DEEPSEEK_CONFIG_PATH", &config_path);
+            }
+            Self {
+                _tmp: tmp,
+                previous,
+                _lock: lock,
+            }
+        }
+
+        fn config_path(&self) -> PathBuf {
+            std::env::var_os("DEEPSEEK_CONFIG_PATH")
+                .map(PathBuf::from)
+                .expect("config path set")
+        }
+    }
+
+    impl Drop for ConfigPathEnvGuard {
+        fn drop(&mut self) {
+            // Safety: test-only environment mutation guarded by a global mutex.
+            unsafe {
+                if let Some(previous) = self.previous.take() {
+                    std::env::set_var("DEEPSEEK_CONFIG_PATH", previous);
+                } else {
+                    std::env::remove_var("DEEPSEEK_CONFIG_PATH");
+                }
+            }
+        }
+    }
+
+    fn create_test_app() -> App {
+        let options = TuiOptions {
+            model: "deepseek-v4-pro".to_string(),
+            workspace: PathBuf::from("."),
+            config_path: None,
+            config_profile: None,
+            allow_shell: false,
+            use_alt_screen: true,
+            use_mouse_capture: false,
+            use_bracketed_paste: true,
+            max_subagents: 1,
+            skills_dir: PathBuf::from("."),
+            memory_path: PathBuf::from("memory.md"),
+            notes_path: PathBuf::from("notes.txt"),
+            mcp_config_path: PathBuf::from("mcp.json"),
+            use_memory: false,
+            start_in_agent_mode: true,
+            skip_onboarding: false,
+            yolo: false,
+            resume_session_id: None,
+            initial_input: None,
+        };
+        let mut app = App::new(options, &Config::default());
+        app.api_provider = ApiProvider::Deepseek;
+        app.model = "deepseek-v4-pro".to_string();
+        app.auto_model = false;
+        app
+    }
+
+    struct MockProviderKeyVerifier {
+        result: Result<(), String>,
+        calls: std::sync::Mutex<Vec<(ApiProvider, String, String)>>,
+    }
+
+    impl MockProviderKeyVerifier {
+        fn new(result: Result<(), String>) -> Self {
+            Self {
+                result,
+                calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<(ApiProvider, String, String)> {
+            self.calls.lock().expect("calls lock").clone()
+        }
+    }
+
+    impl ProviderKeyVerifier for MockProviderKeyVerifier {
+        fn verify<'a>(
+            &'a self,
+            provider: ApiProvider,
+            api_key: &'a str,
+            base_url: &'a str,
+        ) -> ProviderKeyVerification<'a> {
+            self.calls.lock().expect("calls lock").push((
+                provider,
+                api_key.to_string(),
+                base_url.to_string(),
+            ));
+            Box::pin(std::future::ready(self.result.clone()))
+        }
+    }
+
+    fn openrouter_config(base_url: &str) -> Config {
+        Config {
+            providers: Some(ProvidersConfig {
+                openrouter: ProviderConfig {
+                    base_url: Some(base_url.to_string()),
+                    ..ProviderConfig::default()
+                },
+                ..ProvidersConfig::default()
+            }),
+            ..Config::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_key_submit_persists_after_mocked_validation_success() {
+        let config_env = ConfigPathEnvGuard::new();
+        let mut app = create_test_app();
+        let mut engine = mock_engine_handle();
+        let mut config = openrouter_config("https://mock.openrouter.test/v1");
+        let verifier = MockProviderKeyVerifier::new(Ok(()));
+
+        apply_provider_picker_api_key_with_verifier(
+            &mut app,
+            &mut engine.handle,
+            &mut config,
+            ApiProvider::Openrouter,
+            "sk-verified".to_string(),
+            &verifier,
+        )
+        .await;
+
+        assert_eq!(
+            verifier.calls(),
+            vec![(
+                ApiProvider::Openrouter,
+                "sk-verified".to_string(),
+                "https://mock.openrouter.test/v1".to_string()
+            )]
+        );
+        assert_eq!(app.api_provider, ApiProvider::Openrouter);
+        assert_eq!(config.provider.as_deref(), Some("openrouter"));
+        assert_eq!(
+            config
+                .providers
+                .as_ref()
+                .and_then(|providers| providers.openrouter.api_key.as_deref()),
+            Some("sk-verified")
+        );
+        let saved = std::fs::read_to_string(config_env.config_path()).expect("saved config");
+        assert!(saved.contains("[providers.openrouter]"));
+        assert!(saved.contains("api_key = \"sk-verified\""));
+    }
+
+    #[tokio::test]
+    async fn provider_key_submit_reopens_picker_without_persisting_on_validation_failure() {
+        let config_env = ConfigPathEnvGuard::new();
+        let mut app = create_test_app();
+        let mut engine = mock_engine_handle();
+        let mut config = openrouter_config("https://mock.openrouter.test/v1");
+        let verifier = MockProviderKeyVerifier::new(Err("HTTP 401: unauthorized".to_string()));
+
+        apply_provider_picker_api_key_with_verifier(
+            &mut app,
+            &mut engine.handle,
+            &mut config,
+            ApiProvider::Openrouter,
+            "sk-rejected".to_string(),
+            &verifier,
+        )
+        .await;
+
+        assert_eq!(app.api_provider, ApiProvider::Deepseek);
+        assert_eq!(config.provider.as_deref(), None);
+        assert_eq!(
+            config
+                .providers
+                .as_ref()
+                .and_then(|providers| providers.openrouter.api_key.as_deref()),
+            None
+        );
+        let saved = std::fs::read_to_string(config_env.config_path()).unwrap_or_default();
+        assert!(!saved.contains("sk-rejected"));
+        assert_eq!(app.view_stack.top_kind(), Some(ModalKind::ProviderPicker));
+        assert!(
+            app.status_message
+                .as_deref()
+                .is_some_and(|status| status.contains("API key verification failed")),
+            "status names validation failure: {:?}",
+            app.status_message
+        );
+
+        let picker = app.view_stack.pop().expect("provider picker reopened");
+        let area = Rect::new(0, 0, 90, 14);
+        let mut buf = Buffer::empty(area);
+        picker.render(area, &mut buf);
+        let rendered = (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("Verification failed: HTTP 401: unauthorized"));
+    }
 }
 
 #[cfg(test)]

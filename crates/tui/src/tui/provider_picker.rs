@@ -79,6 +79,9 @@ pub struct ProviderPickerView {
     stage: Stage,
     view: ProviderListView,
     api_key_input: String,
+    /// An error surfaced after a failed key verification, shown inline
+    /// in the key-entry stage. Cleared when the user edits the input.
+    key_entry_error: Option<String>,
     custom_provider_field: CustomProviderField,
     custom_provider_id: String,
     custom_provider_base_url: String,
@@ -1135,6 +1138,7 @@ impl ProviderPickerView {
             stage: Stage::List,
             view,
             api_key_input: String::new(),
+            key_entry_error: None,
             custom_provider_field: CustomProviderField::Name,
             custom_provider_id: String::new(),
             custom_provider_base_url: String::new(),
@@ -1264,6 +1268,29 @@ impl ProviderPickerView {
     fn enter_key_entry(&mut self) {
         self.stage = Stage::KeyEntry;
         self.api_key_input.clear();
+        self.key_entry_error = None;
+    }
+
+    /// Open the picker already focused on `target` in its key-entry stage
+    /// with a validation error message - the verify-then-persist handoff
+    /// (#3875): when a submitted key fails live validation, drop the user
+    /// back on that provider's key prompt with the provider's actual error
+    /// instead of dead-ending with a status toast.
+    #[must_use]
+    pub fn new_for_key_entry_with_error(
+        active: ApiProvider,
+        target: ApiProvider,
+        config: &Config,
+        runtime_status: Option<ProviderRuntimeStatus>,
+        error: String,
+    ) -> Option<Self> {
+        let mut picker = Self::new_with_runtime_status(active, config, runtime_status);
+        let idx = picker.rows.iter().position(|row| row.provider == target)?;
+        picker.selected_idx = idx;
+        picker.view = ProviderListView::Catalog;
+        picker.stage = Stage::KeyEntry;
+        picker.key_entry_error = Some(error);
+        Some(picker)
     }
 
     fn enter_custom_form(&mut self) {
@@ -1661,6 +1688,15 @@ impl ProviderPickerView {
             Style::default().fg(palette::TEXT_MUTED),
         )))
         .render(layout[1], buf);
+
+        if let Some(ref error) = self.key_entry_error {
+            let error_text = format!("Verification failed: {error}");
+            Paragraph::new(Line::from(Span::styled(
+                error_text,
+                Style::default().fg(palette::DEEPSEEK_RED),
+            )))
+            .render(layout[2], buf);
+        }
     }
 
     fn render_custom_form(&self, area: Rect, buf: &mut Buffer) {
@@ -3116,6 +3152,24 @@ mod tests {
         .expect("Anthropic has a picker row");
         assert_eq!(picker.stage, Stage::KeyEntry);
         assert_eq!(picker.selected_provider(), ApiProvider::Anthropic);
+    }
+
+    #[test]
+    fn new_for_key_entry_with_error_opens_prompt_and_renders_reason() {
+        let config = Config::default();
+        let picker = ProviderPickerView::new_for_key_entry_with_error(
+            ApiProvider::Deepseek,
+            ApiProvider::Openrouter,
+            &config,
+            None,
+            "HTTP 401: unauthorized".to_string(),
+        )
+        .expect("OpenRouter has a picker row");
+
+        assert_eq!(picker.stage, Stage::KeyEntry);
+        assert_eq!(picker.selected_provider(), ApiProvider::Openrouter);
+        let rendered = render_text(&picker, 90, 14);
+        assert!(rendered.contains("Verification failed: HTTP 401: unauthorized"));
     }
 
     #[test]

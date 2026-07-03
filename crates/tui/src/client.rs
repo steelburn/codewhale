@@ -937,6 +937,58 @@ fn api_provider_skips_models_probe(api_provider: ApiProvider) -> bool {
     matches!(api_provider, ApiProvider::DeepseekAnthropic)
 }
 
+/// Verify a provider API key by hitting the `/models` endpoint
+/// (#3875). Builds a minimal HTTP client with the canonical auth
+/// headers for `provider`, issues a single GET, and returns
+/// `Ok(())` on a 2xx response or `Err(reason)` on any failure.
+///
+/// This is intentionally a one-shot call — no retry, no rate-limit
+/// wait — so a bad key is surfaced immediately.
+pub async fn verify_provider_api_key(
+    provider: ApiProvider,
+    api_key: &str,
+    base_url: &str,
+) -> Result<(), String> {
+    if api_provider_skips_models_probe(provider) {
+        // Providers without a /models endpoint can't be verified this
+        // way; accept the key optimistically (same as health_check).
+        return Ok(());
+    }
+    let headers = build_default_headers(api_key, &Default::default(), provider, base_url)
+        .map_err(|err| format!("failed to build auth headers: {err:#}"))?;
+    let client = crate::tls::reqwest_client_builder()
+        .default_headers(headers)
+        .user_agent(concat!(
+            "Mozilla/5.0 (compatible; codewhale/",
+            env!("CARGO_PKG_VERSION"),
+            "; +https://github.com/Hmbown/CodeWhale)"
+        ))
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|err| format!("failed to build HTTP client: {err:#}"))?;
+    let url = api_url(base_url, "models");
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|err| format!("request failed: {err:#}"))?;
+    let status = response.status();
+    if status.is_success() {
+        // Consume the body so the connection returns to the pool.
+        let _ = response.text().await;
+        Ok(())
+    } else {
+        let body = response.text().await.unwrap_or_default();
+        let summary = if body.chars().count() > 200 {
+            format!("{}...", body.chars().take(200).collect::<String>())
+        } else {
+            body
+        };
+        Err(format!("HTTP {status}: {summary}"))
+    }
+}
+
 fn translation_system_prompt(target_language: &str) -> String {
     format!(
         "You are a professional translator. Your ONLY task is to translate text to {target_language}. \
@@ -2052,7 +2104,7 @@ mod tests {
         ContentBlock, ContentBlockStart, Delta, Message, MessageRequest, StreamEvent, Tool,
     };
     use serde_json::json;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn test_tool(name: &str) -> Tool {
@@ -4298,6 +4350,38 @@ mod tests {
             .respond_with(ResponseTemplate::new(status).set_body_json(body))
             .mount(server)
             .await;
+    }
+
+    #[tokio::test]
+    async fn verify_provider_api_key_accepts_mocked_models_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .and(header("authorization", "Bearer test-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": []})))
+            .mount(&server)
+            .await;
+
+        verify_provider_api_key(ApiProvider::Openrouter, "test-key", &server.uri())
+            .await
+            .expect("mocked /models success should verify");
+    }
+
+    #[tokio::test]
+    async fn verify_provider_api_key_returns_status_and_unicode_body_without_panic() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("密钥无效"))
+            .mount(&server)
+            .await;
+
+        let err = verify_provider_api_key(ApiProvider::Openrouter, "bad-key", &server.uri())
+            .await
+            .expect_err("mocked /models failure should be reported");
+
+        assert!(err.contains("HTTP 401"), "status is preserved: {err}");
+        assert!(err.contains("密钥无效"), "unicode body is preserved: {err}");
     }
 
     #[tokio::test]
