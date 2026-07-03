@@ -53,7 +53,7 @@ use crate::config::{
     provider_capability, save_provider_auth_mode_for,
 };
 use crate::config_ui::{self, ConfigUiMode, WebConfigSession, WebConfigSessionEvent};
-use crate::core::engine::{EngineConfig, EngineHandle, spawn_engine};
+use crate::core::engine::{EngineConfig, EngineHandle, SubagentPolicy, spawn_engine};
 use crate::core::events::Event as EngineEvent;
 use crate::core::ops::{Op, ProviderRuntimeStatus, USER_SHELL_TOOL_ID_PREFIX};
 use crate::hooks::{HookEvent, HookExecutor, TurnEndPayloadInput, TurnEndTotals};
@@ -1346,6 +1346,10 @@ fn handle_memory_quick_add(app: &mut App, input: &str, config: &Config) {
 fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
     let provider = app.api_provider;
     let max_subagents = app.max_subagents.clamp(1, crate::config::MAX_SUBAGENTS);
+    let subagent_policy = SubagentPolicy::from_config_for_provider(config, provider, max_subagents);
+    #[cfg(test)]
+    let subagents_enabled = subagent_policy.enabled;
+
     EngineConfig {
         model: app.model.clone(),
         active_route_limits: app.active_route_limits,
@@ -1370,12 +1374,9 @@ fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
         // model stops emitting tool calls. A real runaway is rare and
         // human-noticeable; we trust the operator over a hard step cap.
         max_steps: u32::MAX,
-        max_subagents,
-        max_admitted_subagents: config
-            .max_admitted_subagents_for_provider(provider)
-            .max(max_subagents),
-        launch_concurrency: config.launch_concurrency_for_provider(provider),
-        subagents_enabled: config.subagents_enabled_for_provider(provider),
+        subagent_policy,
+        #[cfg(test)]
+        subagents_enabled,
         features: config.features(),
         auto_review_policy: config.auto_review_policy(),
         compaction: app.compaction_config(),
@@ -1386,8 +1387,6 @@ fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
             app.hunt.token_budget,
             app.hunt.verdict.goal_status(),
         ),
-        max_spawn_depth: config.subagent_max_spawn_depth_for_provider(provider),
-        subagent_token_budget: config.subagent_token_budget_for_provider(provider),
         allowed_tools: app.active_allowed_tools.clone(),
         disallowed_tools: None,
         hook_executor: app.runtime_services.hook_executor.clone(),
@@ -1404,14 +1403,7 @@ fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
             .clone()
             .map(crate::config::LspConfigToml::into_runtime),
         runtime_services: app.runtime_services.clone(),
-        subagent_model_overrides: config.subagent_model_overrides(),
-        subagent_api_timeout: Duration::from_secs(
-            config.subagent_api_timeout_secs_for_provider(provider),
-        ),
         stream_chunk_timeout: Duration::from_secs(app.stream_chunk_timeout_secs),
-        subagent_heartbeat_timeout: Duration::from_secs(
-            config.subagent_heartbeat_timeout_secs_for_provider(provider),
-        ),
         prefer_bwrap: config.prefer_bwrap.unwrap_or(false),
         memory_enabled: config.memory_enabled(),
         moraine_fallback: config.moraine_fallback(),

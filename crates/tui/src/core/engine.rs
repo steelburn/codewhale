@@ -27,7 +27,7 @@ use crate::client::DeepSeekClient;
 use crate::compaction::{
     CompactionConfig, compact_messages_safe, merge_system_prompts, should_compact,
 };
-use crate::config::{ApiProvider, Config, DEFAULT_MAX_SUBAGENTS, DEFAULT_TEXT_MODEL};
+use crate::config::{ApiProvider, Config, DEFAULT_TEXT_MODEL};
 use crate::error_taxonomy::{ErrorCategory, ErrorEnvelope, StreamError};
 use crate::features::{Feature, Features};
 use crate::llm_client::LlmClient;
@@ -282,16 +282,12 @@ pub struct EngineConfig {
     pub verbosity: Option<String>,
     /// Maximum number of assistant steps before stopping.
     pub max_steps: u32,
-    /// Maximum number of concurrently active subagents.
-    pub max_subagents: usize,
-    /// Maximum queued + running sub-agents admitted for this engine session.
-    pub max_admitted_subagents: usize,
-    /// Number of direct (depth-1) sub-agents that may execute concurrently
-    /// before further launches queue for a launch slot (#3095).
-    /// Resolved from `[subagents] launch_concurrency`.
-    pub launch_concurrency: usize,
-    /// Whether the model-facing `agent` tool is available after applying
-    /// feature flags and `[subagents]` opt-out controls.
+    /// Sub-agent concurrency, depth, timeout, and budget controls aggregated
+    /// into a single policy struct (#3942).
+    pub subagent_policy: SubagentPolicy,
+    /// Legacy test fixture shim while existing engine tests migrate to
+    /// `subagent_policy`.
+    #[cfg(test)]
     pub subagents_enabled: bool,
     /// Feature flags controlling tool availability.
     pub features: Features,
@@ -305,14 +301,6 @@ pub struct EngineConfig {
     pub plan_state: SharedPlanState,
     /// Shared runtime goal state for model-visible goal tools.
     pub goal_state: SharedGoalState,
-    /// Maximum sub-agent recursion depth (default 3). See
-    /// `SubAgentRuntime::max_spawn_depth`. Override via
-    /// `[subagents] max_depth = N` in `~/.codewhale/config.toml`.
-    pub max_spawn_depth: u32,
-    /// Optional aggregate token budget for each root sub-agent run.
-    /// Descendant agents inherit the root pool unless a child starts a new
-    /// budget scope with an explicit per-call override.
-    pub subagent_token_budget: Option<u64>,
     /// Per-domain network policy decider (#135). Shared across the session so
     /// session-scoped approvals (`/network allow <host>`) persist for the
     /// remainder of the run.
@@ -328,8 +316,6 @@ pub struct EngineConfig {
     pub lsp_config: Option<crate::lsp::LspConfig>,
     /// Durable runtime services exposed to model-visible tools.
     pub runtime_services: RuntimeToolServices,
-    /// Per-role/type sub-agent model overrides already resolved from config.
-    pub subagent_model_overrides: HashMap<String, String>,
     /// Whether the user-memory feature is enabled (#489). When `true` the
     /// engine reads `memory_path` on each prompt assembly and prepends a
     /// `<user_memory>` block to the system prompt.
@@ -375,19 +361,10 @@ pub struct EngineConfig {
     pub search_api_key: Option<String>,
     /// Optional DuckDuckGo-compatible HTML endpoint override.
     pub search_base_url: Option<String>,
-    /// Per-step DeepSeek API timeout for sub-agent `create_message` requests.
-    /// Resolved from `[subagents] api_timeout_secs` (clamped to 1..=1800)
-    /// once at engine construction, then threaded onto every
-    /// `SubAgentRuntime` the engine builds (#1806, #1808).
-    pub subagent_api_timeout: Duration,
     /// Per-SSE-chunk idle timeout for streamed model responses.
     /// Resolved from `[tui].stream_chunk_timeout_secs` (or the legacy
     /// `DEEPSEEK_STREAM_IDLE_TIMEOUT_SECS`) and updated live by `/config`.
     pub stream_chunk_timeout: Duration,
-    /// No-progress heartbeat timeout for live sub-agents. Used by the manager
-    /// and parent wait loop to auto-cancel stuck children before they exhaust
-    /// the sub-agent slot pool indefinitely (#2614).
-    pub subagent_heartbeat_timeout: Duration,
     /// Native tools that should stay in the model-visible catalog even when
     /// they are outside the small default core surface (#2076).
     pub tools_always_load: HashSet<String>,
@@ -431,9 +408,8 @@ impl Default for EngineConfig {
             // `at_max_steps()`. 1000 stays high enough to never gate real work
             // while still guaranteeing the turn ends.
             max_steps: 1000,
-            max_subagents: DEFAULT_MAX_SUBAGENTS,
-            max_admitted_subagents: DEFAULT_MAX_SUBAGENTS,
-            launch_concurrency: DEFAULT_MAX_SUBAGENTS,
+            subagent_policy: SubagentPolicy::default(),
+            #[cfg(test)]
             subagents_enabled: true,
             features: Features::with_defaults(),
             auto_review_policy: crate::tui::auto_review::AutoReviewPolicy::default(),
@@ -441,15 +417,12 @@ impl Default for EngineConfig {
             todos: new_shared_todo_list(),
             plan_state: new_shared_plan_state(),
             goal_state: new_shared_goal_state(),
-            max_spawn_depth: crate::tools::subagent::DEFAULT_MAX_SPAWN_DEPTH,
-            subagent_token_budget: None,
             network_policy: None,
             snapshots_enabled: true,
             snapshots_max_workspace_bytes:
                 crate::snapshot::DEFAULT_MAX_WORKSPACE_BYTES_FOR_SNAPSHOT,
             lsp_config: None,
             runtime_services: RuntimeToolServices::default(),
-            subagent_model_overrides: HashMap::new(),
             memory_enabled: false,
             moraine_fallback: false,
             memory_path: PathBuf::from("./memory.md"),
@@ -467,14 +440,8 @@ impl Default for EngineConfig {
             search_provider: crate::config::SearchProvider::default(),
             search_api_key: None,
             search_base_url: None,
-            subagent_api_timeout: Duration::from_secs(
-                crate::config::DEFAULT_SUBAGENT_API_TIMEOUT_SECS,
-            ),
             stream_chunk_timeout: Duration::from_secs(
                 crate::config::DEFAULT_STREAM_CHUNK_TIMEOUT_SECS,
-            ),
-            subagent_heartbeat_timeout: Duration::from_secs(
-                crate::config::DEFAULT_SUBAGENT_HEARTBEAT_TIMEOUT_SECS,
             ),
             tools_always_load: HashSet::new(),
             prefer_bwrap: false,
@@ -811,6 +778,13 @@ impl Engine {
     pub fn new(config: EngineConfig, api_config: &Config) -> (Self, EngineHandle) {
         crate::tls::ensure_rustls_crypto_provider();
 
+        #[cfg(test)]
+        let config = {
+            let mut config = config;
+            config.subagent_policy.enabled = config.subagents_enabled;
+            config
+        };
+
         if let Some(objective) = normalized_goal_objective(config.goal_objective.as_deref()) {
             sync_goal_state_from_host(
                 &config.goal_state,
@@ -900,11 +874,11 @@ impl Engine {
 
         let subagent_manager = new_shared_subagent_manager_with_timeout(
             config.workspace.clone(),
-            config.max_subagents,
-            config.max_admitted_subagents,
-            config.subagent_heartbeat_timeout,
-            config.launch_concurrency,
-            config.subagent_token_budget,
+            config.subagent_policy.max_subagents,
+            config.subagent_policy.max_admitted_subagents,
+            config.subagent_policy.heartbeat_timeout,
+            config.subagent_policy.launch_concurrency,
+            config.subagent_policy.token_budget,
         );
         let shell_manager = config
             .runtime_services
@@ -1457,7 +1431,7 @@ impl Engine {
                             Some(self.tx_event.clone()),
                             Arc::clone(&self.subagent_manager),
                         )
-                        .with_role_models(self.config.subagent_model_overrides.clone())
+                        .with_role_models(self.config.subagent_policy.model_overrides.clone())
                         .with_auto_model(self.session.auto_model)
                         .with_reasoning_effort(
                             self.session.reasoning_effort.clone(),
@@ -1466,8 +1440,8 @@ impl Engine {
                         .with_agent_tool_surface_options(self.agent_tool_surface_options(
                             shell_policy_for_mode(AppMode::Agent, self.session.allow_shell),
                         ))
-                        .with_max_spawn_depth(self.config.max_spawn_depth)
-                        .with_step_api_timeout(self.config.subagent_api_timeout)
+                        .with_max_spawn_depth(self.config.subagent_policy.max_spawn_depth)
+                        .with_step_api_timeout(self.config.subagent_policy.api_timeout)
                         .with_speech_output_dir(self.config.speech_output_dir.clone())
                         .with_mcp_pool(mcp_pool)
                         .with_todos(self.config.todos.clone())
@@ -1615,24 +1589,25 @@ impl Engine {
                         api_timeout_secs,
                         heartbeat_timeout_secs,
                     } => {
-                        self.config.subagents_enabled = enabled;
-                        self.config.max_subagents =
+                        self.config.subagent_policy.enabled = enabled;
+                        self.config.subagent_policy.max_subagents =
                             max_subagents.clamp(1, crate::config::MAX_SUBAGENTS);
-                        self.config.launch_concurrency =
-                            launch_concurrency.clamp(1, self.config.max_subagents);
-                        self.config.max_spawn_depth =
+                        self.config.subagent_policy.launch_concurrency =
+                            launch_concurrency.clamp(1, self.config.subagent_policy.max_subagents);
+                        self.config.subagent_policy.max_spawn_depth =
                             max_spawn_depth.min(codewhale_config::MAX_SPAWN_DEPTH_CEILING);
-                        self.config.subagent_api_timeout = Duration::from_secs(api_timeout_secs);
-                        self.config.subagent_heartbeat_timeout =
+                        self.config.subagent_policy.api_timeout =
+                            Duration::from_secs(api_timeout_secs);
+                        self.config.subagent_policy.heartbeat_timeout =
                             Duration::from_secs(heartbeat_timeout_secs);
                         let launch_gate_applied = {
                             let mut manager = self.subagent_manager.write().await;
                             manager.update_runtime_limits(
-                                self.config.max_subagents,
-                                self.config.max_admitted_subagents,
-                                self.config.subagent_heartbeat_timeout,
-                                self.config.launch_concurrency,
-                                self.config.subagent_token_budget,
+                                self.config.subagent_policy.max_subagents,
+                                self.config.subagent_policy.max_admitted_subagents,
+                                self.config.subagent_policy.heartbeat_timeout,
+                                self.config.subagent_policy.launch_concurrency,
+                                self.config.subagent_policy.token_budget,
                             )
                         };
                         let launch_note = if launch_gate_applied {
@@ -1644,9 +1619,9 @@ impl Engine {
                             .tx_event
                             .send(Event::status(format!(
                                 "Sub-agent runtime updated: enabled={enabled}, max_subagents={}, launch_concurrency={}, max_depth={}{}",
-                                self.config.max_subagents,
-                                self.config.launch_concurrency,
-                                self.config.max_spawn_depth,
+                                self.config.subagent_policy.max_subagents,
+                                self.config.subagent_policy.launch_concurrency,
+                                self.config.subagent_policy.max_spawn_depth,
                                 launch_note
                             )))
                             .await;
@@ -2422,8 +2397,10 @@ impl Engine {
             .build_turn_tool_registry_builder(input_policy.mode, todo_list, plan_state)
             .with_dynamic_tools(&dynamic_tools);
 
-        let subagents_available =
-            self.config.subagents_enabled && self.config.features.enabled(Feature::Subagents);
+        let subagents_available = self
+            .config
+            .subagent_policy
+            .exposes_agent_tool(&self.config.features, input_policy.mode);
 
         let fork_context_for_runtime = if subagents_available {
             let state = StructuredState::capture(
@@ -2509,7 +2486,7 @@ impl Engine {
                             Some(self.tx_event.clone()),
                             Arc::clone(&self.subagent_manager),
                         )
-                        .with_role_models(self.config.subagent_model_overrides.clone())
+                        .with_role_models(self.config.subagent_policy.model_overrides.clone())
                         .with_auto_model(self.session.auto_model)
                         .with_reasoning_effort(
                             self.session.reasoning_effort.clone(),
@@ -2518,8 +2495,8 @@ impl Engine {
                         .with_agent_tool_surface_options(self.agent_tool_surface_options(
                             shell_policy_for_mode(AppMode::Agent, self.session.allow_shell),
                         ))
-                        .with_max_spawn_depth(self.config.max_spawn_depth)
-                        .with_step_api_timeout(self.config.subagent_api_timeout)
+                        .with_max_spawn_depth(self.config.subagent_policy.max_spawn_depth)
+                        .with_step_api_timeout(self.config.subagent_policy.api_timeout)
                         .with_speech_output_dir(self.config.speech_output_dir.clone())
                         .with_mcp_pool(mcp_pool.clone())
                         .with_todos(self.config.todos.clone())
@@ -3921,11 +3898,13 @@ use context::{context_input_budget_for_provider, effective_max_output_tokens};
 mod dispatch;
 mod lsp_hooks;
 mod streaming;
+mod subagent_policy;
 mod token_estimate_cache;
 mod tool_catalog;
 mod tool_execution;
 mod tool_setup;
 mod turn_loop;
+pub use subagent_policy::SubagentPolicy;
 pub(crate) use token_estimate_cache::TokenEstimateCache;
 
 pub(super) const MAX_PARALLEL_SHELL_EXEC: usize = 4;

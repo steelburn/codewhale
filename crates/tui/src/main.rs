@@ -7486,7 +7486,7 @@ async fn run_exec_agent(
     append_system_prompt: Option<String>,
 ) -> Result<()> {
     use crate::compaction::CompactionConfig;
-    use crate::core::engine::{EngineConfig, spawn_engine};
+    use crate::core::engine::{EngineConfig, SubagentPolicy, spawn_engine};
     use crate::core::events::Event;
     use crate::core::ops::Op;
     use crate::tools::plan::new_shared_plan_state;
@@ -7542,6 +7542,14 @@ async fn run_exec_agent(
         .lsp
         .clone()
         .map(crate::config::LspConfigToml::into_runtime);
+    let subagent_policy = SubagentPolicy::from_config_for_provider(
+        &execution_config,
+        effective_provider,
+        max_subagents,
+    );
+    #[cfg(test)]
+    let subagents_enabled = subagent_policy.enabled;
+
     let engine_config = EngineConfig {
         model: effective_model.clone(),
         active_route_limits,
@@ -7570,21 +7578,15 @@ async fn run_exec_agent(
         translation_enabled: false,
         show_thinking: settings.show_thinking,
         max_steps: max_turns,
-        max_subagents,
-        max_admitted_subagents: execution_config
-            .max_admitted_subagents_for_provider(effective_provider)
-            .max(max_subagents),
-        launch_concurrency: execution_config.launch_concurrency_for_provider(effective_provider),
-        subagents_enabled: execution_config.subagents_enabled_for_provider(effective_provider),
+        subagent_policy,
+        #[cfg(test)]
+        subagents_enabled,
         features: execution_config.features(),
         auto_review_policy: execution_config.auto_review_policy(),
         compaction,
         todos: new_shared_todo_list(),
         plan_state: new_shared_plan_state(),
         goal_state: crate::tools::goal::new_shared_goal_state(),
-        max_spawn_depth: execution_config.subagent_max_spawn_depth_for_provider(effective_provider),
-        subagent_token_budget: execution_config
-            .subagent_token_budget_for_provider(effective_provider),
         network_policy,
         snapshots_enabled: execution_config.snapshots_config().enabled,
         snapshots_max_workspace_bytes: execution_config
@@ -7593,15 +7595,8 @@ async fn run_exec_agent(
             .saturating_mul(1024 * 1024 * 1024),
         lsp_config,
         runtime_services: crate::tools::spec::RuntimeToolServices::default(),
-        subagent_model_overrides: execution_config.subagent_model_overrides(),
-        subagent_api_timeout: std::time::Duration::from_secs(
-            execution_config.subagent_api_timeout_secs_for_provider(effective_provider),
-        ),
         stream_chunk_timeout: std::time::Duration::from_secs(
             execution_config.stream_chunk_timeout_secs(),
-        ),
-        subagent_heartbeat_timeout: std::time::Duration::from_secs(
-            execution_config.subagent_heartbeat_timeout_secs_for_provider(effective_provider),
         ),
         prefer_bwrap: execution_config.prefer_bwrap.unwrap_or(false),
         memory_enabled: execution_config.memory_enabled(),

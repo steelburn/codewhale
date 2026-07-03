@@ -27,7 +27,7 @@ use uuid::Uuid;
 
 use crate::compaction::CompactionConfig;
 use crate::config::{Config, DEFAULT_TEXT_MODEL, MAX_SUBAGENTS};
-use crate::core::engine::{EngineConfig, EngineHandle, spawn_engine};
+use crate::core::engine::{EngineConfig, EngineHandle, SubagentPolicy, spawn_engine};
 use crate::core::events::{Event as EngineEvent, TurnOutcomeStatus};
 use crate::core::ops::Op;
 use crate::models::{
@@ -2552,6 +2552,11 @@ impl RuntimeThreadManager {
         let max_subagents = cfg
             .max_subagents_for_provider(provider)
             .clamp(1, MAX_SUBAGENTS);
+        let subagent_policy =
+            SubagentPolicy::from_config_for_provider(&cfg, provider, max_subagents);
+        #[cfg(test)]
+        let subagents_enabled = subagent_policy.enabled;
+
         let engine_cfg = EngineConfig {
             model: thread.model.clone(),
             active_route_limits: None,
@@ -2571,20 +2576,15 @@ impl RuntimeThreadManager {
             translation_enabled: false,
             show_thinking: settings.show_thinking,
             max_steps: 100,
-            max_subagents,
-            max_admitted_subagents: cfg
-                .max_admitted_subagents_for_provider(provider)
-                .max(max_subagents),
-            launch_concurrency: cfg.launch_concurrency_for_provider(provider),
-            subagents_enabled: cfg.subagents_enabled_for_provider(provider),
+            subagent_policy,
+            #[cfg(test)]
+            subagents_enabled,
             features: cfg.features(),
             auto_review_policy: cfg.auto_review_policy(),
             compaction,
             todos: new_shared_todo_list(),
             plan_state: new_shared_plan_state(),
             goal_state: crate::tools::goal::new_shared_goal_state(),
-            max_spawn_depth: cfg.subagent_max_spawn_depth_for_provider(provider),
-            subagent_token_budget: cfg.subagent_token_budget_for_provider(provider),
             network_policy,
             snapshots_enabled: cfg.snapshots_config().enabled,
             snapshots_max_workspace_bytes: cfg
@@ -2604,14 +2604,7 @@ impl RuntimeThreadManager {
                 handle_store: crate::tools::handle::new_shared_handle_store(),
                 rlm_sessions: crate::rlm::session::new_shared_rlm_session_store(),
             },
-            subagent_model_overrides: cfg.subagent_model_overrides(),
-            subagent_api_timeout: std::time::Duration::from_secs(
-                cfg.subagent_api_timeout_secs_for_provider(provider),
-            ),
             stream_chunk_timeout: std::time::Duration::from_secs(cfg.stream_chunk_timeout_secs()),
-            subagent_heartbeat_timeout: std::time::Duration::from_secs(
-                cfg.subagent_heartbeat_timeout_secs_for_provider(provider),
-            ),
             prefer_bwrap: cfg.prefer_bwrap.unwrap_or(false),
             memory_enabled: cfg.memory_enabled(),
             moraine_fallback: cfg.moraine_fallback(),
