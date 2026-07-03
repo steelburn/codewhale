@@ -29,7 +29,7 @@ impl ToolSpec for ReadFileTool {
     }
 
     fn description(&self) -> &'static str {
-        "Read a UTF-8 file from the workspace. Use this instead of `cat`, `head`, `tail`, or `sed -n '..p'` in `exec_shell` — it's faster, sandbox-aware, and skips the approval prompt. Plain text is returned as-is and records the file snapshot required before `edit_file` will make a narrow in-place edit. PDFs are auto-extracted via the bundled pure-Rust extractor (no Poppler install required). Image screenshots are OCR-extracted when local OCR is available. Cannot read other non-PDF binaries.\n\nFor large files, use `start_line` and `max_lines` to read in chunks. By default, returns at most 200 lines (~16KB). If `truncated=\"true\"` in the response, use `next_start_line` to continue reading. For PDFs, use `pages` instead — `start_line`/`max_lines` only apply to text files."
+        "Read a UTF-8 file from the workspace. Use this instead of `cat`, `head`, `tail`, or `sed -n '..p'` in `exec_shell` — it's faster, sandbox-aware, and skips the approval prompt. Plain text is returned as-is and records the file snapshot required before `edit_file` will make a narrow in-place edit. PDFs are auto-extracted via the bundled pure-Rust extractor (no Poppler install required). Image screenshots are OCR-extracted when local OCR is available. Jupyter notebooks (.ipynb) are rendered as markdown + code cells with truncated outputs. Archive files (.zip, .tar, .tar.gz, .tgz) list entries by default; pass an `entry` parameter to extract a single member. Cannot read other non-PDF binaries.\n\nFor large files, use `start_line` and `max_lines` to read in chunks. By default, returns at most 200 lines (~16KB). If `truncated=\"true\"` in the response, use `next_start_line` to continue reading. For PDFs, use `pages` instead — `start_line`/`max_lines` only apply to text files."
     }
 
     fn input_schema(&self) -> Value {
@@ -51,6 +51,10 @@ impl ToolSpec for ReadFileTool {
                 "pages": {
                     "type": "string",
                     "description": "PDF only: page range to extract, e.g. \"1-5\" or \"10\". Ignored for non-PDF files."
+                },
+                "entry": {
+                    "type": "string",
+                    "description": "Archive only: name of the entry to extract (e.g. \"src/main.rs\"). When omitted, lists all archive entries. Ignored for non-archive files."
                 }
             },
             "required": ["path"]
@@ -89,6 +93,23 @@ impl ToolSpec for ReadFileTool {
         }
         if is_image_for_ocr(&file_path) {
             return read_image_via_ocr(&file_path, path_str);
+        }
+        if is_ipynb(&file_path) {
+            let start_line = input
+                .get("start_line")
+                .and_then(Value::as_u64)
+                .and_then(|v| usize::try_from(v).ok())
+                .unwrap_or(1);
+            let max_lines = input
+                .get("max_lines")
+                .and_then(Value::as_u64)
+                .and_then(|v| usize::try_from(v).ok())
+                .unwrap_or(DEFAULT_READ_LINES);
+            return read_ipynb(&file_path, path_str, start_line, max_lines);
+        }
+        if is_archive(&file_path) {
+            let entry = optional_str(&input, "entry");
+            return read_archive(&file_path, path_str, entry);
         }
 
         let contents = fs::read_to_string(&file_path).map_err(|e| {
@@ -473,6 +494,626 @@ fn read_pdf_via_pdftotext(
 
     let text = String::from_utf8_lossy(&output.stdout).to_string();
     Ok(ToolResult::success(clean_pdf_text(&text)))
+}
+
+// === Notebook (.ipynb) support ===
+
+fn is_ipynb(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("ipynb"))
+}
+
+/// Maximum total bytes of rendered notebook output before truncation.
+const NOTEBOOK_MAX_OUTPUT_BYTES: usize = 64 * 1024; // 64 KB
+/// Maximum bytes for a single cell output stream before truncation.
+const CELL_MAX_OUTPUT_BYTES: usize = 8 * 1024; // 8 KB
+
+fn read_ipynb(
+    path: &Path,
+    requested_path: &str,
+    start_line: usize,
+    max_lines: usize,
+) -> Result<ToolResult, ToolError> {
+    let raw = fs::read_to_string(path).map_err(|e| {
+        ToolError::execution_failed(format!(
+            "Failed to read notebook {}: {}",
+            path.display(),
+            e
+        ))
+    })?;
+
+    let nb: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+        ToolError::execution_failed(format!(
+            "Failed to parse notebook {}: {}",
+            path.display(),
+            e
+        ))
+    })?;
+
+    let cells = nb
+        .get("cells")
+        .and_then(|c| c.as_array())
+        .ok_or_else(|| {
+            ToolError::execution_failed(format!(
+                "Notebook {} has no 'cells' array",
+                path.display()
+            ))
+        })?;
+
+    let mut rendered = String::new();
+    let mut total_output_bytes: usize = 0;
+
+    for (i, cell) in cells.iter().enumerate() {
+        if total_output_bytes >= NOTEBOOK_MAX_OUTPUT_BYTES {
+            rendered.push_str(&format!(
+                "\n[TRUNCATED] Notebook output limit ({NOTEBOOK_MAX_OUTPUT_BYTES} bytes) reached; {} cells omitted.\n",
+                cells.len() - i
+            ));
+            break;
+        }
+
+        let cell_type = cell
+            .get("cell_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("code");
+        let source = cell
+            .get("source")
+            .and_then(|v| v.as_array())
+            .map(|lines| {
+                lines
+                    .iter()
+                    .filter_map(|l| l.as_str())
+                    .collect::<Vec<_>>()
+                    .concat()
+            })
+            .or_else(|| cell.get("source").and_then(|v| v.as_str()).map(|s| s.to_string()))
+            .unwrap_or_default();
+
+        let cell_header = format!("## Cell {i} [{cell_type}]\n");
+
+        match cell_type {
+            "markdown" | "raw" => {
+                rendered.push_str(&cell_header);
+                rendered.push_str(&source);
+                rendered.push('\n');
+            }
+            "code" => {
+                rendered.push_str(&cell_header);
+                rendered.push_str("```\n");
+                rendered.push_str(&source);
+                if !source.ends_with('\n') {
+                    rendered.push('\n');
+                }
+                rendered.push_str("```\n");
+
+                // Render outputs
+                if let Some(outputs) = cell.get("outputs").and_then(|o| o.as_array()) {
+                    for output in outputs {
+                        if total_output_bytes >= NOTEBOOK_MAX_OUTPUT_BYTES {
+                            break;
+                        }
+                        let output_text = render_notebook_output(output);
+                        if !output_text.is_empty() {
+                            let truncated = if total_output_bytes + output_text.len()
+                                > NOTEBOOK_MAX_OUTPUT_BYTES
+                            {
+                                let remaining =
+                                    NOTEBOOK_MAX_OUTPUT_BYTES.saturating_sub(total_output_bytes);
+                                let mut snippet = output_text;
+                                snippet.truncate(remaining);
+                                snippet
+                            } else {
+                                output_text
+                            };
+                            total_output_bytes += truncated.len();
+                            rendered.push_str("Output:\n");
+                            rendered.push_str(&truncated);
+                            if !truncated.ends_with('\n') {
+                                rendered.push('\n');
+                            }
+                        }
+                    }
+                }
+                rendered.push('\n');
+            }
+            other => {
+                rendered.push_str(&cell_header);
+                rendered.push_str(&format!("(unsupported cell type: {other})\n\n"));
+            }
+        }
+    }
+
+    // Apply line-range slicing to the rendered text
+    let all_lines: Vec<&str> = rendered.lines().collect();
+    let total_lines = all_lines.len();
+    let zero_based_start = (start_line.saturating_sub(1)).min(total_lines);
+    let zero_based_end = (zero_based_start + max_lines).min(total_lines);
+
+    let shown_first = zero_based_start + 1;
+    let shown_last = zero_based_end;
+    let truncated_by_lines = zero_based_end < total_lines;
+    let next_start = zero_based_end + 1;
+
+    let sliced: String = all_lines[zero_based_start..zero_based_end]
+        .iter()
+        .map(|l| format!("{l}\n"))
+        .collect();
+
+    let mut attrs = format!(
+        "path=\"{requested_path}\" total_lines=\"{total_lines}\" shown_lines=\"{shown_first}-{shown_last}\" truncated=\"{truncated_by_lines}\""
+    );
+    if truncated_by_lines {
+        attrs.push_str(&format!(" next_start_line=\"{next_start}\""));
+    }
+
+    let mut output = format!("<file {attrs}>\n{sliced}");
+    if truncated_by_lines {
+        output.push_str(&format!(
+            "\n[TRUNCATED] Showing lines {shown_first}-{shown_last} of {total_lines}. To continue, call read_file with path=\"{requested_path}\" start_line={next_start} max_lines={max_lines}\n"
+        ));
+    }
+    output.push_str("</file>");
+
+    Ok(ToolResult::success(output))
+}
+
+fn render_notebook_output(output: &serde_json::Value) -> String {
+    let output_type = output
+        .get("output_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+
+    match output_type {
+        "stream" => {
+            let name = output
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("stdout");
+            let text = output
+                .get("text")
+                .and_then(|v| v.as_array())
+                .map(|lines| {
+                    lines
+                        .iter()
+                        .filter_map(|l| l.as_str())
+                        .collect::<Vec<_>>()
+                        .concat()
+                })
+                .or_else(|| output.get("text").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                .unwrap_or_default();
+            if text.is_empty() {
+                return String::new();
+            }
+            let truncated = truncate_bytes(&text, CELL_MAX_OUTPUT_BYTES);
+            if truncated.len() < text.len() {
+                format!("[{name}]:\n{truncated}\n[... truncated at {CELL_MAX_OUTPUT_BYTES} bytes]\n")
+            } else {
+                format!("[{name}]:\n{truncated}\n")
+            }
+        }
+        "execute_result" | "display_data" => {
+            // Prefer text/plain over other mime types
+            if let Some(data) = output.get("data") {
+                if let Some(text) = data
+                    .get("text/plain")
+                    .and_then(|v| v.as_array())
+                    .map(|lines| {
+                        lines
+                            .iter()
+                            .filter_map(|l| l.as_str())
+                            .collect::<Vec<_>>()
+                            .concat()
+                    })
+                    .or_else(|| {
+                        data.get("text/plain")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                    })
+                {
+                    if text.is_empty() {
+                        return String::new();
+                    }
+                    let truncated = truncate_bytes(&text, CELL_MAX_OUTPUT_BYTES);
+                    if truncated.len() < text.len() {
+                        return format!(
+                            "{truncated}\n[... truncated at {CELL_MAX_OUTPUT_BYTES} bytes]\n"
+                        );
+                    }
+                    return format!("{text}\n");
+                }
+                // Fallback: list available keys
+                let keys: Vec<&str> = data
+                    .as_object()
+                    .map(|m| m.keys().map(|k| k.as_str()).collect())
+                    .unwrap_or_default();
+                if !keys.is_empty() {
+                    return format!("[output data keys: {}]\n", keys.join(", "));
+                }
+            }
+            String::new()
+        }
+        "error" => {
+            let ename = output
+                .get("ename")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Error");
+            let evalue = output
+                .get("evalue")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let traceback = output
+                .get("traceback")
+                .and_then(|v| v.as_array())
+                .map(|lines| {
+                    lines
+                        .iter()
+                        .filter_map(|l| l.as_str())
+                        .collect::<Vec<_>>()
+                        .join("")
+                })
+                .unwrap_or_default();
+            let text = format!("{ename}: {evalue}\n{traceback}");
+            let truncated = truncate_bytes(&text, CELL_MAX_OUTPUT_BYTES);
+            if truncated.len() < text.len() {
+                format!("{truncated}\n[... truncated at {CELL_MAX_OUTPUT_BYTES} bytes]\n")
+            } else {
+                format!("{text}\n")
+            }
+        }
+        _ => String::new(),
+    }
+}
+
+/// Truncate a string to at most `max_bytes` bytes at a char boundary.
+fn truncate_bytes(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+// === Archive support ===
+
+fn is_archive(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "zip" | "tar" | "tgz"
+            )
+        })
+        || path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|name| {
+                let lower = name.to_ascii_lowercase();
+                lower.ends_with(".tar.gz")
+            })
+}
+
+fn read_archive(
+    path: &Path,
+    requested_path: &str,
+    entry: Option<&str>,
+) -> Result<ToolResult, ToolError> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    let is_targz = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|name| name.to_ascii_lowercase().ends_with(".tar.gz"));
+
+    match (ext.as_str(), is_targz) {
+        ("zip", _) => read_zip_archive(path, requested_path, entry),
+        ("tar", _) | (_, true) | ("tgz", _) => read_tar_archive(path, requested_path, entry, is_targz || ext == "tgz"),
+        (ext, is_tgz) => Err(ToolError::execution_failed(format!(
+            "Unsupported archive format: ext={ext}, is_tgz={is_tgz}"
+        ))),
+    }
+}
+
+fn reject_path_traversal(name: &str) -> Result<(), ToolError> {
+    // Reject entries whose path components include ".." or start with "/"
+    let normalized = name.replace('\\', "/");
+    for component in normalized.split('/') {
+        if component == ".." || component == "." {
+            // "." alone as a component is also suspicious in archive context
+            if component == ".." {
+                return Err(ToolError::execution_failed(format!(
+                    "Archive entry '{name}' contains path traversal (..) — rejected for safety"
+                )));
+            }
+        }
+    }
+    // Reject absolute paths
+    if normalized.starts_with('/') {
+        return Err(ToolError::execution_failed(format!(
+            "Archive entry '{name}' is an absolute path — rejected for safety"
+        )));
+    }
+    Ok(())
+}
+
+fn read_zip_archive(
+    path: &Path,
+    requested_path: &str,
+    entry: Option<&str>,
+) -> Result<ToolResult, ToolError> {
+    let file = fs::File::open(path).map_err(|e| {
+        ToolError::execution_failed(format!(
+            "Failed to open archive {}: {}",
+            path.display(),
+            e
+        ))
+    })?;
+
+    let mut archive =
+        zip::ZipArchive::new(file).map_err(|e| {
+            ToolError::execution_failed(format!(
+                "Failed to read zip archive {}: {}",
+                path.display(),
+                e
+            ))
+        })?;
+
+    if let Some(entry_name) = entry {
+        reject_path_traversal(entry_name)?;
+        let mut found = false;
+        for i in 0..archive.len() {
+            let mut ze = archive.by_index(i).map_err(|e| {
+                ToolError::execution_failed(format!("Failed to access zip entry: {e}"))
+            })?;
+            if ze.name() == entry_name {
+                found = true;
+                if ze.is_dir() {
+                    return Err(ToolError::execution_failed(format!(
+                        "Archive entry '{entry_name}' is a directory, not a file"
+                    )));
+                }
+                let mut contents = String::new();
+                std::io::Read::read_to_string(&mut ze, &mut contents).map_err(|e| {
+                    ToolError::execution_failed(format!(
+                        "Failed to read zip entry '{entry_name}': {e}"
+                    ))
+                })?;
+                return Ok(ToolResult::success(format!(
+                    "<archive_entry path=\"{requested_path}\" entry=\"{entry_name}\">\n{contents}\n</archive_entry>"
+                )));
+            }
+        }
+        if !found {
+            // Enumerate entries for a helpful error message
+            let names: Vec<String> = (0..archive.len())
+                .filter_map(|i| {
+                    archive
+                        .by_index(i)
+                        .ok()
+                        .map(|e| e.name().to_string())
+                })
+                .collect();
+            return Err(ToolError::execution_failed(format!(
+                "Archive entry '{entry_name}' not found. Available entries: {}",
+                names.join(", ")
+            )));
+        }
+    }
+
+    // No entry specified — list all entries
+    let mut listing = String::new();
+    for i in 0..archive.len() {
+        let ze = archive.by_index(i).map_err(|e| {
+            ToolError::execution_failed(format!("Failed to access zip entry: {e}"))
+        })?;
+        let kind = if ze.is_dir() { "dir " } else { "file" };
+        listing.push_str(&format!(
+            "{kind}  {:>8}  {}\n",
+            ze.size(),
+            ze.name()
+        ));
+    }
+
+    Ok(ToolResult::success(format!(
+        "<archive_listing path=\"{requested_path}\">\n{listing}</archive_listing>"
+    )))
+}
+
+struct TarEntry {
+    name: String,
+    is_dir: bool,
+    size: u64,
+}
+
+fn read_tar_archive(
+    path: &Path,
+    requested_path: &str,
+    entry: Option<&str>,
+    gzipped: bool,
+) -> Result<ToolResult, ToolError> {
+    let file = fs::File::open(path).map_err(|e| {
+        ToolError::execution_failed(format!(
+            "Failed to open archive {}: {}",
+            path.display(),
+            e
+        ))
+    })?;
+
+    let entries: Vec<TarEntry> = if gzipped {
+        let decoder = flate2::read::GzDecoder::new(file);
+        let mut archive = tar::Archive::new(decoder);
+        collect_tar_entries(&mut archive, path)?
+    } else {
+        let mut archive = tar::Archive::new(file);
+        collect_tar_entries(&mut archive, path)?
+    };
+
+    if let Some(entry_name) = entry {
+        reject_path_traversal(entry_name)?;
+        // Need to re-open the archive to extract the entry
+        let file2 = fs::File::open(path).map_err(|e| {
+            ToolError::execution_failed(format!(
+                "Failed to open archive {}: {}",
+                path.display(),
+                e
+            ))
+        })?;
+
+        if gzipped {
+            let decoder = flate2::read::GzDecoder::new(file2);
+            let mut archive = tar::Archive::new(decoder);
+            extract_tar_entry(&mut archive, entry_name, path, requested_path)
+        } else {
+            let mut archive = tar::Archive::new(file2);
+            extract_tar_entry(&mut archive, entry_name, path, requested_path)
+        }
+    } else {
+        // List all entries
+        let mut listing = String::new();
+        for e in &entries {
+            let kind = if e.is_dir { "dir " } else { "file" };
+            listing.push_str(&format!("{kind}  {:>8}  {}\n", e.size, e.name));
+        }
+        Ok(ToolResult::success(format!(
+            "<archive_listing path=\"{requested_path}\">\n{listing}</archive_listing>"
+        )))
+    }
+}
+
+fn collect_tar_entries<R: std::io::Read>(
+    archive: &mut tar::Archive<R>,
+    path: &Path,
+) -> Result<Vec<TarEntry>, ToolError> {
+    let mut entries = Vec::new();
+    for entry in archive.entries().map_err(|e| {
+        ToolError::execution_failed(format!(
+            "Failed to read tar archive {}: {}",
+            path.display(),
+            e
+        ))
+    })? {
+        let entry = entry.map_err(|e| {
+            ToolError::execution_failed(format!(
+                "Failed to read tar entry in {}: {}",
+                path.display(),
+                e
+            ))
+        })?;
+        let name = entry
+            .path()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| String::from("<invalid path>"));
+        let is_dir = entry.header().entry_type().is_dir();
+        let size = entry.header().size().unwrap_or(0);
+        entries.push(TarEntry { name, is_dir, size });
+    }
+    Ok(entries)
+}
+
+fn extract_tar_entry<R: std::io::Read>(
+    archive: &mut tar::Archive<R>,
+    entry_name: &str,
+    path: &Path,
+    requested_path: &str,
+) -> Result<ToolResult, ToolError> {
+    for entry in archive.entries().map_err(|e| {
+        ToolError::execution_failed(format!(
+            "Failed to read tar archive {}: {}",
+            path.display(),
+            e
+        ))
+    })? {
+        let mut entry = entry.map_err(|e| {
+            ToolError::execution_failed(format!(
+                "Failed to read tar entry in {}: {}",
+                path.display(),
+                e
+            ))
+        })?;
+        let name = entry
+            .path()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| String::from("<invalid path>"));
+
+        if name == entry_name {
+            if entry.header().entry_type().is_dir() {
+                return Err(ToolError::execution_failed(format!(
+                    "Archive entry '{entry_name}' is a directory, not a file"
+                )));
+            }
+            let mut contents = String::new();
+            std::io::Read::read_to_string(&mut entry, &mut contents).map_err(|e| {
+                ToolError::execution_failed(format!(
+                    "Failed to read tar entry '{entry_name}': {e}"
+                ))
+            })?;
+            return Ok(ToolResult::success(format!(
+                "<archive_entry path=\"{requested_path}\" entry=\"{entry_name}\">\n{contents}\n</archive_entry>"
+            )));
+        }
+    }
+
+    // Entry not found — list available names
+    // Re-open again to build listing
+    let file = fs::File::open(path).map_err(|e| {
+        ToolError::execution_failed(format!(
+            "Failed to open archive {}: {}",
+            path.display(),
+            e
+        ))
+    })?;
+
+    let names: Vec<String> = if gzipped(path) {
+        let decoder = flate2::read::GzDecoder::new(file);
+        let mut archive = tar::Archive::new(decoder);
+        archive
+            .entries()
+            .map_err(|e| {
+                ToolError::execution_failed(format!("Failed to read tar archive: {e}"))
+            })?
+            .filter_map(|e| {
+                e.ok()
+                    .and_then(|e| e.path().ok().map(|p| p.to_string_lossy().to_string()))
+            })
+            .collect()
+    } else {
+        let mut archive = tar::Archive::new(file);
+        archive
+            .entries()
+            .map_err(|e| {
+                ToolError::execution_failed(format!("Failed to read tar archive: {e}"))
+            })?
+            .filter_map(|e| {
+                e.ok()
+                    .and_then(|e| e.path().ok().map(|p| p.to_string_lossy().to_string()))
+            })
+            .collect()
+    };
+
+    Err(ToolError::execution_failed(format!(
+        "Archive entry '{entry_name}' not found. Available entries: {}",
+        names.join(", ")
+    )))
+}
+
+fn gzipped(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("tgz"))
+        || path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|name| {
+                name.to_ascii_lowercase().ends_with(".tar.gz")
+            })
 }
 
 // === WriteFileTool ===
