@@ -7,7 +7,7 @@ use codewhale_protocol::ToolOutput;
 
 use crate::call::{FunctionCallError, ToolCall, ToolInvocation};
 use crate::handler::ToolHandler;
-use crate::runtime::{ToolCallRuntime, TOOL_EXECUTION_LOCK_HELD, tool_payload_kind};
+use crate::runtime::{TOOL_EXECUTION_LOCK_HELD, ToolCallRuntime, tool_payload_kind};
 use crate::spec::ConfiguredToolSpec;
 use crate::spec::ToolSpec;
 

@@ -3,8 +3,8 @@
 //! This crate defines the core tool types, the [`ToolHandler`] trait, and the
 //! [`ToolRegistry`] that dispatches tool calls to registered handlers.
 
-mod capability;
 mod call;
+mod capability;
 mod error;
 mod handler;
 mod helpers;
@@ -14,8 +14,8 @@ mod runtime;
 mod spec;
 
 // Re-export everything from the original flat public API.
-pub use capability::{ApprovalRequirement, ToolCapability};
 pub use call::{FunctionCallError, ToolCall, ToolCallSource, ToolInvocation};
+pub use capability::{ApprovalRequirement, ToolCapability};
 pub use error::ToolError;
 pub use handler::ToolHandler;
 pub use helpers::{optional_bool, optional_str, optional_u64, required_str, required_u64};

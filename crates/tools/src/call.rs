@@ -87,4 +87,3 @@ pub enum FunctionCallError {
     /// The tool handler returned an error.
     ExecutionFailed { name: String, error: String },
 }
-
