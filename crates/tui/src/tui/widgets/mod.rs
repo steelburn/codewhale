@@ -3046,13 +3046,25 @@ fn push_command_entry(
         } else {
             None
         };
-        let desc = if info.aliases.is_empty() {
+        // Filter out the alias already shown in the display name (via hint)
+        // to avoid redundant "(aliases: /qingping)" when the label already says
+        // "/clear or /qingping".
+        let desc_aliases: Vec<&str> = if let Some(ref hint) = hint {
+            info.aliases
+                .iter()
+                .filter(|a| **a != hint.as_str())
+                .copied()
+                .collect()
+        } else {
+            info.aliases.to_vec()
+        };
+        let desc = if desc_aliases.is_empty() {
             info.description_for(locale).to_string()
         } else {
             format!(
                 "{}  (aliases: {})",
                 info.description_for(locale),
-                info.aliases
+                desc_aliases
                     .iter()
                     .map(|a| format!("/{a}"))
                     .collect::<Vec<_>>()
@@ -3724,9 +3736,17 @@ mod tests {
             .iter()
             .position(|n| *n == "/clear")
             .expect("/clear should still appear when typing /q (alias `qingping`)");
+        let clear_entry = hints
+            .iter()
+            .find(|hint| hint.name == "/clear")
+            .expect("/clear hint should be present");
         assert!(
             exit_pos < clear_pos,
             "expected /exit to rank above /clear for prefix /q, got {names:?}"
+        );
+        assert!(
+            !clear_entry.description.contains("aliases: /qingping"),
+            "displayed alias should not be repeated in the /clear description"
         );
     }
 
