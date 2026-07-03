@@ -83,6 +83,13 @@ const MAX_CONTEXT_SIZE: usize = 100 * 1024; // 100KB
 /// Maximum number of rule files loaded per rules directory.
 /// Prevents a project from silently injecting hundreds of rule files.
 const MAX_RULES_FILES: usize = 50;
+
+/// Maximum total bytes across the assembled rules_block.
+/// 50 files × 100 KB per file could reach ~5 MB; this caps the
+/// cumulative injected content so a large rules directory can't
+/// dominate the context window. Exceeded bytes are truncated with
+/// an explicit marker.
+const MAX_RULES_BLOCK_BYTES: usize = 500 * 1024; // 500 KB
 const PACK_README_MAX_CHARS: usize = 4_000;
 const PACK_MAX_ENTRIES: usize = 220;
 const PACK_MAX_SOURCE_FILES: usize = 60;
@@ -895,6 +902,21 @@ pub fn load_project_context(workspace: &Path) -> ProjectContext {
     }
 
     if !rules_content.is_empty() {
+        // Cap total rules bytes so a large rules dir can't dominate the context window
+        if rules_content.len() > MAX_RULES_BLOCK_BYTES {
+            let mut end = MAX_RULES_BLOCK_BYTES;
+            while !rules_content.is_char_boundary(end) {
+                end -= 1;
+            }
+            rules_content.truncate(end);
+            rules_content.push_str("\n\n[…rules block truncated at 500 KB…]");
+            tracing::warn!(
+                target: "project_context",
+                total_bytes = rules_content.len(),
+                cap = MAX_RULES_BLOCK_BYTES,
+                "Truncating rules block to total byte budget"
+            );
+        }
         ctx.rules_block = Some(rules_content);
     }
 
@@ -2835,6 +2857,33 @@ mod tests {
         assert!(
             pos_cw < pos_claude,
             ".codewhale/rules/ should precede .claude/rules/"
+        );
+    }
+
+    #[test]
+    fn rules_block_truncated_at_total_byte_budget() {
+        let tmp = tempdir().expect("tempdir");
+        let rules_dir = tmp.path().join(".codewhale/rules");
+        fs::create_dir_all(&rules_dir).expect("mkdir rules");
+
+        // Create files whose combined content exceeds MAX_RULES_BLOCK_BYTES
+        let per_file = "X".repeat(20 * 1024); // 20 KB each
+        for i in 0..30 {
+            fs::write(rules_dir.join(format!("rule_{i:04}.md")), &per_file).expect("write");
+        }
+
+        let ctx = load_project_context(tmp.path());
+        let rules = ctx.rules_block.as_ref().unwrap();
+
+        assert!(
+            rules.len() <= MAX_RULES_BLOCK_BYTES + 200, // + marker overhead
+            "rules block should be truncated to budget: {} > {}",
+            rules.len(),
+            MAX_RULES_BLOCK_BYTES
+        );
+        assert!(
+            rules.contains("truncated at 500 KB"),
+            "truncation marker missing"
         );
     }
 }
