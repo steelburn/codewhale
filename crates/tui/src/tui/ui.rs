@@ -2763,7 +2763,7 @@ async fn run_event_loop(
                         }
                     }
                     EngineEvent::Status { message } => {
-                        app.status_message = Some(message);
+                        app.observe_engine_status_message(message);
                     }
                     EngineEvent::GoalUpdated { snapshot } => {
                         if apply_goal_snapshot_to_app(app, &snapshot) {

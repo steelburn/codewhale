@@ -1603,6 +1603,8 @@ pub struct App {
     pub turn_error_posted: bool,
     /// Legacy status text sink retained for compatibility with existing call sites.
     pub status_message: Option<String>,
+    /// Latest runtime policy narrowing reason observed from the engine.
+    pub last_policy_narrowing_status: Option<String>,
     /// Recent status toasts (ephemeral, newest at back).
     pub status_toasts: VecDeque<StatusToast>,
     /// Sticky status toast used for important warnings/errors.
@@ -2667,6 +2669,7 @@ impl App {
             // Surface parse warnings so the user knows their config file is
             // broken instead of silently losing all settings.
             status_message: settings_parse_warning.or(tui_prefs_warning),
+            last_policy_narrowing_status: None,
             status_toasts: VecDeque::new(),
             sticky_status: None,
             last_status_message_seen: None,
@@ -4047,6 +4050,19 @@ impl App {
 
     fn is_mode_switch_status_message(message: &str) -> bool {
         message.starts_with("Switched to ") && message.ends_with(" mode")
+    }
+
+    pub fn is_policy_narrowing_status_message(message: &str) -> bool {
+        (message.starts_with("Input provenance '")
+            && message.contains("cannot inherit standing auto-approval authority"))
+            || message.starts_with("Review/inspection request detected; using read-only Plan tools")
+    }
+
+    pub fn observe_engine_status_message(&mut self, message: String) {
+        if Self::is_policy_narrowing_status_message(&message) {
+            self.last_policy_narrowing_status = Some(message.clone());
+        }
+        self.status_message = Some(message);
     }
 
     pub fn sync_status_message_to_toasts(&mut self) {

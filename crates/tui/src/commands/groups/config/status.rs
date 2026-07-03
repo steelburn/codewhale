@@ -35,6 +35,13 @@ fn format_status(app: &App) -> String {
     push_row(&mut out, "Mode:", app.mode.label());
     push_row(&mut out, "Permissions:", &permission_summary(app));
     push_row(&mut out, "Safety:", safety_summary(app));
+    push_row(
+        &mut out,
+        "Last narrowing:",
+        app.last_policy_narrowing_status
+            .as_deref()
+            .unwrap_or("none"),
+    );
     push_row(&mut out, "Project docs:", &project_docs(&app.workspace));
     push_row(
         &mut out,
@@ -299,6 +306,23 @@ mod tests {
         app.mode = AppMode::Yolo;
         let yolo = format_status(&app);
         assert!(yolo.contains("sandbox disabled, network unrestricted"));
+    }
+
+    #[test]
+    fn status_report_surfaces_policy_narrowing_debug_status() {
+        let tmpdir = TempDir::new().expect("temp dir");
+        let mut app = create_test_app(tmpdir.path().to_path_buf());
+        app.last_policy_narrowing_status = Some(
+            "Review/inspection request detected; using read-only Plan tools for this turn."
+                .to_string(),
+        );
+
+        let msg = format_status(&app);
+        assert!(msg.contains("Last narrowing:"));
+        assert!(
+            msg.contains("Review/inspection request detected; using read-only Plan tools"),
+            "{msg}",
+        );
     }
 
     #[test]

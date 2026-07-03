@@ -3356,3 +3356,27 @@ fn status_classifier_does_not_paint_negated_success_green() {
     let (level, _, _) = App::classify_status_text("Turn cancelled");
     assert_eq!(level, StatusToastLevel::Warning);
 }
+
+#[test]
+fn engine_policy_narrowing_status_updates_debug_state() {
+    let mut app = App::new(test_options(false), &Config::default());
+
+    app.observe_engine_status_message("Request cancelled".to_string());
+    assert_eq!(app.status_message.as_deref(), Some("Request cancelled"));
+    assert!(app.last_policy_narrowing_status.is_none());
+
+    let provenance_status = "Input provenance 'assistant_generated' cannot inherit standing auto-approval authority; continuing with approvals required.";
+    app.observe_engine_status_message(provenance_status.to_string());
+    assert_eq!(app.status_message.as_deref(), Some(provenance_status));
+    assert_eq!(
+        app.last_policy_narrowing_status.as_deref(),
+        Some(provenance_status)
+    );
+
+    let review_status = "Review/inspection request detected; using read-only Plan tools for this turn. Add an explicit fix/edit/commit instruction to allow writes.";
+    app.observe_engine_status_message(review_status.to_string());
+    assert_eq!(
+        app.last_policy_narrowing_status.as_deref(),
+        Some(review_status)
+    );
+}
