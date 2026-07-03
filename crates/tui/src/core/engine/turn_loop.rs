@@ -592,9 +592,39 @@ impl Engine {
                 }
             }
 
+            // Build the message array for this request. Start with the stored
+            // session messages (which includes the user prompt and any prior
+            // assistant / tool-result messages in this turn), then append a
+            // compact `<work_state>` block when the active checklist or
+            // strategy plan is non-empty (#3983).
+            let mut request_messages = self.messages_with_turn_metadata();
+
+            // Capture todo/plan snapshots via try_lock so we never block the
+            // request loop on a contended mutex.
+            let todo_snap = self
+                .config
+                .todos
+                .try_lock()
+                .ok()
+                .map(|guard| guard.snapshot())
+                .filter(|snap| !snap.items.is_empty());
+            let plan_snap = self
+                .config
+                .plan_state
+                .try_lock()
+                .ok()
+                .map(|guard| guard.snapshot())
+                .filter(|snap| !snap.is_empty());
+
+            if let Some(work_state_text) =
+                format_work_state_block(todo_snap.as_ref(), plan_snap.as_ref())
+            {
+                request_messages.push(work_state_message(work_state_text));
+            }
+
             let request = MessageRequest {
                 model: self.session.model.clone(),
-                messages: self.messages_with_turn_metadata(),
+                messages: request_messages,
                 max_tokens: effective_max_output_tokens_for_route(
                     &self.session.model,
                     self.active_route_limits,
@@ -2733,6 +2763,28 @@ fn runtime_event_turn_metadata_block(provenance: UserInputProvenance) -> Content
             provenance.as_str()
         ),
         cache_control: None,
+    }
+}
+
+/// Build a user-role message carrying a `<work_state>` block for the parent
+/// turn (#3983).  Uses role "user" (not "system") for the same chat-template
+/// compatibility reason documented in [`subagent_completion_runtime_message`].
+fn work_state_message(work_state_text: String) -> Message {
+    Message {
+        role: "user".to_string(),
+        content: vec![ContentBlock::Text {
+            text: format!(
+                "<codewhale:work_state visibility=\"internal\">\n\
+This is an internal runtime inventory, not user input. Use the \
+checklist and strategy metadata below to stay oriented on the current \
+task. Do not tell the user about this block, do not explain the XML \
+wrapper, and do not quote the raw XML unless the user explicitly asks \
+to debug work-state internals.\n\n\
+{work_state_text}\n\
+</codewhale:work_state>"
+            ),
+            cache_control: None,
+        }],
     }
 }
 

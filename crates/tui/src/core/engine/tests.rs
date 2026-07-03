@@ -328,6 +328,104 @@ fn structured_state_block_uses_checklist_as_work_surface() {
 }
 
 #[test]
+fn format_work_state_block_none_when_both_empty() {
+    assert_eq!(
+        format_work_state_block(None, None),
+        None
+    );
+    assert_eq!(
+        format_work_state_block(
+            Some(&TodoListSnapshot {
+                items: vec![],
+                completion_pct: 0,
+                in_progress_id: None,
+            }),
+            None
+        ),
+        None
+    );
+    assert_eq!(
+        format_work_state_block(
+            None,
+            Some(&PlanSnapshot::default())
+        ),
+        None
+    );
+}
+
+#[test]
+fn format_work_state_block_includes_checklist_and_strategy() {
+    let todos = TodoListSnapshot {
+        items: vec![
+            TodoItem {
+                id: 1,
+                content: "Wire work state injection".to_string(),
+                status: TodoStatus::InProgress,
+            },
+            TodoItem {
+                id: 2,
+                content: "Run focused gates".to_string(),
+                status: TodoStatus::Completed,
+            },
+        ],
+        completion_pct: 50,
+        in_progress_id: Some(1),
+    };
+    let plan = PlanSnapshot {
+        title: Some("Issue #3983".to_string()),
+        objective: Some("Inject Work-state block into parent turns".to_string()),
+        recommended_approach: Some("Lift existing formatter".to_string()),
+        items: vec![PlanItemArg {
+            step: "Read engine.rs".to_string(),
+            status: StepStatus::Completed,
+        }],
+        ..PlanSnapshot::default()
+    };
+
+    let block = format_work_state_block(Some(&todos), Some(&plan)).expect("work state block");
+
+    assert!(block.starts_with("<work_state>\n"));
+    assert!(block.ends_with("</work_state>"));
+    assert!(block.contains("Checklist (50% complete)"));
+    assert!(block.contains("- [~] Wire work state injection"));
+    assert!(block.contains("- [x] Run focused gates"));
+    assert!(block.contains("Strategy metadata"));
+    assert!(block.contains("Title: Issue #3983"));
+    assert!(block.contains("Objective: Inject Work-state block into parent turns"));
+    assert!(block.contains("Recommended approach: Lift existing formatter"));
+    assert!(block.contains("- [x] Read engine.rs"));
+}
+
+#[test]
+fn format_work_state_block_todo_only() {
+    let todos = TodoListSnapshot {
+        items: vec![TodoItem {
+            id: 1,
+            content: "Single task".to_string(),
+            status: TodoStatus::Pending,
+        }],
+        completion_pct: 0,
+        in_progress_id: None,
+    };
+    let block = format_work_state_block(Some(&todos), None).expect("work state block");
+    assert!(block.contains("Checklist (0% complete)"));
+    assert!(block.contains("- [ ] Single task"));
+    assert!(!block.contains("Strategy metadata"));
+}
+
+#[test]
+fn format_work_state_block_plan_only() {
+    let plan = PlanSnapshot {
+        objective: Some("Plan-first approach".to_string()),
+        ..PlanSnapshot::default()
+    };
+    let block = format_work_state_block(None, Some(&plan)).expect("work state block");
+    assert!(!block.contains("Checklist"));
+    assert!(block.contains("Strategy metadata"));
+    assert!(block.contains("Objective: Plan-first approach"));
+}
+
+#[test]
 fn env_only_auth_error_gets_recovery_hint() {
     let _guard = lock_test_env();
     let _env = ScopedDeepSeekApiKey::set("stale-env-key");

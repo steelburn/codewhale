@@ -238,6 +238,88 @@ fn append_plan_list(out: &mut String, label: &str, values: &[String]) {
     }
 }
 
+/// Format a compact `<work_state>` block from the current todo and plan
+/// snapshots. Returns `None` when there is nothing to report.
+///
+/// This is the parent-turn equivalent of the `## Fork State` block that
+/// sub-agents receive via `StructuredState::to_system_block`. It includes only
+/// the checklist and strategy portions — no mode, workspace, sub-agent, or
+/// working-set sections — wrapped in `<work_state>` XML for model consumption
+/// (issue #3983).
+pub(super) fn format_work_state_block(
+    todo_snapshot: Option<&crate::tools::todo::TodoListSnapshot>,
+    plan_snapshot: Option<&crate::tools::plan::PlanSnapshot>,
+) -> Option<String> {
+    if todo_snapshot.map_or(true, |t| t.items.is_empty())
+        && plan_snapshot.map_or(true, |p| p.is_empty())
+    {
+        return None;
+    }
+
+    let mut out = String::new();
+    out.push_str("<work_state>\n");
+
+    if let Some(todos) = todo_snapshot {
+        if !todos.items.is_empty() {
+            out.push_str(&format!(
+                "Checklist ({}% complete)\n",
+                todos.completion_pct
+            ));
+            for item in &todos.items {
+                let marker = match item.status {
+                    crate::tools::todo::TodoStatus::Pending => "[ ]",
+                    crate::tools::todo::TodoStatus::InProgress => "[~]",
+                    crate::tools::todo::TodoStatus::Completed => "[x]",
+                };
+                out.push_str(&format!("- {marker} {}\n", item.content));
+            }
+        }
+    }
+
+    if let Some(plan) = plan_snapshot {
+        if !plan.is_empty() {
+            if todo_snapshot.map_or(false, |t| !t.items.is_empty()) {
+                out.push('\n');
+            }
+            out.push_str("Strategy metadata\n");
+            append_plan_field(&mut out, "Title", plan.title.as_deref());
+            append_plan_field(&mut out, "Objective", plan.objective.as_deref());
+            append_plan_field(&mut out, "Context", plan.context_summary.as_deref());
+            append_plan_field(&mut out, "Explanation", plan.explanation.as_deref());
+            append_plan_list(&mut out, "Source", &plan.sources_used);
+            append_plan_list(&mut out, "Critical file", &plan.critical_files);
+            append_plan_list(&mut out, "Constraint", &plan.constraints);
+            append_plan_field(
+                &mut out,
+                "Recommended approach",
+                plan.recommended_approach.as_deref(),
+            );
+            append_plan_field(
+                &mut out,
+                "Verification plan",
+                plan.verification_plan.as_deref(),
+            );
+            append_plan_field(
+                &mut out,
+                "Risks and unknowns",
+                plan.risks_and_unknowns.as_deref(),
+            );
+            append_plan_field(&mut out, "Handoff packet", plan.handoff_packet.as_deref());
+            for item in &plan.items {
+                let marker = match item.status {
+                    crate::tools::plan::StepStatus::Pending => "[ ]",
+                    crate::tools::plan::StepStatus::InProgress => "[~]",
+                    crate::tools::plan::StepStatus::Completed => "[x]",
+                };
+                out.push_str(&format!("- {marker} {}\n", item.step));
+            }
+        }
+    }
+
+    out.push_str("</work_state>");
+    Some(out)
+}
+
 // === Types ===
 
 /// Configuration for the engine
