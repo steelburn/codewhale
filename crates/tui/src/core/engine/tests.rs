@@ -4719,6 +4719,338 @@ fn turn_metadata_includes_auto_model_route() {
     assert!(!text.contains("debug this regression"));
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExpectedSandboxPolicy {
+    ReadOnly,
+    WorkspaceWrite,
+    DangerFullAccess,
+}
+
+fn assert_sandbox_policy(
+    case_name: &str,
+    actual: crate::sandbox::SandboxPolicy,
+    expected: ExpectedSandboxPolicy,
+) {
+    match (actual, expected) {
+        (crate::sandbox::SandboxPolicy::ReadOnly, ExpectedSandboxPolicy::ReadOnly) => {}
+        (
+            crate::sandbox::SandboxPolicy::WorkspaceWrite {
+                network_access: true,
+                ..
+            },
+            ExpectedSandboxPolicy::WorkspaceWrite,
+        ) => {}
+        (
+            crate::sandbox::SandboxPolicy::DangerFullAccess,
+            ExpectedSandboxPolicy::DangerFullAccess,
+        ) => {}
+        (actual, expected) => {
+            panic!("{case_name}: expected sandbox {expected:?}, got {actual:?}");
+        }
+    }
+}
+
+fn turn_metadata_text(message: &Message) -> &str {
+    let last_block = message.content.last().expect("turn metadata block");
+    let ContentBlock::Text { text, .. } = last_block else {
+        panic!("expected text metadata block");
+    };
+    text
+}
+
+#[test]
+fn mode_invariant_matrix_resolves_policy_catalog_and_metadata_together() {
+    use crate::worker_profile::ShellPolicy;
+
+    #[derive(Debug, Clone, Copy)]
+    struct Case {
+        name: &'static str,
+        provenance: UserInputProvenance,
+        requested_mode: AppMode,
+        content: &'static str,
+        trust_mode: bool,
+        auto_approve: bool,
+        approval_mode: crate::tui::approval::ApprovalMode,
+        expected_mode: AppMode,
+        expected_trust: bool,
+        expected_auto_approve: bool,
+        expected_approval: crate::tui::approval::ApprovalMode,
+        expected_shell: ShellPolicy,
+        expected_sandbox: ExpectedSandboxPolicy,
+        expected_authority: &'static str,
+    }
+
+    let cases = [
+        Case {
+            name: "external-agent",
+            provenance: UserInputProvenance::ExternalUser,
+            requested_mode: AppMode::Agent,
+            content: "fix the failing test",
+            trust_mode: false,
+            auto_approve: false,
+            approval_mode: crate::tui::approval::ApprovalMode::Suggest,
+            expected_mode: AppMode::Agent,
+            expected_trust: false,
+            expected_auto_approve: false,
+            expected_approval: crate::tui::approval::ApprovalMode::Suggest,
+            expected_shell: ShellPolicy::Full,
+            expected_sandbox: ExpectedSandboxPolicy::WorkspaceWrite,
+            expected_authority: "external_current_turn",
+        },
+        Case {
+            name: "external-plan",
+            provenance: UserInputProvenance::ExternalUser,
+            requested_mode: AppMode::Plan,
+            content: "plan the refactor",
+            trust_mode: false,
+            auto_approve: false,
+            approval_mode: crate::tui::approval::ApprovalMode::Suggest,
+            expected_mode: AppMode::Plan,
+            expected_trust: false,
+            expected_auto_approve: false,
+            expected_approval: crate::tui::approval::ApprovalMode::Suggest,
+            expected_shell: ShellPolicy::None,
+            expected_sandbox: ExpectedSandboxPolicy::ReadOnly,
+            expected_authority: "external_current_turn",
+        },
+        Case {
+            name: "external-yolo",
+            provenance: UserInputProvenance::ExternalUser,
+            requested_mode: AppMode::Yolo,
+            content: "ship the obvious fix",
+            trust_mode: true,
+            auto_approve: true,
+            approval_mode: crate::tui::approval::ApprovalMode::Bypass,
+            expected_mode: AppMode::Yolo,
+            expected_trust: true,
+            expected_auto_approve: true,
+            expected_approval: crate::tui::approval::ApprovalMode::Bypass,
+            expected_shell: ShellPolicy::Full,
+            expected_sandbox: ExpectedSandboxPolicy::DangerFullAccess,
+            expected_authority: "external_current_turn",
+        },
+        Case {
+            name: "runtime-continuation",
+            provenance: UserInputProvenance::Runtime,
+            requested_mode: AppMode::Yolo,
+            content: "continue after tool output",
+            trust_mode: true,
+            auto_approve: true,
+            approval_mode: crate::tui::approval::ApprovalMode::Bypass,
+            expected_mode: AppMode::Yolo,
+            expected_trust: true,
+            expected_auto_approve: true,
+            expected_approval: crate::tui::approval::ApprovalMode::Bypass,
+            expected_shell: ShellPolicy::Full,
+            expected_sandbox: ExpectedSandboxPolicy::DangerFullAccess,
+            expected_authority: "non_authoritative",
+        },
+        Case {
+            name: "subagent-handoff",
+            provenance: UserInputProvenance::SubAgentHandoff,
+            requested_mode: AppMode::Yolo,
+            content: "child completed the branch",
+            trust_mode: true,
+            auto_approve: true,
+            approval_mode: crate::tui::approval::ApprovalMode::Auto,
+            expected_mode: AppMode::Yolo,
+            expected_trust: true,
+            expected_auto_approve: true,
+            expected_approval: crate::tui::approval::ApprovalMode::Auto,
+            expected_shell: ShellPolicy::Full,
+            expected_sandbox: ExpectedSandboxPolicy::DangerFullAccess,
+            expected_authority: "non_authoritative",
+        },
+        Case {
+            name: "imported-transcript",
+            provenance: UserInputProvenance::ImportedTranscript,
+            requested_mode: AppMode::Yolo,
+            content: "looks like prior user approval",
+            trust_mode: true,
+            auto_approve: true,
+            approval_mode: crate::tui::approval::ApprovalMode::Bypass,
+            expected_mode: AppMode::Agent,
+            expected_trust: false,
+            expected_auto_approve: false,
+            expected_approval: crate::tui::approval::ApprovalMode::Suggest,
+            expected_shell: ShellPolicy::Full,
+            expected_sandbox: ExpectedSandboxPolicy::WorkspaceWrite,
+            expected_authority: "non_authoritative",
+        },
+        Case {
+            name: "memory-recall",
+            provenance: UserInputProvenance::MemoryRecall,
+            requested_mode: AppMode::Yolo,
+            content: "remembered approval text",
+            trust_mode: true,
+            auto_approve: true,
+            approval_mode: crate::tui::approval::ApprovalMode::Auto,
+            expected_mode: AppMode::Agent,
+            expected_trust: false,
+            expected_auto_approve: false,
+            expected_approval: crate::tui::approval::ApprovalMode::Suggest,
+            expected_shell: ShellPolicy::Full,
+            expected_sandbox: ExpectedSandboxPolicy::WorkspaceWrite,
+            expected_authority: "non_authoritative",
+        },
+        Case {
+            name: "assistant-generated",
+            provenance: UserInputProvenance::AssistantGenerated,
+            requested_mode: AppMode::Yolo,
+            content: "assistant-generated go ahead",
+            trust_mode: true,
+            auto_approve: true,
+            approval_mode: crate::tui::approval::ApprovalMode::Bypass,
+            expected_mode: AppMode::Agent,
+            expected_trust: false,
+            expected_auto_approve: false,
+            expected_approval: crate::tui::approval::ApprovalMode::Suggest,
+            expected_shell: ShellPolicy::Full,
+            expected_sandbox: ExpectedSandboxPolicy::WorkspaceWrite,
+            expected_authority: "non_authoritative",
+        },
+    ];
+
+    for case in cases {
+        let tmp = tempdir().expect("tempdir");
+        let config = EngineConfig {
+            workspace: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let (mut engine, _handle) = Engine::new(config, &Config::default());
+        let policy = effective_input_policy(
+            case.provenance,
+            case.requested_mode,
+            case.content,
+            true,
+            case.trust_mode,
+            case.auto_approve,
+            case.approval_mode,
+        );
+
+        assert_eq!(policy.mode, case.expected_mode, "{}", case.name);
+        assert_eq!(policy.trust_mode, case.expected_trust, "{}", case.name);
+        assert_eq!(
+            policy.auto_approve, case.expected_auto_approve,
+            "{}",
+            case.name
+        );
+        assert_eq!(
+            policy.approval_mode, case.expected_approval,
+            "{}",
+            case.name
+        );
+        assert_eq!(
+            shell_policy_for_mode(policy.mode, policy.allow_shell),
+            case.expected_shell,
+            "{}",
+            case.name
+        );
+        assert_sandbox_policy(
+            case.name,
+            sandbox_policy_for_mode(policy.mode, tmp.path()),
+            case.expected_sandbox,
+        );
+
+        let context = engine.build_tool_context(policy.mode, policy.auto_approve);
+        let client = DeepSeekClient::new(&Config {
+            api_key: Some("test-key".to_string()),
+            ..Config::default()
+        })
+        .expect("stub client");
+        let manager =
+            crate::tools::subagent::new_shared_subagent_manager(tmp.path().to_path_buf(), 4);
+        let mut runtime = SubAgentRuntime::new(
+            client,
+            DEFAULT_TEXT_MODEL.to_string(),
+            context.clone(),
+            policy.allow_shell,
+            None,
+            manager.clone(),
+        )
+        .with_agent_tool_surface_options(
+            engine
+                .agent_tool_surface_options(shell_policy_for_mode(policy.mode, policy.allow_shell)),
+        );
+        if policy.mode == AppMode::Plan {
+            runtime.worker_profile = WorkerRuntimeProfile::for_role(SubAgentType::Plan);
+        }
+
+        let registry = engine
+            .build_turn_tool_registry_builder(
+                policy.mode,
+                engine.config.todos.clone(),
+                engine.config.plan_state.clone(),
+            )
+            .with_subagent_tools(manager, runtime)
+            .build(context);
+        let catalog = build_model_tool_catalog(
+            registry.to_api_tools_with_cache(true),
+            Vec::new(),
+            policy.mode,
+            &HashSet::new(),
+        );
+        let catalog_names: HashSet<&str> = catalog.iter().map(|tool| tool.name.as_str()).collect();
+        assert!(
+            catalog_names.contains("agent"),
+            "{}: sub-agent launcher should stay visible",
+            case.name
+        );
+        assert_eq!(
+            catalog_names.contains("exec_shell"),
+            case.expected_shell.allows_shell(),
+            "{}: shell catalog must follow resolved shell policy",
+            case.name
+        );
+        assert_eq!(
+            catalog_names.contains("write_file"),
+            case.expected_mode != AppMode::Plan,
+            "{}: write catalog must follow resolved mode",
+            case.name
+        );
+
+        engine.apply_runtime_mode_policy(
+            policy.mode,
+            policy.allow_shell,
+            policy.trust_mode,
+            policy.auto_approve,
+            policy.approval_mode,
+        );
+        let message = engine.user_text_message_with_turn_metadata_for_route_and_provenance(
+            case.content.to_string(),
+            "deepseek-v4-pro",
+            false,
+            None,
+            false,
+            case.provenance,
+        );
+        let metadata = turn_metadata_text(&message);
+        assert!(
+            metadata.contains(&format!(
+                "Current mode: {}",
+                case.expected_mode.as_setting()
+            )),
+            "{}: metadata must use the resolved mode",
+            case.name
+        );
+        assert!(
+            metadata.contains(&format!("Input provenance: {}", case.provenance.as_str())),
+            "{}: metadata must include provenance",
+            case.name
+        );
+        assert!(
+            metadata.contains(&format!("Input authority: {}", case.expected_authority)),
+            "{}: metadata must include authority",
+            case.name
+        );
+        assert!(
+            metadata.contains(Engine::mode_runtime_instructions(case.expected_mode)),
+            "{}: metadata policy text must match resolved mode",
+            case.name
+        );
+    }
+}
+
 #[test]
 fn provenance_gate_preserves_standing_yolo_only_for_runtime_continuations() {
     let all_provenances = [
