@@ -4177,6 +4177,8 @@ async fn run_event_loop(
                             app.needs_redraw = true;
                         }
                     }
+                } else {
+                    report_empty_hotbar_slot_if_discoverable(app, config, slot);
                 }
                 continue;
             }
@@ -5359,6 +5361,15 @@ fn dispatch_hotbar_slot(
     }
 
     action.dispatch(app).map(Some)
+}
+
+fn report_empty_hotbar_slot_if_discoverable(app: &mut App, config: &Config, slot: u8) -> bool {
+    if crate::tui::sidebar::is_hotbar_disabled(config) {
+        return false;
+    }
+    app.status_message = Some(format!("Hotbar slot {slot} is empty - /hotbar to set up"));
+    app.needs_redraw = true;
+    true
 }
 
 fn apply_alt_4_shortcut(app: &mut App, _modifiers: KeyModifiers) {
@@ -12707,6 +12718,68 @@ fn parse_semver(v: &str) -> Option<(u32, u32, u32)> {
     let minor = parts.next()?.parse::<u32>().ok()?;
     let patch = parts.next().unwrap_or("0").parse::<u32>().ok()?;
     Some((major, minor, patch))
+}
+
+#[cfg(test)]
+mod hotbar_activation_affordance_tests {
+    use super::*;
+
+    fn test_app() -> App {
+        let options = TuiOptions {
+            model: "deepseek-v4-pro".to_string(),
+            workspace: PathBuf::from("."),
+            config_path: None,
+            config_profile: None,
+            allow_shell: false,
+            use_alt_screen: true,
+            use_mouse_capture: false,
+            use_bracketed_paste: true,
+            max_subagents: 1,
+            skills_dir: PathBuf::from("."),
+            memory_path: PathBuf::from("memory.md"),
+            notes_path: PathBuf::from("notes.txt"),
+            mcp_config_path: PathBuf::from("mcp.json"),
+            use_memory: false,
+            start_in_agent_mode: false,
+            skip_onboarding: true,
+            yolo: false,
+            resume_session_id: None,
+            initial_input: None,
+        };
+        App::new(options, &Config::default())
+    }
+
+    #[test]
+    fn hotbar_empty_slot_reports_setup_hint_unless_explicitly_disabled() {
+        let mut app = test_app();
+        app.needs_redraw = false;
+        let fresh_config = Config::default();
+
+        assert!(report_empty_hotbar_slot_if_discoverable(
+            &mut app,
+            &fresh_config,
+            3
+        ));
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("Hotbar slot 3 is empty - /hotbar to set up")
+        );
+        assert!(app.needs_redraw);
+
+        app.status_message = None;
+        app.needs_redraw = false;
+        let disabled_config = Config {
+            hotbar: Some(Vec::new()),
+            ..Config::default()
+        };
+        assert!(!report_empty_hotbar_slot_if_discoverable(
+            &mut app,
+            &disabled_config,
+            3
+        ));
+        assert_eq!(app.status_message, None);
+        assert!(!app.needs_redraw);
+    }
 }
 
 #[cfg(test)]

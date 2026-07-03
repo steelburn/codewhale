@@ -47,6 +47,10 @@ const TASK_STOP_TARGET_LABEL: &str = "[x]";
 const TASK_STOP_TARGET_SUFFIX: &str = " [x]";
 const HOTBAR_PANEL_HEIGHT: u16 = 4;
 const HOTBAR_ROW_COLUMNS: usize = 4;
+/// Height reserved for the hotbar discovery hint when the hotbar is not yet
+/// configured. One line of dim text is enough to be discoverable without
+/// stealing usable space from the sidebar panels.
+const HOTBAR_DISCOVERY_HINT_HEIGHT: u16 = 1;
 
 pub fn render_sidebar(f: &mut Frame, area: Rect, app: &mut App, config: &Config) {
     // Clear hover state at the start of each render
@@ -68,7 +72,13 @@ pub fn render_sidebar(f: &mut Frame, area: Rect, app: &mut App, config: &Config)
     }
 
     let hotbar_enabled = hotbar_panel_enabled(app, config) && !is_hotbar_disabled(config);
-    let (main_area, hotbar_area) = split_sidebar_hotbar_area(area, hotbar_enabled);
+    // Discovery hint: the hotbar is not configured yet but the user hasn't
+    // explicitly disabled it either. Show a subtle one-line prompt at the
+    // bottom of the sidebar so users learn about Alt+1-8 without it being
+    // intrusive.
+    let hotbar_discoverable = !hotbar_panel_enabled(app, config) && !is_hotbar_disabled(config);
+    let (main_area, hotbar_area, hint_area) =
+        split_sidebar_hotbar_area(area, hotbar_enabled, hotbar_discoverable);
     match app.sidebar_focus {
         SidebarFocus::Auto => render_sidebar_auto(f, main_area, app),
         SidebarFocus::Pinned => render_sidebar_pinned(f, main_area, app),
@@ -80,20 +90,63 @@ pub fn render_sidebar(f: &mut Frame, area: Rect, app: &mut App, config: &Config)
     if let Some(hotbar_area) = hotbar_area {
         render_hotbar_panel(f, hotbar_area, app, config);
     }
+    if let Some(hint_area) = hint_area {
+        render_hotbar_discovery_hint(f, hint_area, app);
+    }
 }
 
-fn split_sidebar_hotbar_area(area: Rect, show_hotbar: bool) -> (Rect, Option<Rect>) {
+fn split_sidebar_hotbar_area(
+    area: Rect,
+    show_hotbar: bool,
+    show_hint: bool,
+) -> (Rect, Option<Rect>, Option<Rect>) {
     // Hide the Hotbar entirely when the user disabled it (`hotbar = []`) or when
     // the sidebar is too short to fit it; give the main panel the full area.
     if !show_hotbar || area.height < HOTBAR_PANEL_HEIGHT.saturating_add(3) {
-        return (area, None);
+        // When the hotbar isn't shown but we should display a discovery hint,
+        // carve out a single row at the bottom.
+        if show_hint && area.height >= 5 {
+            let sections = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Min(3),
+                    Constraint::Length(HOTBAR_DISCOVERY_HINT_HEIGHT),
+                ])
+                .split(area);
+            return (sections[0], None, Some(sections[1]));
+        }
+        return (area, None, None);
     }
 
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(3), Constraint::Length(HOTBAR_PANEL_HEIGHT)])
         .split(area);
-    (sections[0], Some(sections[1]))
+    (sections[0], Some(sections[1]), None)
+}
+
+/// Renders a subtle one-line hint at the bottom of the sidebar when the hotbar
+/// hasn't been configured yet. The user sees the keyboard shortcut and how to
+/// opt in, without any persistent bling.
+fn render_hotbar_discovery_hint(f: &mut Frame, area: Rect, app: &App) {
+    let hint = hotbar_discovery_hint_text(area.width as usize);
+    let line = Line::from(vec![Span::styled(
+        hint,
+        Style::default()
+            .fg(app.ui_theme.text_dim)
+            .add_modifier(ratatui::style::Modifier::DIM),
+    )]);
+    // Fill the rest of the area with the surface background so stale cells
+    // from a previous (taller) frame don't bleed through (#400).
+    let bg_block = Block::default().style(Style::default().bg(app.ui_theme.surface_bg));
+    f.render_widget(bg_block, area);
+    f.render_widget(Paragraph::new(line), area);
+}
+
+fn hotbar_discovery_hint_text(width: usize) -> String {
+    let alt_prefix = super::widgets::key_hint::alt_prefix();
+    let hint = format!(" {alt_prefix}1-8 /hotbar setup");
+    pad_to_display_width(clip_line_to_width(&hint, width), width)
 }
 
 /// The Hotbar is "disabled" when the user persisted an explicit empty
@@ -102,7 +155,7 @@ fn split_sidebar_hotbar_area(area: Rect, show_hotbar: bool) -> (Rect, Option<Rec
 /// zero bindings via [`hotbar_panel_enabled`] rather than the explicit-disabled
 /// state, which keeps `/hotbar on` (write default bindings) and `/hotbar off`
 /// (write `[]`) distinct on disk.
-fn is_hotbar_disabled(config: &Config) -> bool {
+pub(crate) fn is_hotbar_disabled(config: &Config) -> bool {
     config.hotbar.as_deref().is_some_and(<[_]>::is_empty)
 }
 
@@ -387,7 +440,15 @@ fn hotbar_panel_hover_texts(slots: &[HotbarPanelSlot]) -> Vec<String> {
 }
 
 fn hotbar_slot_cell_text(slot: &HotbarPanelSlot, cell_width: usize) -> String {
-    let chord = format!("Alt{}", slot.slot);
+    let wide_enough_for_chord = match slot.state {
+        HotbarSlotState::Empty | HotbarSlotState::Inactive => cell_width >= 6,
+        HotbarSlotState::Active | HotbarSlotState::Unknown => cell_width >= 7,
+    };
+    let slot_prefix = if wide_enough_for_chord {
+        format!("Alt{}", slot.slot)
+    } else {
+        slot.slot.to_string()
+    };
     let marker = match slot.state {
         HotbarSlotState::Empty => "-",
         HotbarSlotState::Inactive => "",
@@ -395,11 +456,11 @@ fn hotbar_slot_cell_text(slot: &HotbarPanelSlot, cell_width: usize) -> String {
         HotbarSlotState::Unknown => "?",
     };
     let text = if marker.is_empty() {
-        format!("{chord}:{}", slot.label)
+        format!("{slot_prefix}:{}", slot.label)
     } else if slot.state == HotbarSlotState::Empty {
-        format!("{chord}:{marker}")
+        format!("{slot_prefix}:{marker}")
     } else {
-        format!("{chord}:{marker}{}", slot.label)
+        format!("{slot_prefix}:{marker}{}", slot.label)
     };
     pad_to_display_width(clip_line_to_width(&text, cell_width), cell_width)
 }
@@ -3426,10 +3487,11 @@ mod tests {
         SidebarHoverSection, SidebarHoverState, SidebarSubagentSummary, SidebarToolRow,
         SidebarWorkChecklistItem, SidebarWorkStrategyStep, SidebarWorkSummary, ToolRowOrder,
         agent_row_hover_text, auto_sidebar_panels, background_task_spinner_prefix,
-        context_panel_cost_line, editorial_tool_rows, hotbar_panel_enabled,
-        hotbar_panel_hover_texts, hotbar_panel_lines, hotbar_panel_slots, is_hotbar_disabled,
-        normalize_activity_text, render_sidebar, sidebar_agent_rows, sidebar_hover_rows,
-        sidebar_work_summary, sort_sidebar_agent_rows_as_tree, subagent_panel_hover_texts,
+        context_panel_cost_line, editorial_tool_rows, hotbar_discovery_hint_text,
+        hotbar_panel_enabled, hotbar_panel_hover_texts, hotbar_panel_lines, hotbar_panel_slots,
+        hotbar_slot_cell_text, is_hotbar_disabled, normalize_activity_text, render_sidebar,
+        sidebar_agent_rows, sidebar_hover_rows, sidebar_work_summary,
+        sort_sidebar_agent_rows_as_tree, split_sidebar_hotbar_area, subagent_panel_hover_texts,
         subagent_panel_lines, subagent_panel_rows, task_panel_hover_texts, task_panel_lines,
         task_panel_rows, work_panel_empty_hint, work_panel_hover_texts, work_panel_lines,
     };
@@ -3662,6 +3724,31 @@ mod tests {
     }
 
     #[test]
+    fn hotbar_discovery_hint_uses_one_layout_safe_row() {
+        let hint = hotbar_discovery_hint_text(16);
+
+        assert!(
+            hint.contains("/hotbar") || hint.contains("/hot"),
+            "hint should point toward setup even when clipped: {hint:?}"
+        );
+        assert_eq!(
+            unicode_width::UnicodeWidthStr::width(hint.as_str()),
+            16,
+            "hint should be clipped and padded to exactly one row"
+        );
+
+        let area = ratatui::layout::Rect::new(0, 0, 24, 8);
+        let (main, hotbar, hint_area) = split_sidebar_hotbar_area(area, false, true);
+        assert_eq!(main.height, 7);
+        assert!(hotbar.is_none());
+        assert_eq!(hint_area, Some(ratatui::layout::Rect::new(0, 7, 24, 1)));
+
+        let (_, hotbar, hint_area) = split_sidebar_hotbar_area(area, true, true);
+        assert!(hotbar.is_some());
+        assert!(hint_area.is_none());
+    }
+
+    #[test]
     fn hotbar_panel_slots_resolve_configured_bindings_and_active_state() {
         let mut app = create_test_app();
         app.mode = AppMode::Agent;
@@ -3803,6 +3890,33 @@ mod tests {
     }
 
     #[test]
+    fn hotbar_panel_cells_preserve_slot_label_and_active_marker_when_narrow() {
+        let mut app = create_test_app();
+        app.mode = AppMode::Agent;
+        let config = Config {
+            hotbar: Some(codewhale_config::default_hotbar_bindings_toml()),
+            ..Config::default()
+        };
+        let slots = hotbar_panel_slots(&app, &config);
+
+        let inactive = hotbar_slot_cell_text(&slots[0], 4);
+        let active = hotbar_slot_cell_text(&slots[3], 4);
+        let lines = hotbar_panel_lines(&slots, 19, &app.ui_theme);
+        let text = lines_to_text(&lines);
+
+        assert_eq!(inactive, "1:vo");
+        assert_eq!(active, "4:*a");
+        assert!(
+            !text[0].contains("Alt"),
+            "narrow cells should not spend all their width on the modifier prefix: {text:?}"
+        );
+        assert!(
+            text[0].contains("4:*"),
+            "active marker must survive narrow rendering: {text:?}"
+        );
+    }
+
+    #[test]
     fn sidebar_hotbar_render_smoke_omits_panel_when_empty_config() {
         let mut app = create_test_app();
         app.sidebar_focus = SidebarFocus::Pinned;
@@ -3828,6 +3942,40 @@ mod tests {
         assert!(
             !rendered.contains("Hotbar"),
             "empty hotbar config should not render hotbar panel: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("/hotbar"),
+            "explicitly disabled hotbar should not render the discovery hint: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn sidebar_hotbar_render_smoke_paints_discovery_hint_for_fresh_config() {
+        let mut app = create_test_app();
+        app.sidebar_focus = SidebarFocus::Pinned;
+        app.mode = AppMode::Agent;
+        let config = Config::default();
+
+        let backend = TestBackend::new(44, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| render_sidebar(frame, frame.area(), &mut app, &config))
+            .expect("draw sidebar");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(
+            !rendered.contains("Hotbar"),
+            "fresh config should not render the full hotbar panel: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("/hotbar"),
+            "fresh config should render the one-line setup hint: {rendered:?}"
         );
     }
 
