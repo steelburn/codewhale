@@ -1088,6 +1088,49 @@ mod tests {
     }
 
     #[test]
+    fn role_step_stacks_detail_below_choices_at_80_columns() {
+        let rows = render_through_stack(|| FleetSetupView::from_snapshot(snapshot()), 80, 24);
+
+        let custom_row = rows
+            .iter()
+            .position(|row| row.contains("custom"))
+            .expect("role list should include custom");
+        let summary_row = rows
+            .iter()
+            .position(|row| row.contains("Plan & split queued work"))
+            .expect("selected role summary should render");
+        let detail_row = rows
+            .iter()
+            .position(|row| row.contains("Coordinates the Fleet run"))
+            .expect("selected role detail should render");
+
+        assert!(
+            summary_row > custom_row,
+            "80-column role detail should render below the full role list:\n{}",
+            rows.join("\n")
+        );
+        assert!(detail_row > summary_row);
+
+        let selected_detail_needles = [
+            "Plan & split queued work",
+            "Coordinates the Fleet run",
+            "bounded tasks",
+            "Fleet runs sub-agents",
+            "team member should play",
+        ];
+        for (y, row) in rows.iter().enumerate() {
+            let has_role_label = ROLES.iter().any(|role| row.contains(role.label));
+            let has_selected_detail = selected_detail_needles
+                .iter()
+                .any(|needle| row.contains(needle));
+            assert!(
+                !(has_role_label && has_selected_detail),
+                "80-column role row {y} interleaves list and detail: {row:?}"
+            );
+        }
+    }
+
+    #[test]
     fn review_lists_model_permissions_tools_and_scope() {
         // Top of the review: the leading sections are visible without scrolling.
         let top = render_through_stack(
