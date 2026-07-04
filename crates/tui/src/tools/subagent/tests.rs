@@ -478,6 +478,20 @@ fn git(repo: &Path, args: &[&str]) {
     );
 }
 
+fn git_output(repo: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .output()
+        .expect("git command should run");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).to_string()
+}
+
 fn text_message(role: &str, text: &str) -> Message {
     Message {
         role: role.to_string(),
@@ -3258,6 +3272,107 @@ fn create_isolated_worktree_rejects_invalid_branch_as_input() {
 }
 
 #[test]
+fn checkpoint_worktree_changes_commits_dirty_worktree_to_checkpoint_branch() {
+    let repo = init_subagent_git_repo();
+    let original_branch = current_git_branch(repo.path());
+    std::fs::write(repo.path().join("partial.txt"), "partial intent\n")
+        .expect("write partial file");
+    let checkpoint = make_checkpoint(
+        "agent_dirty",
+        2,
+        vec![text_message("assistant", "I still need to run tests")],
+    );
+
+    let branch = checkpoint_worktree_changes(repo.path(), "agent_dirty", &checkpoint)
+        .expect("checkpoint branch save should succeed")
+        .expect("dirty worktree should create a branch");
+
+    assert!(branch.starts_with("codex/checkpoint/agent_dirty/"));
+    assert_eq!(current_git_branch(repo.path()), original_branch);
+    let status = git_output(repo.path(), &["status", "--porcelain"]);
+    assert!(
+        status.contains("?? partial.txt"),
+        "working copy should retain uncommitted file after checkpoint save: {status:?}"
+    );
+    let saved = git_output(repo.path(), &["show", &format!("{branch}:partial.txt")]);
+    assert_eq!(saved, "partial intent\n");
+}
+
+#[test]
+fn prune_checkpoint_branch_deletes_only_checkpoint_branches() {
+    let repo = init_subagent_git_repo();
+    std::fs::write(repo.path().join("partial.txt"), "partial intent\n")
+        .expect("write partial file");
+    let checkpoint = make_checkpoint(
+        "agent_cleanup",
+        3,
+        vec![text_message("assistant", "ready to resume")],
+    );
+    let branch = checkpoint_worktree_changes(repo.path(), "agent_cleanup", &checkpoint)
+        .expect("checkpoint branch save should succeed")
+        .expect("dirty worktree should create a branch");
+
+    assert!(
+        prune_checkpoint_branch(repo.path(), &branch).expect("checkpoint prune should succeed"),
+        "existing checkpoint branch should be pruned"
+    );
+    let listed = git_output(repo.path(), &["branch", "--list", &branch]);
+    assert!(listed.trim().is_empty(), "branch should be gone: {listed}");
+
+    let err = prune_checkpoint_branch(repo.path(), "feature/not-a-checkpoint")
+        .expect_err("non-checkpoint branches must not be pruned");
+    assert!(
+        err.to_string().contains("non-checkpoint"),
+        "clear prune guardrail: {err}"
+    );
+}
+
+#[tokio::test]
+async fn completed_resumed_subagent_prunes_checkpoint_branch() {
+    let repo = init_subagent_git_repo();
+    std::fs::write(repo.path().join("partial.txt"), "partial intent\n")
+        .expect("write partial file");
+    let checkpoint = make_checkpoint(
+        "agent_resume_cleanup",
+        1,
+        vec![text_message("assistant", "ready to finish")],
+    );
+    let branch = checkpoint_worktree_changes(repo.path(), "agent_resume_cleanup", &checkpoint)
+        .expect("checkpoint branch save should succeed")
+        .expect("dirty worktree should create a branch");
+    let (client, _calls, _bodies) = delayed_chat_client(Duration::from_millis(0), "done").await;
+    let mut runtime = stub_runtime();
+    runtime.client = client;
+    runtime.context = ToolContext::new(repo.path());
+    runtime.manager = new_shared_subagent_manager(repo.path().to_path_buf(), 2);
+    runtime.resumed_checkpoint_branch = Some(branch.clone());
+    let (_tx, rx) = mpsc::unbounded_channel();
+
+    let result = run_subagent(
+        &runtime,
+        "agent_resume_cleanup".to_string(),
+        SubAgentType::General,
+        "finish from checkpoint".to_string(),
+        make_assignment(),
+        Some(vec![]),
+        false,
+        Instant::now(),
+        1,
+        None,
+        rx,
+    )
+    .await
+    .expect("resumed sub-agent should complete");
+
+    assert_eq!(result.status, SubAgentStatus::Completed);
+    let listed = git_output(repo.path(), &["branch", "--list", &branch]);
+    assert!(
+        listed.trim().is_empty(),
+        "checkpoint branch should be pruned on success: {listed}"
+    );
+}
+
+#[test]
 fn build_subagent_system_prompt_appends_role_when_set() {
     let assignment = SubAgentAssignment::new("p".to_string(), Some("worker".to_string()));
     let prompt = build_subagent_system_prompt(&SubAgentType::General, &assignment);
@@ -4166,6 +4281,7 @@ fn stub_runtime() -> SubAgentRuntime {
         parent_agent_id: None,
         parent_completion_tx: None,
         fork_context: None,
+        resumed_checkpoint_branch: None,
         mcp_pool: None,
         step_api_timeout: DEFAULT_STEP_API_TIMEOUT,
         tool_timeout: DEFAULT_TOOL_TIMEOUT,

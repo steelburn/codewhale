@@ -134,6 +134,7 @@ const SUBAGENT_TRANSCRIPT_MESSAGE_BUDGET_BYTES: usize = 1024 * 1024;
 const SUBAGENT_STATE_SCHEMA_VERSION: u32 = 1;
 const SUBAGENT_STATE_FILE: &str = "subagents.v1.json";
 const SUBAGENT_WORKTREE_ROOT_DIR: &str = ".codewhale-worktrees";
+const SUBAGENT_CHECKPOINT_BRANCH_PREFIX: &str = "codex/checkpoint";
 const SUBAGENT_RESTART_REASON: &str = "Interrupted by process restart";
 const SUBAGENT_QUEUED_LAUNCH_REASON: &str = "queued: waiting for a sub-agent launch slot";
 const SUBAGENT_MODEL_WAIT_REASON: &str = "waiting for model response";
@@ -1309,6 +1310,8 @@ pub struct SubAgentCheckpoint {
     pub checkpoint_id: String,
     pub agent_id: String,
     pub continuation_handle: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_branch: Option<String>,
     pub reason: String,
     pub continuable: bool,
     pub steps_taken: u32,
@@ -1491,6 +1494,9 @@ pub struct SubAgentRuntime {
     pub parent_completion_tx: Option<mpsc::UnboundedSender<SubAgentCompletion>>,
     /// Snapshot of the request prefix visible to an opt-in forked child.
     pub fork_context: Option<SubAgentForkContext>,
+    /// Checkpoint branch this runtime is resuming from. Successful completion
+    /// prunes the branch; interrupted/failed runs leave it available.
+    pub resumed_checkpoint_branch: Option<String>,
     /// The parent's MCP pool if available.
     pub mcp_pool: Option<std::sync::Arc<tokio::sync::Mutex<crate::mcp::McpPool>>>,
     /// Per-step DeepSeek API timeout for the child's `create_message` call.
@@ -1551,6 +1557,7 @@ impl SubAgentRuntime {
             mailbox: None,
             parent_completion_tx: None,
             fork_context: None,
+            resumed_checkpoint_branch: None,
             mcp_pool: None,
             step_api_timeout: DEFAULT_STEP_API_TIMEOUT,
             tool_timeout: DEFAULT_TOOL_TIMEOUT,
@@ -1726,6 +1733,7 @@ impl SubAgentRuntime {
             mailbox: self.mailbox.clone(),
             parent_completion_tx: self.parent_completion_tx.clone(),
             fork_context: self.fork_context.clone(),
+            resumed_checkpoint_branch: self.resumed_checkpoint_branch.clone(),
             mcp_pool: self.mcp_pool.clone(),
             step_api_timeout: self.step_api_timeout,
             tool_timeout: self.tool_timeout,
@@ -3889,6 +3897,10 @@ async fn spawn_subagent_from_input(
     let child_workspace = prepare_child_workspace(&runtime.context.workspace, &spawn_request)?;
 
     let mut child_runtime = runtime.background_runtime();
+    child_runtime.resumed_checkpoint_branch = spawn_request
+        .resume_checkpoint
+        .as_ref()
+        .and_then(|checkpoint| checkpoint.checkpoint_branch.clone());
     if let Some(max_depth) = spawn_request.max_depth {
         child_runtime.max_spawn_depth =
             clamp_child_max_spawn_depth(child_runtime.spawn_depth, max_depth);
@@ -4091,6 +4103,7 @@ fn prompt_with_resume_checkpoint(prompt: &str, checkpoint: &SubAgentCheckpoint) 
             "Checkpoint metadata:\n",
             "- checkpoint_id: {}\n",
             "- continuation_handle: {}\n",
+            "- checkpoint_branch: {}\n",
             "- original_agent_id: {}\n",
             "- reason: {}\n",
             "- steps_taken: {}\n",
@@ -4100,6 +4113,7 @@ fn prompt_with_resume_checkpoint(prompt: &str, checkpoint: &SubAgentCheckpoint) 
         ),
         checkpoint.checkpoint_id,
         checkpoint.continuation_handle,
+        checkpoint.checkpoint_branch.as_deref().unwrap_or("none"),
         checkpoint.agent_id,
         checkpoint.reason,
         checkpoint.steps_taken,
@@ -4617,6 +4631,7 @@ fn build_subagent_checkpoint(
         checkpoint_id: checkpoint_id.clone(),
         agent_id: agent_id.to_string(),
         continuation_handle: format!("agent:{agent_id}:checkpoint:{checkpoint_id}"),
+        checkpoint_branch: None,
         reason: reason.into(),
         continuable,
         steps_taken,
@@ -5106,6 +5121,12 @@ async fn run_subagent(
                             true,
                         )
                         .await;
+                        let mut checkpoint = checkpoint;
+                        if let Ok(branch) =
+                            checkpoint_worktree_changes(&runtime.context.workspace, &agent_id, &checkpoint)
+                        {
+                            checkpoint.checkpoint_branch = branch;
+                        }
                         record_agent_progress(
                             runtime,
                             &agent_id,
@@ -5473,6 +5494,18 @@ async fn run_subagent(
         steps,
         false,
     ));
+    if let Some(branch) = runtime.resumed_checkpoint_branch.as_deref() {
+        if let Ok(true) = prune_checkpoint_branch(&runtime.context.workspace, branch) {
+            record_agent_progress(
+                runtime,
+                &agent_id,
+                format!(
+                    "{}: pruned checkpoint branch {branch}",
+                    format_step_counter(steps, max_steps)
+                ),
+            );
+        }
+    }
     insert_subagent_full_transcript_handle(
         runtime,
         &agent_id,
@@ -6310,6 +6343,132 @@ fn create_isolated_worktree(
     })
 }
 
+fn checkpoint_worktree_changes(
+    workspace: &Path,
+    agent_id: &str,
+    checkpoint: &SubAgentCheckpoint,
+) -> Result<Option<String>, ToolError> {
+    let repo_root = match git_repo_root(workspace) {
+        Ok(repo_root) => repo_root,
+        Err(_) => return Ok(None),
+    };
+    let status = run_git_checked(
+        workspace,
+        &git_args(&["status", "--porcelain"]),
+        "inspect checkpoint worktree status",
+    )?;
+    if status.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let branch = checkpoint_branch_name(agent_id, checkpoint);
+    validate_git_branch_name(&repo_root, &branch)?;
+    run_git_checked(
+        workspace,
+        &git_args(&["add", "--all"]),
+        "stage checkpoint worktree changes",
+    )?;
+
+    let checkpoint_result = (|| {
+        let tree = run_git_checked(
+            workspace,
+            &git_args(&["write-tree"]),
+            "write checkpoint tree",
+        )?
+        .trim()
+        .to_string();
+        let parent = run_git_checked(
+            workspace,
+            &git_args(&["rev-parse", "HEAD"]),
+            "resolve checkpoint parent",
+        )?
+        .trim()
+        .to_string();
+        let message = format!("checkpoint({agent_id}): {}", checkpoint.reason);
+        let commit = run_git_checked(
+            workspace,
+            &[
+                "-c".to_string(),
+                "user.name=CodeWhale Checkpoint".to_string(),
+                "-c".to_string(),
+                "user.email=checkpoint@codewhale.local".to_string(),
+                "-c".to_string(),
+                "commit.gpgsign=false".to_string(),
+                "commit-tree".to_string(),
+                tree,
+                "-p".to_string(),
+                parent,
+                "-m".to_string(),
+                message,
+            ],
+            "commit checkpoint tree",
+        )?
+        .trim()
+        .to_string();
+        run_git_checked(
+            &repo_root,
+            &[
+                "branch".to_string(),
+                "-f".to_string(),
+                branch.clone(),
+                commit,
+            ],
+            "update checkpoint branch",
+        )?;
+        Ok(Some(branch))
+    })();
+
+    let reset_result = run_git_checked(
+        workspace,
+        &git_args(&["reset", "-q"]),
+        "restore checkpoint staging state",
+    );
+
+    match (checkpoint_result, reset_result) {
+        (Ok(branch), Ok(_)) => Ok(branch),
+        (Err(err), _) => Err(err),
+        (Ok(_), Err(err)) => Err(err),
+    }
+}
+
+fn checkpoint_branch_name(agent_id: &str, checkpoint: &SubAgentCheckpoint) -> String {
+    format!(
+        "{}/{}/step-{}-{}",
+        SUBAGENT_CHECKPOINT_BRANCH_PREFIX,
+        sanitize_worktree_slug(agent_id),
+        checkpoint.steps_taken,
+        checkpoint.created_at_ms
+    )
+}
+
+fn prune_checkpoint_branch(workspace: &Path, branch: &str) -> Result<bool, ToolError> {
+    if !branch.starts_with(&format!("{SUBAGENT_CHECKPOINT_BRANCH_PREFIX}/")) {
+        return Err(ToolError::invalid_input(format!(
+            "Refusing to prune non-checkpoint branch '{branch}'"
+        )));
+    }
+    let repo_root = git_repo_root(workspace)?;
+    validate_git_branch_name(&repo_root, branch)?;
+    let listed = run_git_checked(
+        &repo_root,
+        &[
+            "branch".to_string(),
+            "--list".to_string(),
+            branch.to_string(),
+        ],
+        "inspect checkpoint branch",
+    )?;
+    if listed.trim().is_empty() {
+        return Ok(false);
+    }
+    run_git_checked(
+        &repo_root,
+        &["branch".to_string(), "-D".to_string(), branch.to_string()],
+        "prune checkpoint branch",
+    )?;
+    Ok(true)
+}
+
 fn git_repo_root(workspace: &Path) -> Result<PathBuf, ToolError> {
     let output = run_git_checked(
         workspace,
@@ -6463,6 +6622,10 @@ fn run_git_checked(workspace: &Path, args: &[String], action: &str) -> Result<St
     Err(ToolError::execution_failed(format!(
         "Failed to {action}: {detail}"
     )))
+}
+
+fn git_args(args: &[&str]) -> Vec<String> {
+    args.iter().map(|arg| (*arg).to_string()).collect()
 }
 
 /// Resolve a user-supplied role/agent_role value to a canonical role string.
