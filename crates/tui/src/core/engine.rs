@@ -2291,7 +2291,7 @@ impl Engine {
             mode == AppMode::Yolo || auto_approve,
             approval_mode,
         );
-        if let Some(status) = input_policy.status.clone() {
+        if let Some(status) = input_policy.status() {
             let _ = self.tx_event.send(Event::status(status)).await;
         }
         // Reset cancel token for fresh turn (in case previous was cancelled)
@@ -2301,11 +2301,11 @@ impl Engine {
         // idle worker resumptions, and approval gates cannot read a stale policy
         // after the UI changed modes (#3568).
         self.apply_runtime_mode_policy(
-            input_policy.mode,
-            input_policy.allow_shell,
-            input_policy.trust_mode,
-            input_policy.auto_approve,
-            input_policy.approval_mode,
+            input_policy.mode(),
+            input_policy.allow_shell(),
+            input_policy.trust_mode(),
+            input_policy.auto_approve(),
+            input_policy.approval_mode(),
         );
 
         // Drain stale steer messages from previous turns.
@@ -2402,7 +2402,7 @@ impl Engine {
         self.session
             .working_set
             .observe_user_message(&content, &self.session.workspace);
-        let force_update_plan_first = should_force_update_plan_first(input_policy.mode, &content);
+        let force_update_plan_first = should_force_update_plan_first(input_policy.mode(), &content);
 
         // Add user message to session
         let user_msg = self.user_text_message_with_turn_metadata_for_route_and_provenance(
@@ -2453,9 +2453,10 @@ impl Engine {
         let todo_list = self.config.todos.clone();
         let plan_state = self.config.plan_state.clone();
 
-        let tool_context = self.build_tool_context(input_policy.mode, input_policy.auto_approve);
+        let tool_context =
+            self.build_tool_context(input_policy.mode(), input_policy.auto_approve());
         let builder = self
-            .build_turn_tool_registry_builder(input_policy.mode, todo_list, plan_state)
+            .build_turn_tool_registry_builder(input_policy.mode(), todo_list, plan_state)
             .with_dynamic_tools(&dynamic_tools);
 
         let subagents_available =
@@ -2463,7 +2464,7 @@ impl Engine {
 
         let fork_context_for_runtime = if subagents_available {
             let state = StructuredState::capture(
-                input_policy.mode.label(),
+                input_policy.mode().label(),
                 self.config.workspace.clone(),
                 std::env::current_dir().ok(),
                 &self.session.working_set,
@@ -2536,9 +2537,9 @@ impl Engine {
         let mut tool_registry = if subagents_available {
             let runtime = if let Some(client) = self.deepseek_client.clone() {
                 let runtime_allow_shell =
-                    self.session.allow_shell && !matches!(input_policy.mode, AppMode::Plan);
+                    self.session.allow_shell && !matches!(input_policy.mode(), AppMode::Plan);
                 let runtime_shell_policy =
-                    shell_policy_for_mode(input_policy.mode, runtime_allow_shell);
+                    shell_policy_for_mode(input_policy.mode(), runtime_allow_shell);
                 let mut rt = SubAgentRuntime::new(
                     client,
                     self.session.model.clone(),
@@ -2562,7 +2563,7 @@ impl Engine {
                 .with_mcp_pool(mcp_pool.clone())
                 .with_todos(self.config.todos.clone())
                 .with_parent_completion_tx(self.tx_subagent_completion.clone());
-                if matches!(input_policy.mode, AppMode::Plan) {
+                if matches!(input_policy.mode(), AppMode::Plan) {
                     rt.worker_profile = WorkerRuntimeProfile::for_role(SubAgentType::Plan);
                 }
                 if let Some(context) = fork_context_for_runtime.clone() {
@@ -2615,7 +2616,7 @@ impl Engine {
             let mut catalog = build_model_tool_catalog_with_surface(
                 registry.to_api_tools_with_cache(true),
                 mcp_tools,
-                input_policy.mode,
+                input_policy.mode(),
                 &self.config.tools_always_load,
                 capability.tool_surface_budget,
             );
@@ -2646,9 +2647,9 @@ impl Engine {
             &mut turn,
             tool_registry.as_ref(),
             tools,
-            input_policy.mode,
+            input_policy.mode(),
             force_update_plan_first,
-            input_policy.dynamic_active_tools,
+            input_policy.dynamic_active_tools().to_vec(),
         ))
         .catch_unwind()
         .await;
