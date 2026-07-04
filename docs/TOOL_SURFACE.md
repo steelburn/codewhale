@@ -28,6 +28,7 @@ chosen over the available shell equivalent. Companion to `crates/tui/src/prompts
 | `apply_patch` | Apply a unified diff. The right tool for multi-hunk edits. |
 | `retrieve_tool_result` | Read summaries or slices of prior large tool outputs spilled to `~/.codewhale/tool_outputs/`; use `summary`, `head`, `tail`, `lines`, or `query` instead of replaying the whole result. |
 | `handle_read` | Read bounded projections from `var_handle` payloads held by live tool environments. This is the foundation for RLM sessions, sub-agent transcripts, and other large symbolic payloads. |
+| `structural_code` | Search Rust and TypeScript/JavaScript symbol blocks and preview structural edits before writing. Applies only with `apply=true` after the normal fresh-read gate. |
 
 ### Search
 
@@ -37,6 +38,13 @@ chosen over the available shell equivalent. Companion to `crates/tui/src/prompts
 | `file_search` | Fuzzy-match filenames (not contents). Use when you know roughly the name. |
 | `web_search` | DuckDuckGo by default with Bing fallback; Bing, Tavily, Bocha, Metaso, SearXNG, Baidu, Volcengine, and Sofya are selectable in config. Ranked snippets + `ref_id` for citation. |
 | `fetch_url` | Direct HTTP GET on a known URL. Faster than `web_search` when the link is already known. HTML stripped to text by default. |
+
+`structural_code` is intentionally a small first slice: Rust plus
+TypeScript/JavaScript symbol blocks. Unsupported languages and parse failures
+return explicit fallback guidance to `grep_files`, `read_file`, and
+`edit_file` rather than guessing with text edits. `read_file` also accepts
+`view: "structure"` for an opt-in symbol summary without changing the default
+raw-text read behavior.
 
 ### Shell
 

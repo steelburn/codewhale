@@ -51,6 +51,11 @@ impl ToolSpec for ReadFileTool {
                 "pages": {
                     "type": "string",
                     "description": "PDF only: page range to extract, e.g. \"1-5\" or \"10\". Ignored for non-PDF files."
+                },
+                "view": {
+                    "type": "string",
+                    "enum": ["text", "structure"],
+                    "description": "Use structure for an opt-in symbol summary of supported code files. Defaults to text."
                 }
             },
             "required": ["path"]
@@ -95,6 +100,20 @@ impl ToolSpec for ReadFileTool {
             ToolError::execution_failed(format!("Failed to read {}: {}", file_path.display(), e))
         })?;
         context.note_file_read(&file_path);
+
+        match optional_str(&input, "view") {
+            Some("structure") => {
+                return Ok(ToolResult::success(
+                    crate::tools::structural::summarize_file(&file_path, &contents)?,
+                ));
+            }
+            Some("text") | None => {}
+            Some(other) => {
+                return Err(ToolError::invalid_input(format!(
+                    "unsupported read_file view `{other}`; expected `text` or `structure`"
+                )));
+            }
+        }
 
         let total_lines = contents.lines().count();
         let total_bytes = contents.len();
@@ -1144,6 +1163,29 @@ mod tests {
             !result.content.contains("<file"),
             "small-file fast path must not wrap output"
         );
+    }
+
+    #[tokio::test]
+    async fn read_file_structure_view_returns_symbol_summary() {
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        let file = tmp.path().join("lib.rs");
+        fs::write(
+            &file,
+            "pub struct Whale {\n    pub name: String,\n}\n\npub fn surface() {\n}\n",
+        )
+        .expect("write");
+
+        let result = ReadFileTool
+            .execute(json!({ "path": "lib.rs", "view": "structure" }), &ctx)
+            .await
+            .expect("execute");
+
+        assert!(result.success);
+        assert!(result.content.contains("<structure"));
+        assert!(result.content.contains("- struct `Whale`"));
+        assert!(result.content.contains("- function `surface`"));
+        assert!(!result.content.contains("pub name: String"));
     }
 
     #[tokio::test]
