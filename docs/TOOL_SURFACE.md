@@ -127,6 +127,7 @@ to the model, such as `mcp_<server>_<tool>`.
 | `git_status` | Inspect repo status without running shell. |
 | `git_diff` | Inspect working-tree or staged diffs. |
 | `diagnostics` | Workspace, git, sandbox, and toolchain info in one call. |
+| `dap_debugger` | Start or attach to a supported DAP debugger, set breakpoints, resume/step, and inspect stack/scopes/variables. First slice supports `debugpy`; launch program and cwd are resolved through workspace policy and the tool is approval-gated. |
 | `run_tests` | `cargo test` with optional args. |
 | `run_verifiers` | Run independent verifier gates in parallel across detected Rust, Node, Python, and Go projects, with optional custom `program` + `args` gates for other ecosystems. |
 
