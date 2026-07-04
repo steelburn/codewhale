@@ -9,6 +9,7 @@ mod model_policy;
 mod replay;
 #[cfg(not(target_env = "ohos"))]
 mod starlark_authoring;
+mod topology;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -26,6 +27,7 @@ pub use replay::*;
 pub use starlark_authoring::{
     compile_starlark_workflow, compile_starlark_workflow_with_repair, repair_starlark_workflow_once,
 };
+pub use topology::WorkflowTopology;
 
 pub const DEFAULT_FLEET_WORKFLOW_MAX_AGENTS: usize = 100;
 pub const DEFAULT_FLEET_WORKFLOW_MAX_DEPTH: usize = 5;
@@ -2232,6 +2234,18 @@ mod tests {
         }
     }
 
+    fn recorded_inputs(
+        runner: &RecordingLeafRunner,
+        leaf_id: &str,
+    ) -> Vec<(String, Option<String>)> {
+        runner
+            .inputs
+            .iter()
+            .find(|(id, _)| id == leaf_id)
+            .map(|(_, inputs)| inputs.clone())
+            .unwrap_or_default()
+    }
+
     #[test]
     fn workflow_driver_delegates_leaves_predicates_and_expansion() {
         let workflow = workflow_spec(vec![WorkflowNode::Sequence(SequenceSpec {
@@ -2292,6 +2306,262 @@ mod tests {
         assert_eq!(
             control_result(&execution, "split").selected_children,
             vec!["worker-a"]
+        );
+    }
+
+    #[test]
+    fn topology_fan_out_declares_parallel_branch_and_runs_all_leaves() {
+        let topology = WorkflowTopology::fan_out(
+            "fanout",
+            vec![
+                WorkflowTopology::leaf("one", "try first approach"),
+                WorkflowTopology::leaf("two", "try second approach"),
+                WorkflowTopology::leaf("three", "try third approach"),
+            ],
+        );
+        let WorkflowNode::BranchSet(branch) = &topology else {
+            panic!("fan-out should compile to a branch set");
+        };
+        assert!(branch.parallel);
+        assert_eq!(branch.children.len(), 3);
+
+        let workflow = workflow_spec(vec![topology]);
+        let mut runner = RecordingLeafRunner::default();
+        let execution = WorkflowDriver::new(&mut runner)
+            .run(&workflow)
+            .expect("fan-out topology should execute");
+
+        assert_eq!(runner.leaves, vec!["one", "two", "three"]);
+        assert_eq!(
+            control_result(&execution, "fanout").selected_children,
+            vec!["one", "two", "three"]
+        );
+    }
+
+    #[test]
+    fn topology_pipeline_threads_previous_output_to_next_leaf() {
+        let workflow = workflow_spec(vec![WorkflowTopology::pipeline(
+            "pipeline",
+            vec![
+                WorkflowTopology::leaf("scan", "scan the code"),
+                WorkflowTopology::leaf("patch", "patch using scan output"),
+                WorkflowTopology::leaf("verify", "verify using patch output"),
+            ],
+        )]);
+        let mut runner = RecordingLeafRunner::default();
+
+        WorkflowDriver::new(&mut runner)
+            .run(&workflow)
+            .expect("pipeline topology should execute");
+
+        assert_eq!(runner.leaves, vec!["scan", "patch", "verify"]);
+        assert_eq!(
+            recorded_inputs(&runner, "patch"),
+            vec![("scan".to_string(), Some("recorded leaf scan".to_string()))]
+        );
+        assert_eq!(
+            recorded_inputs(&runner, "verify"),
+            vec![("patch".to_string(), Some("recorded leaf patch".to_string()))]
+        );
+    }
+
+    #[test]
+    fn topology_diamond_routes_scouts_to_integrator_then_verifiers() {
+        let workflow = workflow_spec(vec![WorkflowTopology::diamond(
+            "diamond",
+            vec![
+                WorkflowTopology::leaf("scout-a", "inspect parser"),
+                WorkflowTopology::leaf("scout-b", "inspect renderer"),
+            ],
+            WorkflowTopology::leaf("integrate", "merge scout reports"),
+            vec![
+                WorkflowTopology::leaf("verify-a", "verify parser fix"),
+                WorkflowTopology::leaf("verify-b", "verify renderer fix"),
+            ],
+        )]);
+        let mut runner = RecordingLeafRunner::default();
+
+        WorkflowDriver::new(&mut runner)
+            .run(&workflow)
+            .expect("diamond topology should execute");
+
+        assert_eq!(
+            recorded_inputs(&runner, "integrate"),
+            vec![
+                (
+                    "scout-a".to_string(),
+                    Some("recorded leaf scout-a".to_string())
+                ),
+                (
+                    "scout-b".to_string(),
+                    Some("recorded leaf scout-b".to_string())
+                )
+            ]
+        );
+        assert_eq!(
+            recorded_inputs(&runner, "verify-a"),
+            vec![(
+                "integrate".to_string(),
+                Some("recorded leaf integrate".to_string())
+            )]
+        );
+        assert_eq!(
+            recorded_inputs(&runner, "verify-b"),
+            vec![(
+                "integrate".to_string(),
+                Some("recorded leaf integrate".to_string())
+            )]
+        );
+    }
+
+    #[test]
+    fn topology_speculative_routes_candidates_to_verifier_and_review() {
+        let workflow = workflow_spec(vec![WorkflowTopology::speculative(
+            "speculate",
+            vec![
+                WorkflowTopology::leaf("fast", "try a small patch"),
+                WorkflowTopology::leaf("deep", "try a broader patch"),
+            ],
+            WorkflowTopology::leaf("judge", "pick the best candidate and explain why"),
+        )]);
+        let mut runner = RecordingLeafRunner::default();
+
+        let execution = WorkflowDriver::new(&mut runner)
+            .run(&workflow)
+            .expect("speculative topology should execute");
+
+        assert_eq!(
+            recorded_inputs(&runner, "judge"),
+            vec![
+                ("fast".to_string(), Some("recorded leaf fast".to_string())),
+                ("deep".to_string(), Some("recorded leaf deep".to_string()))
+            ]
+        );
+        assert_eq!(
+            control_result(&execution, "speculate-selection").selected_children,
+            vec!["judge"]
+        );
+        let review = TeacherReviewSpec {
+            id: "speculate-selection".to_string(),
+            candidates: vec!["judge".to_string()],
+            promotion_policy: PromotionPolicy {
+                strategy: PromotionStrategy::TeacherSelected,
+                require_teacher_review: true,
+                ..PromotionPolicy::default()
+            },
+        };
+        let report = TeacherReviewReport::from_execution(&review, &execution);
+        assert_eq!(report.candidates.len(), 1);
+        assert!(
+            report.candidates[0]
+                .evidence
+                .iter()
+                .any(|evidence| { evidence.contains("output=recorded leaf judge") })
+        );
+    }
+
+    #[test]
+    fn topology_critique_loop_threads_implement_review_fix_until_pass() {
+        let workflow = workflow_spec(vec![WorkflowTopology::critique_loop(
+            "critique",
+            "reviewer passed",
+            3,
+            WorkflowTopology::leaf("implement", "apply a fix"),
+            WorkflowTopology::leaf("review", "critique the fix"),
+            WorkflowTopology::leaf("fix", "address the critique"),
+        )]);
+        let mut runner = RecordingLeafRunner::default();
+        runner.conditions.insert("critique".to_string(), true);
+
+        let execution = WorkflowDriver::new(&mut runner)
+            .run(&workflow)
+            .expect("critique loop topology should execute");
+
+        assert_eq!(runner.leaves, vec!["implement", "review", "fix"]);
+        assert_eq!(
+            recorded_inputs(&runner, "implement"),
+            vec![("fix".to_string(), None)]
+        );
+        assert_eq!(
+            recorded_inputs(&runner, "review"),
+            vec![(
+                "implement".to_string(),
+                Some("recorded leaf implement".to_string())
+            )]
+        );
+        assert_eq!(
+            recorded_inputs(&runner, "fix"),
+            vec![(
+                "review".to_string(),
+                Some("recorded leaf review".to_string())
+            )]
+        );
+        assert_eq!(
+            control_result(&execution, "critique").status,
+            WorkflowRunStatus::Succeeded
+        );
+    }
+
+    #[test]
+    fn topology_waterfall_threads_each_wave_to_the_next_wave() {
+        let workflow = workflow_spec(vec![WorkflowTopology::waterfall(
+            "waterfall",
+            vec![
+                vec![
+                    WorkflowTopology::leaf("discover-a", "discover one"),
+                    WorkflowTopology::leaf("discover-b", "discover two"),
+                ],
+                vec![
+                    WorkflowTopology::leaf("patch-a", "patch one"),
+                    WorkflowTopology::leaf("patch-b", "patch two"),
+                ],
+                vec![WorkflowTopology::leaf("verify", "verify both patches")],
+            ],
+        )]);
+        let mut runner = RecordingLeafRunner::default();
+
+        WorkflowDriver::new(&mut runner)
+            .run(&workflow)
+            .expect("waterfall topology should execute");
+
+        assert_eq!(
+            recorded_inputs(&runner, "patch-a"),
+            vec![
+                (
+                    "discover-a".to_string(),
+                    Some("recorded leaf discover-a".to_string())
+                ),
+                (
+                    "discover-b".to_string(),
+                    Some("recorded leaf discover-b".to_string())
+                )
+            ]
+        );
+        assert_eq!(
+            recorded_inputs(&runner, "patch-b"),
+            vec![
+                (
+                    "discover-a".to_string(),
+                    Some("recorded leaf discover-a".to_string())
+                ),
+                (
+                    "discover-b".to_string(),
+                    Some("recorded leaf discover-b".to_string())
+                )
+            ]
+        );
+        assert_eq!(
+            recorded_inputs(&runner, "verify"),
+            vec![
+                (
+                    "patch-a".to_string(),
+                    Some("recorded leaf patch-a".to_string())
+                ),
+                (
+                    "patch-b".to_string(),
+                    Some("recorded leaf patch-b".to_string())
+                )
+            ]
         );
     }
 
