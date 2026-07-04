@@ -695,7 +695,11 @@ impl MockLeafOutcome {
 }
 
 pub trait WorkflowLeafRunner {
-    fn run_leaf(&mut self, spec: &LeafSpec) -> Result<LeafResult, WorkflowExecutionError>;
+    fn run_leaf(
+        &mut self,
+        spec: &LeafSpec,
+        inputs: &[(String, Option<String>)],
+    ) -> Result<LeafResult, WorkflowExecutionError>;
 
     fn evaluate_condition(
         &mut self,
@@ -715,6 +719,7 @@ pub trait WorkflowLeafRunner {
 
 pub struct WorkflowDriver<'runner, R> {
     runner: &'runner mut R,
+    resolved_outputs: BTreeMap<String, Option<String>>,
 }
 
 impl<'runner, R> WorkflowDriver<'runner, R>
@@ -722,7 +727,10 @@ where
     R: WorkflowLeafRunner,
 {
     pub fn new(runner: &'runner mut R) -> Self {
-        Self { runner }
+        Self {
+            runner,
+            resolved_outputs: BTreeMap::new(),
+        }
     }
 
     pub fn run(
@@ -835,10 +843,25 @@ where
         spec: &LeafSpec,
         execution: &mut WorkflowExecution,
     ) -> Result<(), WorkflowExecutionError> {
-        let result = self.runner.run_leaf(spec)?;
+        let inputs = spec
+            .depends_on_results
+            .iter()
+            .map(|dependency| {
+                (
+                    dependency.clone(),
+                    self.resolved_outputs
+                        .get(dependency)
+                        .cloned()
+                        .unwrap_or_default(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let result = self.runner.run_leaf(spec, &inputs)?;
         mark_execution_for_status(execution, result.status);
         execution.usage.add_assign(result.usage);
         execution.memo_usage.add_assign(result.memo_usage);
+        self.resolved_outputs
+            .insert(spec.id.clone(), result.output.clone());
         execution.leaf_results.push(result);
         Ok(())
     }
@@ -1068,7 +1091,11 @@ impl MockWorkflowExecutor {
 }
 
 impl WorkflowLeafRunner for MockWorkflowExecutor {
-    fn run_leaf(&mut self, spec: &LeafSpec) -> Result<LeafResult, WorkflowExecutionError> {
+    fn run_leaf(
+        &mut self,
+        spec: &LeafSpec,
+        _inputs: &[(String, Option<String>)],
+    ) -> Result<LeafResult, WorkflowExecutionError> {
         let outcome = self.mock_leaf_outcome(spec);
         Ok(LeafResult {
             leaf_id: spec.id.clone(),
@@ -1112,6 +1139,13 @@ fn aggregate_workflow_status(results: &[LeafResult]) -> WorkflowRunStatus {
         .any(|result| result.status == WorkflowRunStatus::BudgetExceeded)
     {
         WorkflowRunStatus::BudgetExceeded
+    } else if results.iter().any(|result| {
+        matches!(
+            result.status,
+            WorkflowRunStatus::Pending | WorkflowRunStatus::Running
+        )
+    }) {
+        WorkflowRunStatus::Running
     } else if results
         .iter()
         .any(|result| result.status != WorkflowRunStatus::Succeeded)
@@ -1124,7 +1158,15 @@ fn aggregate_workflow_status(results: &[LeafResult]) -> WorkflowRunStatus {
 
 fn mark_execution_for_status(execution: &mut WorkflowExecution, status: WorkflowRunStatus) {
     match status {
-        WorkflowRunStatus::Succeeded | WorkflowRunStatus::Pending | WorkflowRunStatus::Running => {}
+        WorkflowRunStatus::Succeeded | WorkflowRunStatus::Pending => {}
+        WorkflowRunStatus::Running => {
+            if matches!(
+                execution.status,
+                WorkflowRunStatus::Succeeded | WorkflowRunStatus::Pending
+            ) {
+                execution.status = WorkflowRunStatus::Running;
+            }
+        }
         WorkflowRunStatus::Failed => execution.mark_failed(),
         WorkflowRunStatus::Cancelled => execution.mark_cancelled(),
         WorkflowRunStatus::BudgetExceeded => execution.mark_budget_exceeded(),
@@ -1574,6 +1616,8 @@ pub enum WorkflowExecutionError {
         field: &'static str,
         reference: String,
     },
+    #[error("leaf `{leaf}` execution failed: {message}")]
+    LeafExecutionFailed { leaf: String, message: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2144,13 +2188,19 @@ mod tests {
     #[derive(Default)]
     struct RecordingLeafRunner {
         leaves: Vec<String>,
+        inputs: Vec<(String, Vec<(String, Option<String>)>)>,
         conditions: BTreeMap<String, bool>,
         expansions: BTreeMap<String, Vec<WorkflowNode>>,
     }
 
     impl WorkflowLeafRunner for RecordingLeafRunner {
-        fn run_leaf(&mut self, spec: &LeafSpec) -> Result<LeafResult, WorkflowExecutionError> {
+        fn run_leaf(
+            &mut self,
+            spec: &LeafSpec,
+            inputs: &[(String, Option<String>)],
+        ) -> Result<LeafResult, WorkflowExecutionError> {
             self.leaves.push(spec.id.clone());
+            self.inputs.push((spec.id.clone(), inputs.to_vec()));
             Ok(LeafResult {
                 leaf_id: spec.id.clone(),
                 task_id: spec.id.clone(),
@@ -2203,16 +2253,30 @@ mod tests {
         })]);
         let mut runner = RecordingLeafRunner::default();
         runner.conditions.insert("needs-patch".to_string(), true);
-        runner.expansions.insert(
-            "split".to_string(),
-            vec![leaf_node("worker-a"), leaf_node("worker-b")],
-        );
+        let mut worker_a = leaf_node("worker-a");
+        let WorkflowNode::Leaf(worker_a_spec) = &mut worker_a else {
+            panic!("expected leaf");
+        };
+        worker_a_spec.depends_on_results = vec!["patch".to_string()];
+        runner
+            .expansions
+            .insert("split".to_string(), vec![worker_a, leaf_node("worker-b")]);
 
         let execution = WorkflowDriver::new(&mut runner)
             .run(&workflow)
             .expect("custom runner should execute workflow");
 
         assert_eq!(runner.leaves, vec!["patch", "worker-a"]);
+        assert_eq!(
+            runner.inputs,
+            vec![
+                ("patch".to_string(), Vec::new()),
+                (
+                    "worker-a".to_string(),
+                    vec![("patch".to_string(), Some("recorded leaf patch".to_string()))]
+                )
+            ]
+        );
         assert_eq!(
             execution
                 .leaf_results
@@ -2941,6 +3005,42 @@ mod tests {
                 .map(|result| result.usage.cost_microusd)
                 .collect::<Vec<_>>(),
             vec![500, 250]
+        );
+    }
+
+    #[test]
+    fn mock_executor_keeps_branch_running_when_leaf_is_running() {
+        let workflow = workflow_spec(vec![WorkflowNode::BranchSet(BranchSpec {
+            id: "dispatch".to_string(),
+            description: None,
+            parallel: true,
+            budget: BudgetSpec::default(),
+            permissions: PermissionSpec::default(),
+            model_policy: ModelPolicy::default(),
+            children: vec![leaf_node("worker-a"), leaf_node("worker-b")],
+        })]);
+
+        let mut executor = MockWorkflowExecutor::new().with_leaf_outcome(
+            "worker-a",
+            MockLeafOutcome {
+                status: WorkflowRunStatus::Running,
+                usage: WorkflowUsage::default(),
+                memo_usage: WorkflowMemoUsage::default(),
+                output: Some("agent_id=agent-worker-a status=running".to_string()),
+                artifacts: vec!["agent:agent-worker-a".to_string()],
+            },
+        );
+
+        let execution = executor.run(&workflow).expect("mock workflow should run");
+
+        assert_eq!(execution.status, WorkflowRunStatus::Running);
+        assert_eq!(
+            execution.branch_results[0].status,
+            WorkflowRunStatus::Running
+        );
+        assert_eq!(
+            control_result(&execution, "dispatch").status,
+            WorkflowRunStatus::Running
         );
     }
 

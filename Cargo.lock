@@ -1003,6 +1003,7 @@ dependencies = [
  "codewhale-release",
  "codewhale-secrets",
  "codewhale-tools",
+ "codewhale-whaleflow",
  "colored",
  "crossterm 0.28.1",
  "cucumber",

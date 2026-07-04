@@ -8,4 +8,5 @@ pub mod manager;
 pub mod profile;
 pub mod scheduler;
 pub mod task_spec;
+pub mod whaleflow_agent_executor;
 pub mod worker_runtime;
