@@ -1996,50 +1996,27 @@ impl Engine {
             .summary_block(&self.config.workspace)
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
+        let mut resource_metadata_lines = Vec::new();
+        self.append_resource_metadata_lines(
+            &mut resource_metadata_lines,
+            routed_model,
+            current_text,
+        );
 
-        let mut lines = vec![
-            format!("Current local date: {today}"),
-            // Workspace path moved here from the static `## Environment` block so
-            // the static system prefix stays byte-stable across sessions (see
-            // `render_environment_block` for the prefix-cache rationale).
-            format!("Current workspace: {}", self.config.workspace.display()),
-            format!("Current model: {routed_model}"),
-            format!("Current mode: {}", self.current_mode.as_setting()),
-            "Current mode policy source: runtime".to_string(),
-            format!(
-                "Current mode policy:\n{}",
-                Self::mode_runtime_instructions(self.current_mode)
-            ),
-            format!("Input provenance: {}", provenance.as_str()),
-            format!(
-                "Input authority: {}",
-                if provenance.can_authorize_work() {
-                    "external_current_turn"
-                } else {
-                    "non_authoritative"
-                }
-            ),
-        ];
-        if auto_model {
-            lines.push(format!("Auto model route: {routed_model}"));
-        }
-        if reasoning_effort_auto && let Some(reasoning_effort) = reasoning_effort {
-            lines.push(format!("Auto reasoning effort: {reasoning_effort}"));
-        }
-        if let Some(event) = policy_narrowing {
-            lines.push(format!("Policy narrowing: {}", event.reason().as_str()));
-            lines.push(format!("Policy narrowing status: {}", event.message()));
-        }
-        self.append_resource_metadata_lines(&mut lines, routed_model, current_text);
-        if let Some(working_set_summary) = working_set_summary {
-            lines.push(working_set_summary);
-        }
-        let summary = lines.join("\n");
-
-        ContentBlock::Text {
-            text: format!("<turn_meta>\n{summary}\n</turn_meta>"),
-            cache_control: None,
-        }
+        build_turn_metadata_block(TurnMetadataInput {
+            today,
+            workspace: &self.config.workspace,
+            routed_model,
+            mode: self.current_mode,
+            mode_instructions: Self::mode_runtime_instructions(self.current_mode),
+            provenance,
+            auto_model,
+            reasoning_effort,
+            reasoning_effort_auto,
+            policy_narrowing,
+            resource_metadata_lines,
+            working_set_summary,
+        })
     }
 
     fn user_text_message_with_turn_metadata(&self, text: String) -> Message {
@@ -3849,6 +3826,7 @@ use context::{
 use context::{context_input_budget_for_provider, effective_max_output_tokens};
 mod dispatch;
 mod lsp_hooks;
+mod prompt_turn_metadata;
 mod streaming;
 mod subagent_policy;
 mod token_estimate_cache;
@@ -3892,6 +3870,7 @@ use self::dispatch::{
 };
 #[cfg(test)]
 use self::lsp_hooks::edited_paths_for_tool;
+use self::prompt_turn_metadata::{TurnMetadataInput, build_turn_metadata_block};
 #[cfg(test)]
 use self::streaming::TOOL_CALL_START_MARKERS;
 use self::streaming::{
