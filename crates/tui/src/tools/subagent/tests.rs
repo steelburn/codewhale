@@ -1,4 +1,6 @@
 use super::*;
+use crate::tools::handle::HandleReadTool;
+use crate::tools::spec::ToolSpec;
 use crate::tools::{AgentToolSurfaceOptions, ToolRegistryBuilder};
 use crate::worker_profile::ShellPolicy;
 use axum::{Json, Router, http::StatusCode, response::IntoResponse, routing::post};
@@ -3215,10 +3217,13 @@ fn subagent_done_sentinel_format_is_well_formed() {
     let parsed: serde_json::Value = serde_json::from_str(inner).expect("inner JSON parses");
     assert_eq!(parsed["agent_id"], "agent_xyz");
     assert_eq!(parsed["status"], "completed");
-    assert_eq!(parsed["agent_type"], "general");
-    assert_eq!(parsed["summary_location"], "previous_line");
-    // issue #2652: a complete (non-truncated) summary is tagged as such.
-    assert_eq!(parsed["summary_kind"], "complete");
+    assert_eq!(parsed["verdict"], "completed");
+    assert_eq!(parsed["artifact_refs"]["transcript"], "agent:agent_xyz");
+    assert_eq!(parsed["files_changed"], json!([]));
+    assert_eq!(parsed["key_stats"]["steps"], 0);
+    assert!(parsed.get("agent_type").is_none());
+    assert!(parsed.get("summary_location").is_none());
+    assert!(parsed.get("summary_kind").is_none());
     assert!(parsed.get("details").is_none());
     assert!(parsed.get("result_clipped").is_none());
     assert!(parsed.get("summary_complete").is_none());
@@ -3238,8 +3243,9 @@ fn subagent_done_sentinel_keeps_large_result_out_of_metadata() {
         .trim_end_matches("</codewhale:subagent.done>");
     let parsed: serde_json::Value = serde_json::from_str(inner).expect("inner JSON parses");
     assert_eq!(parsed["agent_id"], "agent_big");
-    assert_eq!(parsed["summary_location"], "previous_line");
-    assert_eq!(parsed["summary_kind"], "complete");
+    assert_eq!(parsed["artifact_refs"]["transcript"], "agent:agent_big");
+    assert!(parsed.get("summary_location").is_none());
+    assert!(parsed.get("summary_kind").is_none());
     assert!(parsed.get("result_clipped").is_none());
     assert!(parsed.get("summary_complete").is_none());
     assert!(parsed.get("next_action").is_none());
@@ -3250,16 +3256,17 @@ fn subagent_done_sentinel_keeps_large_result_out_of_metadata() {
 }
 
 #[test]
-fn subagent_done_sentinel_marks_truncated_summaries() {
-    // issue #2652: when the child summary was length-gated, the sentinel must
-    // advertise summary_kind:"truncated" so the parent can steer verification.
+fn subagent_done_sentinel_keeps_truncation_state_out_of_compact_metadata() {
     let res = make_snapshot(SubAgentStatus::Completed);
     let sentinel = subagent_done_sentinel("agent_trunc", &res, true);
     let inner = sentinel
         .trim_start_matches("<codewhale:subagent.done>")
         .trim_end_matches("</codewhale:subagent.done>");
     let parsed: serde_json::Value = serde_json::from_str(inner).expect("inner JSON parses");
-    assert_eq!(parsed["summary_kind"], "truncated");
+    assert_eq!(parsed["agent_id"], "agent_trunc");
+    assert_eq!(parsed["artifact_refs"]["transcript"], "agent:agent_trunc");
+    assert!(parsed.get("summary_kind").is_none());
+    assert!(parsed.get("summary_location").is_none());
 }
 
 #[test]
@@ -4814,6 +4821,61 @@ fn subagent_completion_payload_compacts_large_reports_and_keeps_retrieval_refs()
         "single compact completion payload was {} bytes",
         completion.payload.len()
     );
+}
+
+#[tokio::test]
+async fn compact_completion_artifact_ref_reads_full_transcript_handle() {
+    let tmp = tempdir().expect("tempdir");
+    let mut runtime = stub_runtime();
+    runtime.context = ToolContext::new(tmp.path().to_path_buf());
+    runtime.manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 4);
+    let assignment = make_assignment();
+    let status = SubAgentStatus::Completed;
+    let result = Some("full child self-report with material details".to_string());
+    let messages = vec![Message {
+        role: "assistant".to_string(),
+        content: vec![ContentBlock::Text {
+            text: "full transcript body".to_string(),
+            cache_control: None,
+        }],
+    }];
+
+    let handle = insert_subagent_full_transcript_handle(
+        &runtime,
+        "agent_readable",
+        &SubAgentType::General,
+        &assignment,
+        &status,
+        result.as_ref(),
+        None,
+        &messages,
+        7,
+        11,
+        false,
+    )
+    .await;
+
+    let mut snap = make_snapshot(status);
+    snap.agent_id = "agent_readable".to_string();
+    snap.name = "agent_readable".to_string();
+    snap.result = result;
+    let completion = subagent_completion_from_result(&snap);
+    assert!(
+        completion
+            .payload
+            .contains("\"transcript\":\"agent:agent_readable\""),
+        "compact sentinel should point at the agent transcript handle"
+    );
+
+    let read = HandleReadTool
+        .execute(
+            json!({"handle": handle, "jsonpath": "$.messages[*].content[*].text"}),
+            &runtime.context,
+        )
+        .await
+        .expect("handle_read executes");
+    let body: serde_json::Value = serde_json::from_str(&read.content).expect("json body");
+    assert_eq!(body["matches"], json!(["full transcript body"]));
 }
 
 #[test]
