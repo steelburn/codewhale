@@ -56,6 +56,10 @@ pub trait LspTransport: Send + Sync {
         wait: Duration,
     ) -> Result<Vec<Diagnostic>>;
 
+    /// Send a request and wait for the JSON-RPC response. Returns the
+    /// response `result`; JSON-RPC errors are converted to `Err`.
+    async fn request(&self, method: &str, params: Value, wait: Duration) -> Result<Value>;
+
     /// Best-effort shutdown. Called via `LspManager::shutdown_all`.
     #[allow(dead_code)]
     async fn shutdown(&self);
@@ -189,6 +193,41 @@ impl StdioLspTransport {
             opened: AsyncMutex::new(HashMap::new()),
         })
     }
+
+    async fn request_inner(&self, method: &str, params: Value, wait: Duration) -> Result<Value> {
+        let mut next_id = self.next_id.lock().await;
+        let id = *next_id;
+        *next_id += 1;
+        drop(next_id);
+
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().await.insert(id, tx);
+
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        });
+        if let Err(err) = send_message(&self.tx_outbound, &payload).await {
+            self.pending.lock().await.remove(&id);
+            return Err(err);
+        }
+
+        let response = match timeout(wait, rx).await {
+            Ok(Ok(value)) => value,
+            Ok(Err(_)) => return Err(anyhow!("LSP response channel closed")),
+            Err(_) => {
+                self.pending.lock().await.remove(&id);
+                return Err(anyhow!("LSP request `{method}` timed out"));
+            }
+        };
+
+        if let Some(error) = response.get("error") {
+            return Err(anyhow!("LSP request `{method}` failed: {error}"));
+        }
+        Ok(response.get("result").cloned().unwrap_or(Value::Null))
+    }
 }
 
 #[async_trait]
@@ -276,6 +315,10 @@ impl LspTransport for StdioLspTransport {
             let _ = c.start_kill();
             let _ = c.wait().await;
         }
+    }
+
+    async fn request(&self, method: &str, params: Value, wait: Duration) -> Result<Value> {
+        self.request_inner(method, params, wait).await
     }
 }
 
@@ -413,7 +456,7 @@ fn parse_publish_diagnostics(value: &Value) -> Option<(PathBuf, Vec<Diagnostic>)
 /// support Windows drive letters perfectly, but the LSP servers in our
 /// registry accept percent-encoded paths well enough for the post-edit
 /// diagnostics use case.
-fn uri_from_path(path: &Path) -> String {
+pub(crate) fn uri_from_path(path: &Path) -> String {
     let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let s = canonical.to_string_lossy();
     if s.starts_with('/') {
@@ -424,7 +467,7 @@ fn uri_from_path(path: &Path) -> String {
 }
 
 /// Inverse of [`uri_from_path`]. Returns `None` when the URI is not a `file://`.
-fn path_from_uri(uri: &str) -> Option<PathBuf> {
+pub(crate) fn path_from_uri(uri: &str) -> Option<PathBuf> {
     let stripped = uri.strip_prefix("file://")?;
     Some(PathBuf::from(stripped))
 }

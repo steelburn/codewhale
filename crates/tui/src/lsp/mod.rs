@@ -38,6 +38,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context;
 use serde::Deserialize;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::timeout;
@@ -208,6 +209,36 @@ impl LspManager {
         };
 
         self.poll_diagnostics(file, &text, transport).await
+    }
+
+    /// Send a model-facing LSP request for `file`, after best-effort syncing
+    /// the current file text with didOpen/didChange.
+    pub async fn request_for_file(
+        &self,
+        file: &Path,
+        method: &str,
+        params: serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        if !self.config.enabled {
+            anyhow::bail!("LSP is disabled");
+        }
+        let lang = registry::detect_language(file);
+        if lang == Language::Other {
+            anyhow::bail!("No LSP server is configured for {}", file.display());
+        }
+        let text = tokio::fs::read_to_string(file)
+            .await
+            .with_context(|| format!("failed to read {}", file.display()))?;
+        let transport = self
+            .transport_for(lang)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("No LSP transport for {}", lang.as_key()))?;
+        let _ = transport
+            .diagnostics_for(file, &text, Duration::from_millis(1))
+            .await;
+        transport
+            .request(method, params, Duration::from_secs(10))
+            .await
     }
 
     /// Shared diagnostics polling: send didOpen/didChange, wait, filter,
@@ -459,6 +490,16 @@ pub(crate) mod tests {
         ) -> anyhow::Result<Vec<Diagnostic>> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             Ok(self.items.clone())
+        }
+
+        async fn request(
+            &self,
+            _method: &str,
+            _params: serde_json::Value,
+            _wait: Duration,
+        ) -> anyhow::Result<serde_json::Value> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(serde_json::Value::Null)
         }
 
         async fn shutdown(&self) {}

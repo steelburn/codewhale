@@ -608,6 +608,13 @@ impl ToolRegistryBuilder {
         self.with_tool(Arc::new(DiagnosticsTool))
     }
 
+    /// Include model-facing LSP navigation/refactor operations.
+    #[must_use]
+    pub fn with_lsp_tool(self) -> Self {
+        use super::lsp::LspTool;
+        self.with_tool(Arc::new(LspTool))
+    }
+
     /// Include the `pandoc_convert` tool only when the `pandoc`
     /// binary is present on this host. Same probe-then-decide
     /// pattern v0.8.31 introduced for Python — when pandoc is
@@ -981,6 +988,7 @@ impl ToolRegistryBuilder {
             .with_git_tools()
             .with_git_history_tools()
             .with_diagnostics_tool()
+            .with_lsp_tool()
             .with_project_tools()
             .with_skill_tools()
             .with_test_runner_tool()
