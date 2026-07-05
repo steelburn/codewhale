@@ -18,7 +18,7 @@ export interface RepoFacts {
 }
 
 export const FACTS: RepoFacts = {
-  "generatedAt": "2026-07-05T04:55:28.855Z",
+  "generatedAt": "2026-07-05T05:08:38.020Z",
   "version": "0.8.67",
   "crates": [
     "agent",
@@ -189,6 +189,11 @@ export const FACTS: RepoFacts = {
       "id": "sakana",
       "label": "Sakana AI",
       "env": "FUGU_API_KEY / SAKANA_API_KEY"
+    },
+    {
+      "id": "longcat",
+      "label": "LongCat",
+      "env": "LONGCAT_API_KEY"
     }
   ],
   "defaultModel": "deepseek-v4-pro",
