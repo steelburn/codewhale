@@ -1721,6 +1721,7 @@ pub(super) fn apply_reasoning_effort(
             }
             ApiProvider::Stepfun => {}
             ApiProvider::Sakana => {}
+            ApiProvider::LongCat => {}
         },
         "low" | "minimal" | "medium" | "mid" | "high" | "" => match provider {
             // DeepSeek compatibility: low/medium both map to high
@@ -1810,6 +1811,7 @@ pub(super) fn apply_reasoning_effort(
             }
             ApiProvider::Stepfun => {}
             ApiProvider::Sakana => {}
+            ApiProvider::LongCat => {}
         },
         "xhigh" | "max" | "highest" | "ultracode" => match provider {
             ApiProvider::Deepseek
@@ -1879,6 +1881,7 @@ pub(super) fn apply_reasoning_effort(
             }
             ApiProvider::Stepfun => {}
             ApiProvider::Sakana => {}
+            ApiProvider::LongCat => {}
         },
         _ => {}
     }
