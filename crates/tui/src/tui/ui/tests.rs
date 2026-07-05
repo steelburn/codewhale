@@ -5779,6 +5779,7 @@ fn custom_update_uri_accepts_tag_only_release_json() {
     let hint = version_hint_from_custom_release_json(&json, "0.8.46")
         .expect("tag-only custom metadata should be enough for mirrors");
     assert!(hint.contains("v0.8.47 available"));
+    assert!(hint.contains("/change 0.8.47"));
 }
 
 #[test]

@@ -58,6 +58,29 @@ a familiar declaration format, not a second execution runtime.
 
 Current example: `workflows/issue_audit.workflow.js`.
 
+## Runtime `whaleflow` tool and Fleet profiles
+
+The model-facing `whaleflow` tool is a sandboxed JavaScript host for dynamic
+workflows inside one turn. It exposes `task({...})`, `tools.<name>(...)`,
+`budget`, `parallel(...)`, `pipeline(...)`, and `log(...)`; it does **not** grant
+direct filesystem, shell, network, provider, or TUI authority. `tools.*` calls go
+through the same approval and sandbox rules as ordinary tool calls from the
+calling context.
+
+Fleet party profiles are available by id:
+
+```js
+await task({
+  description: "Review this patch for release risk",
+  subagentType: "review",
+  profile: "reviewer",
+});
+```
+
+The `profile` field uses the same `.codewhale/agents/<id>.toml` files shown by
+`/fleet party`; model pins and ranked `models = [...]` are resolved against the
+active provider before spawn.
+
 ## Agent-Written Fleet Workflows
 
 The primary product flow is not "ask the user to write a script." The main

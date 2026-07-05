@@ -578,7 +578,29 @@ fn term_score(term: &str, label: &str, description: &str, command: &str, haystac
         return 96;
     }
 
-    128
+    subsequence_match_score(haystack, term).map_or(128, |score| 160 + score)
+}
+
+fn subsequence_match_score(haystack: &str, term: &str) -> Option<usize> {
+    if term.is_empty() {
+        return Some(0);
+    }
+
+    let mut iter = haystack.char_indices();
+    let mut first_idx = None;
+    let mut last_idx = 0usize;
+    for wanted in term.chars() {
+        let (idx, _) = iter.find(|(_, ch)| *ch == wanted)?;
+        first_idx.get_or_insert(idx);
+        last_idx = idx;
+    }
+
+    let first_idx = first_idx.unwrap_or(0);
+    Some(first_idx + last_idx.saturating_sub(first_idx))
+}
+
+fn term_matches(term: &str, entry_text: &str) -> bool {
+    entry_text.contains(term) || subsequence_match_score(entry_text, term).is_some()
 }
 
 fn entry_match_score(entry: &CommandPaletteEntry, terms: &[&str]) -> Option<usize> {
@@ -599,14 +621,14 @@ fn entry_match_score(entry: &CommandPaletteEntry, terms: &[&str]) -> Option<usiz
             if entry.section != required_section {
                 return None;
             }
-            if !entry_text.contains(&scoped_query) {
+            if !term_matches(&scoped_query, &entry_text) {
                 return None;
             }
             total_score += term_score(&scoped_query, &label, &description, &command, &entry_text);
             continue;
         }
 
-        if !entry_text.contains(term) {
+        if !term_matches(term, &entry_text) {
             return None;
         }
         total_score += term_score(term, &label, &description, &command, &entry_text);
@@ -1155,6 +1177,43 @@ mod tests {
 
         assert_eq!(view.entries[view.filtered[0]].label, "/git");
         assert_eq!(view.entries[view.filtered[1]].label, "/config");
+    }
+
+    #[test]
+    fn command_palette_supports_subsequence_matching_without_beating_substrings() {
+        let entries = vec![
+            palette_entry(
+                PaletteSection::Command,
+                "/compact",
+                "compact context",
+                "/compact",
+            ),
+            palette_entry(
+                PaletteSection::Command,
+                "/compare",
+                "compare files",
+                "/compare",
+            ),
+            palette_entry(
+                PaletteSection::Command,
+                "/cache",
+                "cache telemetry",
+                "/cache",
+            ),
+        ];
+        let mut view = CommandPaletteView::new(entries);
+
+        view.query = "cmpat".to_string();
+        view.refilter();
+
+        assert_eq!(view.filtered.len(), 1);
+        assert_eq!(view.entries[view.filtered[0]].label, "/compact");
+
+        view.query = "comp".to_string();
+        view.refilter();
+
+        assert_eq!(view.entries[view.filtered[0]].label, "/compact");
+        assert_eq!(view.entries[view.filtered[1]].label, "/compare");
     }
 
     #[test]

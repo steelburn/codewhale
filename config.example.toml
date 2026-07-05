@@ -1122,6 +1122,20 @@ default_text_model = "deepseek-ai/deepseek-v4-pro"
 # # Output format: "text" (default) or "stream-json" for ndjson events
 # output_format = "text"
 #
+# # Saved Fleet party profiles live in workspace `.codewhale/agents/<id>.toml`.
+# # Example profile file (not inside config.toml):
+# #
+# #   id = "reviewer"
+# #   display_name = "Reviewer"
+# #   role_hint = "reviewer"
+# #   model_class_hint = "heavy"                 # fast | heavy | omni | custom token
+# #   models = ["glm-5.2", "deepseek-v4-pro"]    # best first; `model = "x"` is shorthand
+# #
+# #   [tools]
+# #   posture = "read-only"
+# #
+# # `/fleet party` shows the active pick and any fallback to the class route.
+#
 # # Built-in role presets are always available: smoke-runner, reviewer, builder, read-only.
 # # User-defined roles here override or extend the built-in set. Any key under
 # # [fleet.roles] becomes a valid role name that task specs can reference.

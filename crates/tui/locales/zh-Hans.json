@@ -261,6 +261,7 @@
   "HomePlanModeTip": "Plan 模式 - 先设计再实现",
   "HomePlanModeChecklistTip": "  使用 /mode plan 创建结构化检查清单",
   "HomeGoalModeTip": "Goal 跟踪 - 设置 /goal <目标> 以跟踪持久目标",
+  "FeatureIntroContent": "CodeWhale 设置已就绪。\n\n• 宪法 — 用 `/constitution` 查看或个性化长期指导；随时可运行 `/setup` 完整检查点。\n• 服务商与模型 — 稍后可用 `/provider` 或 `/model` 调整当前路线。\n• Fleet — 用 `/fleet setup` 创建队伍档案，用 `/fleet party` 查看当前名册。\n• WhaleFlow — `whaleflow` 工具可运行带边界的脚本，支持 `task()`、`parallel()`，并沿用正常工具批准。\n• 稍后可选 — 用 `/hotbar` 配置 Hotbar 快捷键（`/hotbar off` 隐藏）；用 `/change` 查看当前版本说明。\n\n此提示不会再次显示。",
   "OnboardLanguageTitle": "选择语言",
   "OnboardLanguageBlurb": "选择界面语言。可随时使用 `/settings set locale <tag>` 修改。",
   "OnboardLanguageFooter": "按 1-8 选择，或按 Enter 保留当前设置",

@@ -54,6 +54,31 @@ field: set `model = "<model id>"` in the profile (or via the wizard's model
 draft) to pin a slot to a specific model; otherwise the slot follows its
 class/loadout on the active route.
 
+### Profile file example
+
+`/fleet setup` writes one TOML file per party member under
+`.codewhale/agents/<id>.toml`. You can review or author the same shape by hand:
+
+```toml
+id = "reviewer"
+display_name = "Reviewer"
+description = "Read-only code and release-note reviewer"
+role_hint = "reviewer"
+model_class_hint = "heavy"                 # fast | heavy | omni | custom token
+models = ["glm-5.2", "deepseek-v4-pro"]    # best first; optional
+
+[instructions]
+text = "Check evidence, report risks, and do not modify files."
+
+[tools]
+posture = "read-only"
+```
+
+Use `model = "<model id>"` when there is only one pinned preference; use
+`models = [...]` when you want an ordered fallback list. Profiles do not select
+providers — they only express role, tool posture, and model intent for the
+active session route.
+
 ### Ranked model preferences (`models = [...]`)
 
 A profile may rank several models instead of pinning one:

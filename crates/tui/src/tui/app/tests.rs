@@ -45,7 +45,7 @@ fn create_dir_symlink(target: &std::path::Path, link: &std::path::Path) -> std::
 
 #[test]
 fn feature_intro_content_centers_constitution_follow_up() {
-    let content = App::feature_intro_content();
+    let content = App::feature_intro_content(Locale::En);
     assert!(content.contains("Your CodeWhale setup is ready."));
     assert!(content.contains("Constitution"));
     assert!(content.contains("/constitution"));
@@ -54,6 +54,17 @@ fn feature_intro_content_centers_constitution_follow_up() {
     assert!(content.contains("Optional later"));
     assert!(content.contains("/hotbar") && content.contains("/hotbar off"));
     assert!(content.contains("Fleet") && content.contains("/fleet setup"));
+    assert!(content.contains("/fleet party"));
+    assert!(content.contains("WhaleFlow") && content.contains("whaleflow"));
+    assert!(content.contains("/change"));
+}
+
+#[test]
+fn feature_intro_content_is_localized_for_zh_hans() {
+    let content = App::feature_intro_content(Locale::ZhHans);
+    assert!(content.contains("CodeWhale 设置已就绪"));
+    assert!(content.contains("/fleet party"));
+    assert!(content.contains("whaleflow"));
 }
 
 #[test]
@@ -551,6 +562,7 @@ fn cny_display_keeps_cny_when_costs_have_cny_rates() {
 fn cny_cache_savings_falls_back_to_usd_for_usd_only_models() {
     let mut app = App::new(test_options(false), &Config::default());
     app.cost_currency = CostCurrency::Cny;
+    app.api_provider = ApiProvider::Moonshot;
     app.model = "kimi-k2.6".to_string();
     app.session.last_prompt_cache_hit_tokens = Some(1_000_000);
 

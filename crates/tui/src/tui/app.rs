@@ -3008,20 +3008,15 @@ impl App {
             // Still show the nudge; the flag write may simply retry next launch.
         }
         self.add_message(HistoryCell::System {
-            content: Self::feature_intro_content(),
+            content: Self::feature_intro_content(self.ui_locale),
         });
         self.needs_redraw = true;
     }
 
     /// The one-time first-run follow-up copy. Plain language, no
     /// marketing. Pure so it can be unit-tested without touching disk or env.
-    pub(crate) fn feature_intro_content() -> String {
-        "Your CodeWhale setup is ready.\n\n\
-         • Constitution — review or personalize standing guidance with `/constitution`; run `/setup` for the full checkpoint any time.\n\
-         • Provider and model — adjust the active route later with `/provider` or `/model`.\n\
-         • Optional later — use `/hotbar` for Hotbar shortcuts (`/hotbar off` hides it) and `/fleet setup` for Fleet loadouts.\n\n\
-         This tip won't show again."
-            .to_string()
+    pub(crate) fn feature_intro_content(locale: Locale) -> String {
+        tr(locale, MessageId::FeatureIntroContent).into_owned()
     }
 
     /// Apply a locale tag selected from the onboarding language picker (#566).

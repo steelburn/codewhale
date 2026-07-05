@@ -12772,7 +12772,7 @@ fn version_hint_from_latest_tag(tag: &str, current: &str) -> Option<String> {
     }
 
     Some(format!(
-        "v{latest} available - run `codewhale update` and restart"
+        "v{latest} available - run `codewhale update` and restart; see `/change {latest}` for what changed"
     ))
 }
 

@@ -327,6 +327,7 @@ pub enum MessageId {
     HomePlanModeTip,
     HomePlanModeChecklistTip,
     HomeGoalModeTip,
+    FeatureIntroContent,
     // Onboarding screens — language picker.
     OnboardLanguageTitle,
     OnboardLanguageBlurb,
@@ -935,6 +936,7 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::HomePlanModeTip,
     MessageId::HomePlanModeChecklistTip,
     MessageId::HomeGoalModeTip,
+    MessageId::FeatureIntroContent,
     MessageId::OnboardLanguageTitle,
     MessageId::OnboardLanguageBlurb,
     MessageId::OnboardLanguageFooter,

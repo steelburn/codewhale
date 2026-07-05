@@ -200,40 +200,36 @@ worker records a typed receipt (`pass` / `fail` / `partial` / `skip` /
 
 Workers are shaped by **roles**, **profiles**, **loadouts**, and **slots**,
 configured under `[fleet]` in your config or authored from the in-app Fleet
-setup view. Loadouts express model intent as a class — `strong`, `balanced`, or
-`fast` — and the route resolver turns that into a concrete provider/model. This
-is the same headless runtime that backs in-session sub-agents; Fleet is the
+setup view. Loadouts express model intent as a class — `fast`, `heavy`, `omni`,
+or `custom` — and the route resolver turns that into a concrete provider/model.
+Saved party profiles live under `.codewhale/agents/`; `/fleet party` shows the
+active roster, including ranked model preferences such as
+`models = ["glm-5.2", "deepseek-v4-pro"]` and any fallback to the class route.
+This is the same headless runtime that backs in-session sub-agents; Fleet is the
 durable layer on top. See [docs/FLEET.md](docs/FLEET.md).
 
 ## WhaleFlow
 
-WhaleFlow is validated multi-agent orchestration. You (or the agent itself)
-author a workflow — in a declarative JS/TS subset, Starlark, or plain JSON —
-and it compiles to a typed Rust `WorkflowSpec` that is validated before
-anything runs: dependency cycles, duplicate nodes, loops without
-`max_iterations`, and unbounded `expand` nodes are all rejected. Launch
-validation bounds the population at **100 worker agents per run and 5
-recursive Fleet rings**, so a workflow can fan out without running away.
+WhaleFlow is CodeWhale's dynamic-workflow tool for bounded orchestration from a
+model turn. Scripts run in a sandboxed JavaScript host with no direct filesystem,
+network, shell, or provider authority; they can only call the explicit host
+surface the current context exposes: `task({...})` for sub-agent fan-out,
+`tools.<name>(...)` for normal tool calls, live `budget` helpers, and
+`parallel(...)` / `pipeline(...)` for orchestration.
 
 ```js
-export default workflow({
-  "id": "issue-audit",
-  "goal": "Audit an issue fix with parallel agents",
-  "nodes": [
-    { "branch": { "id": "audit", "children": [
-      { "agent": { "id": "code-audit", "prompt": "Review code", "agent_type": "review" } },
-      { "agent": { "id": "test-audit", "prompt": "Review tests", "agent_type": "verifier" } }
-    ] } },
-    { "reduce": { "id": "summary", "inputs": ["code-audit", "test-audit"], "prompt": "Summarize" } }
-  ]
-});
+const results = await parallel([
+  () => task({ description: "review docs", subagentType: "review", profile: "reviewer" }),
+  () => tools.write_file({ path: ".codewhale/scratch/summary.txt", content: "done\n" }),
+]);
+return { count: results.length };
 ```
 
-Workflow source is a declaration format, not a second runtime — the compiler
-rejects `import`, `fetch`, `async`, and file I/O outright. WhaleFlow owns the
-plan (branches, loops, reducers); Fleet owns the durable execution (slots,
-models, receipts, resume). See
-[docs/WHALEFLOW_AUTHORING.md](docs/WHALEFLOW_AUTHORING.md).
+Every `tools.*` call keeps the caller's normal approval and sandbox posture, and
+`task({ profile: "reviewer" })` uses the same Fleet party profiles that
+`/fleet party` lists. Older declarative WorkflowSpec authoring still exists for
+durable Fleet plans; use [docs/WHALEFLOW_AUTHORING.md](docs/WHALEFLOW_AUTHORING.md)
+for the exact accepted shapes and limits.
 
 ## Safety
 

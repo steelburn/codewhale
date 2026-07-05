@@ -55,6 +55,7 @@ pub fn run_update(beta: bool, check_only: bool, proxy_arg: Option<String>) -> Re
         println!("Latest {} release: {latest_tag}", channel.label());
         if update_is_needed(channel, current_version, &latest_tag)? {
             println!("Update available. Run `codewhale update` to install {latest_tag}.");
+            println!("{}", release_notes_hint(&latest_tag));
         } else {
             match compare_release_versions(current_version, &latest_tag)? {
                 Ordering::Greater => {
@@ -165,12 +166,15 @@ pub fn run_update(beta: bool, check_only: bool, proxy_arg: Option<String>) -> Re
         "\n✅ Successfully updated to {latest_tag}!\n\
          Updated binaries:\n{}\n\
          \n\
+         {release_notes}\n\
+         \n\
          Restart the application to use the new version.",
         downloads
             .iter()
             .map(|(path, asset, _)| format!("  - {} ({asset})", path.display()))
             .collect::<Vec<_>>()
-            .join("\n")
+            .join("\n"),
+        release_notes = release_notes_hint(latest_tag)
     );
 
     Ok(())
@@ -204,6 +208,13 @@ pub(crate) fn is_legacy_binary(current_exe: &Path) -> bool {
         .unwrap_or("")
         .to_ascii_lowercase();
     exe_name.starts_with("deepseek")
+}
+
+fn release_notes_hint(tag: &str) -> String {
+    let version = tag.trim_start_matches('v');
+    format!(
+        "What changed: run `/change {version}` in CodeWhale, or read https://github.com/Hmbown/CodeWhale/releases/tag/{tag}"
+    )
 }
 
 fn legacy_binary_message(current_exe: &Path) -> String {
@@ -1129,6 +1140,14 @@ mod tests {
         assert!(message.contains("cargo install codewhale-tui --locked"));
         assert!(message.contains("brew upgrade deepseek-tui"));
         assert!(message.contains("https://github.com/Hmbown/CodeWhale/releases/latest"));
+    }
+
+    #[test]
+    fn release_notes_hint_points_to_in_app_change_command() {
+        let hint = release_notes_hint("v0.8.67");
+
+        assert!(hint.contains("/change 0.8.67"));
+        assert!(hint.contains("https://github.com/Hmbown/CodeWhale/releases/tag/v0.8.67"));
     }
 
     #[test]
