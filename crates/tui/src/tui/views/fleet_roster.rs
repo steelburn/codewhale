@@ -178,7 +178,7 @@ impl ModalView for FleetRosterView {
 
         let block = Block::default()
             .title(Line::from(Span::styled(
-                " Fleet roster — your agent team ",
+                " Fleet roster — your operator's team ",
                 Style::default()
                     .fg(palette::WHALE_ACCENT_PRIMARY)
                     .add_modifier(Modifier::BOLD),
@@ -208,11 +208,14 @@ impl ModalView for FleetRosterView {
             .split(content);
         let header = vec![
             Line::from(Span::styled(
-                "The saved party",
+                format!(
+                    "Operator: {} · {}  (change via /model)",
+                    self.operator.model, self.operator.provider
+                ),
                 Style::default().fg(palette::DEEPSEEK_SKY).bold(),
             )),
             Line::from(Span::styled(
-                "Built-ins < config [fleet.profiles] < project .codewhale/agents. s edits.",
+                "This is your operator's team. Built-ins < config [fleet.profiles] < project .codewhale/agents. s edits.",
                 Style::default().fg(palette::TEXT_MUTED),
             )),
         ];
@@ -267,7 +270,7 @@ impl FleetRosterView {
             let pointer = if is_selected { "> " } else { "  " };
             let (text, base_style) = if idx == 0 {
                 (
-                    format!("{pointer}operator  [session]"),
+                    format!("{pointer}operator · {}  [session]", self.operator.model),
                     Style::default()
                         .fg(palette::WHALE_ACCENT_PRIMARY)
                         .add_modifier(Modifier::BOLD),

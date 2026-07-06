@@ -878,11 +878,18 @@ impl ModelPickerView {
         // wraps instead of clipping at narrow widths (#3732).
         let outer = Block::default()
             .title(Line::from(Span::styled(
-                " Model & thinking ",
+                " Operator model & thinking ",
                 Style::default()
                     .fg(palette::DEEPSEEK_SKY)
                     .add_modifier(Modifier::BOLD),
             )))
+            .title_bottom(
+                Line::from(Span::styled(
+                    " this is your Fleet operator · /fleet builds its team ",
+                    Style::default().fg(palette::TEXT_MUTED),
+                ))
+                .alignment(ratatui::layout::Alignment::Center),
+            )
             .borders(Borders::ALL)
             .border_style(Style::default().fg(palette::BORDER_COLOR))
             .style(Style::default().bg(palette::DEEPSEEK_INK));
@@ -927,9 +934,9 @@ impl ModelPickerView {
             model_rows.push((label, hint));
         }
         let model_title = if self.query.trim().is_empty() {
-            "Model".to_string()
+            "Operator model".to_string()
         } else {
-            format!("Model: {}", self.query.trim())
+            format!("Operator model: {}", self.query.trim())
         };
         self.render_pane(
             layout.list,
@@ -2178,7 +2185,7 @@ mod tests {
             }
             // The shared list/detail layout keeps both picker panes visible;
             // narrow blocker sizes stack them instead of squeezing columns.
-            for label in ["Model", "Thinking"] {
+            for label in ["Operator model", "Thinking"] {
                 assert!(text.contains(label), "{w}x{h}: missing '{label}' pane");
             }
             // Composited frame is fully opaque: no sentinel survives and the
