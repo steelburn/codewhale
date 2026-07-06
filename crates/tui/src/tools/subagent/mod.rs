@@ -5972,15 +5972,11 @@ fn spawn_model_route(
     {
         return ModelRoute::Fixed(model.to_string());
     }
-    match member.profile.loadout {
-        codewhale_config::FleetLoadout::Fast => ModelRoute::Faster,
-        // Inherit and the richer loadout classes (strong/balanced/...) all
-        // inherit the parent model here. The fleet dispatcher maps those
-        // classes to Auto, but in this seam Auto routes to the cheap sibling —
-        // a silent downgrade for e.g. a "strong" member. Inheriting keeps the
-        // existing non-profile default behavior.
-        _ => ModelRoute::Inherit,
-    }
+    // Model classes are retired: an unpinned member inherits the operator/
+    // session model. Concrete per-slot model selection (handled above via
+    // `member.profile.model` -> Fixed) is the only way to run a slot on a
+    // different model. No silent class-based downgrade/upgrade.
+    ModelRoute::Inherit
 }
 
 /// Effective absolute `max_spawn_depth` for a child, combining the inherited

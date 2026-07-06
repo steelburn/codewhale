@@ -1258,7 +1258,7 @@ fn test_apply_spawn_profile_accepts_agreeing_explicit_type() {
 }
 
 #[test]
-fn test_apply_spawn_profile_scout_yields_explore_type_and_faster_route() {
+fn test_apply_spawn_profile_scout_yields_explore_type_and_inherits_operator() {
     let roster = FleetRoster::built_ins_only();
     let mut request = parse_spawn_request(&json!({"prompt": "map the parser", "profile": "scout"}))
         .expect("parse");
@@ -1268,8 +1268,8 @@ fn test_apply_spawn_profile_scout_yields_explore_type_and_faster_route() {
     assert_eq!(request.agent_type, SubAgentType::Explore);
     assert_eq!(
         spawn_model_route(&request, Some(&member)),
-        ModelRoute::Faster,
-        "scout's fast loadout routes to the faster sibling"
+        ModelRoute::Inherit,
+        "an unpinned scout inherits the operator model; model classes no longer route"
     );
 }
 
@@ -1325,15 +1325,15 @@ fn test_spawn_model_route_profile_precedence() {
         ModelRoute::Fixed("deepseek-v4-flash".to_string())
     );
 
-    // Without a model pin, the loadout decides: fast -> Faster, other
-    // loadouts inherit rather than auto-downgrade to the cheap sibling.
+    // Without a model pin, model classes are retired: every loadout inherits
+    // the operator model. No auto-downgrade to a cheap sibling.
     let mut fast = custom_fleet_profile("scout");
     fast.loadout = codewhale_config::FleetLoadout::Fast;
     let roster = fleet_roster_with("recon", fast);
     let request = parse_spawn_request(&json!({"prompt": "x", "profile": "recon"})).expect("parse");
     assert_eq!(
         spawn_model_route(&request, roster.get("recon")),
-        ModelRoute::Faster
+        ModelRoute::Inherit
     );
 
     let mut strong = custom_fleet_profile("builder");

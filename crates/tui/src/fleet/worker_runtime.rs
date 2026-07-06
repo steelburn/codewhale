@@ -63,15 +63,13 @@ pub fn fleet_task_to_worker_spec_with_profiles(
     let tool_profile = fleet_tool_profile(worker_profile);
     let objective = fleet_task_prompt_with_profile(task_spec, agent_profile);
     let max_spawn_depth = codewhale_config::FleetExecConfig::default().max_spawn_depth;
-    let loadout = effective_fleet_loadout(worker_profile, agent_profile);
     let effective_model = effective_fleet_model(model, worker_profile, agent_profile);
-    let mut requested_runtime = fleet_worker_runtime_profile_for_loadout(
+    let mut requested_runtime = fleet_worker_runtime_profile(
         &agent_type,
         &tool_profile,
         &effective_model,
         0,
         max_spawn_depth,
-        &loadout,
     );
     if let Some(agent_profile) = agent_profile
         && let Some(profile_depth) = agent_profile.profile.delegation.max_spawn_depth
@@ -163,11 +161,7 @@ pub(crate) fn resolve_fleet_route(
         loadout: loadout_intent_label(&loadout),
         model_class,
         model_route: Some(
-            model_route_label(&fleet_model_route_for_loadout(
-                model_selector.unwrap_or("auto"),
-                &loadout,
-            ))
-            .to_string(),
+            model_route_label(&fleet_model_route(model_selector.unwrap_or("auto"))).to_string(),
         ),
         // The offline resolver path does not know the concrete sub-agent
         // thinking tier. Leave it absent rather than fabricating one.
@@ -350,13 +344,6 @@ fn effective_fleet_role_with_source(
         })
 }
 
-fn effective_fleet_loadout(
-    worker_profile: Option<&FleetTaskWorkerProfile>,
-    agent_profile: Option<&AgentProfile>,
-) -> codewhale_config::FleetLoadout {
-    effective_fleet_loadout_with_source(worker_profile, agent_profile).0
-}
-
 fn effective_fleet_loadout_with_source(
     worker_profile: Option<&FleetTaskWorkerProfile>,
     agent_profile: Option<&AgentProfile>,
@@ -495,32 +482,10 @@ fn fleet_worker_runtime_profile(
         AgentWorkerToolProfile::Inherited => ToolScope::Inherit,
         AgentWorkerToolProfile::Explicit(tools) => ToolScope::Explicit(tools.clone()),
     };
-    profile.model = if model == "auto" {
-        ModelRoute::Auto
-    } else {
-        ModelRoute::Fixed(model.to_string())
-    };
+    // Concrete pin -> Fixed; unset/"auto" -> Inherit (follow the operator).
+    profile.model = fleet_model_route(model);
     profile.max_spawn_depth = max_spawn_depth.saturating_sub(spawn_depth);
     profile.background = true;
-    profile
-}
-
-fn fleet_worker_runtime_profile_for_loadout(
-    agent_type: &SubAgentType,
-    tool_profile: &AgentWorkerToolProfile,
-    model: &str,
-    spawn_depth: u32,
-    max_spawn_depth: u32,
-    loadout: &codewhale_config::FleetLoadout,
-) -> WorkerRuntimeProfile {
-    let mut profile = fleet_worker_runtime_profile(
-        agent_type,
-        tool_profile,
-        model,
-        spawn_depth,
-        max_spawn_depth,
-    );
-    profile.model = fleet_model_route_for_loadout(model, loadout);
     profile
 }
 
@@ -529,26 +494,22 @@ fn non_empty_trimmed(value: &str) -> Option<&str> {
     (!trimmed.is_empty()).then_some(trimmed)
 }
 
-pub(crate) fn fleet_model_route_for_loadout(
-    model: &str,
-    loadout: &codewhale_config::FleetLoadout,
-) -> ModelRoute {
+/// Resolve a fleet slot's model route. Model selection is operator-centric and
+/// concrete: a slot either pins an explicit model (`Fixed`) or inherits the
+/// operator/session model (`Inherit`). The legacy `FleetLoadout` model classes
+/// (fast/balanced/strong/…) are retired and no longer influence routing — a
+/// `loadout` param is retained only where a caller still threads one through,
+/// and is ignored. If a user wants a cheaper or stronger model for a slot, they
+/// pick it explicitly rather than relying on class magic.
+pub(crate) fn fleet_model_route(model: &str) -> ModelRoute {
     let model = model.trim();
     if !model.is_empty() && !model.eq_ignore_ascii_case("auto") {
-        return ModelRoute::Fixed(model.to_string());
-    }
-    match loadout {
-        codewhale_config::FleetLoadout::Inherit => ModelRoute::Inherit,
-        codewhale_config::FleetLoadout::Fast => ModelRoute::Faster,
-        codewhale_config::FleetLoadout::Strong
-        | codewhale_config::FleetLoadout::Balanced
-        | codewhale_config::FleetLoadout::DeepReasoning
-        | codewhale_config::FleetLoadout::Code
-        | codewhale_config::FleetLoadout::Review
-        | codewhale_config::FleetLoadout::ToolHeavy
-        | codewhale_config::FleetLoadout::Custom(_) => ModelRoute::Auto,
+        ModelRoute::Fixed(model.to_string())
+    } else {
+        ModelRoute::Inherit
     }
 }
+
 
 /// Apply exec hardening to a worker spec from fleet config (#3027).
 ///
@@ -868,9 +829,12 @@ mod tests {
         assert!(!route.wire_model_id.is_empty());
         assert_eq!(route.protocol, "chat_completions");
         assert_eq!(route.role.as_deref(), Some("builder"));
+        // The receipt still records the configured loadout as intent metadata,
+        // but the actual route is honest: an unpinned slot inherits the operator
+        // model. Model classes no longer route to a faster/other model.
         assert_eq!(route.loadout.as_deref(), Some("fast"));
         assert_eq!(route.model_class, None);
-        assert_eq!(route.model_route.as_deref(), Some("faster"));
+        assert_eq!(route.model_route.as_deref(), Some("inherit"));
         assert_eq!(route.reasoning_effort, None);
         assert_eq!(route.role_source.as_deref(), Some("task.role"));
         assert_eq!(route.loadout_source.as_deref(), Some("task.loadout"));
@@ -1087,7 +1051,9 @@ mod tests {
                 .contains("Focus on regressions and missing tests.")
         );
         assert_eq!(spec.runtime_profile.role, SubAgentType::Review);
-        assert_eq!(spec.runtime_profile.model, ModelRoute::Auto);
+        // No concrete model pin: the slot inherits the operator/session model.
+        // The legacy `Balanced` class no longer downgrades the route.
+        assert_eq!(spec.runtime_profile.model, ModelRoute::Inherit);
 
         let permissions = fleet_effective_permissions_for_task(&task, &profiles, &spec);
         assert_eq!(permissions.profile_id.as_deref(), Some("reviewer"));
@@ -1243,7 +1209,9 @@ mod tests {
             spec.runtime_profile.tools,
             ToolScope::Explicit(vec!["read_file".to_string()])
         );
-        assert_eq!(spec.runtime_profile.model, ModelRoute::Faster);
+        // Unpinned slot inherits the operator model (legacy fast class no
+        // longer routes to a faster sibling).
+        assert_eq!(spec.runtime_profile.model, ModelRoute::Inherit);
         assert_eq!(spec.max_spawn_depth, 1);
 
         let permissions = fleet_effective_permissions_from_worker_spec(&spec);
@@ -1441,73 +1409,22 @@ mod tests {
     }
 
     #[test]
-    fn fleet_route_parity_uses_shared_router_candidates() {
-        use crate::config::ApiProvider;
-        use crate::model_routing::{RouterCandidates, provider_router_candidates};
-
-        // Fleet emits the SAME `ModelRoute` seam the sub-agent assignment path
-        // consumes (`SubAgentModelStrength::model_route`: fast -> Faster,
-        // same/inherit -> Inherit). No fleet-specific provider/model table is
-        // involved — only the shared enum.
+    fn model_route_is_concrete_pin_or_operator_inherit() {
+        // Model selection is operator-centric and concrete: an unpinned slot
+        // inherits the operator/session model; a concrete model pins exactly
+        // that model. There is no provider-specific "faster sibling" magic and
+        // no model-class routing — if a user wants a cheaper or stronger model
+        // for a slot, they pick it explicitly.
+        assert_eq!(fleet_model_route("auto"), ModelRoute::Inherit);
+        assert_eq!(fleet_model_route(""), ModelRoute::Inherit);
+        assert_eq!(fleet_model_route("  "), ModelRoute::Inherit);
         assert_eq!(
-            fleet_model_route_for_loadout("auto", &codewhale_config::FleetLoadout::Fast),
-            ModelRoute::Faster,
-        );
-        assert_eq!(
-            fleet_model_route_for_loadout("auto", &codewhale_config::FleetLoadout::Inherit),
-            ModelRoute::Inherit,
-        );
-        assert_eq!(
-            fleet_model_route_for_loadout("auto", &codewhale_config::FleetLoadout::Strong),
-            ModelRoute::Auto,
-        );
-        // An explicit model always pins to a Fixed route, regardless of loadout.
-        assert_eq!(
-            fleet_model_route_for_loadout(
-                "deepseek-v4-flash",
-                &codewhale_config::FleetLoadout::Strong
-            ),
+            fleet_model_route("deepseek-v4-flash"),
             ModelRoute::Fixed("deepseek-v4-flash".to_string()),
         );
-
-        // The sub-agent runtime resolves a `ModelRoute` to a concrete model via
-        // `provider_router_candidates` (see `worker_profile_subagent_assignment_route`):
-        //   Fixed(m)      -> m
-        //   Faster | Auto -> candidates.cheap (else parent)
-        //   Inherit       -> parent
-        // A fleet worker hands its `ModelRoute` to that same resolution, so a
-        // fleet "fast" loadout lands on the provider's cheap sibling.
-        let parent = "deepseek-v4-pro";
-        let resolve = |route: &ModelRoute, candidates: &RouterCandidates| match route {
-            ModelRoute::Fixed(model) => model.clone(),
-            ModelRoute::Faster | ModelRoute::Auto => candidates
-                .cheap
-                .clone()
-                .unwrap_or_else(|| parent.to_string()),
-            ModelRoute::Inherit => parent.to_string(),
-        };
-
-        let deepseek = provider_router_candidates(ApiProvider::Deepseek, parent);
         assert_eq!(
-            resolve(
-                &fleet_model_route_for_loadout("auto", &codewhale_config::FleetLoadout::Fast),
-                &deepseek,
-            ),
-            "deepseek-v4-flash",
-            "fleet fast loadout resolves to the provider cheap sibling via the shared router",
-        );
-
-        // A provider with no known fast sibling must keep children on the parent
-        // model rather than fabricating a cloud id (#3166 route assertion).
-        let no_sibling = provider_router_candidates(ApiProvider::Anthropic, parent);
-        assert_eq!(no_sibling.cheap, None);
-        assert_eq!(
-            resolve(
-                &fleet_model_route_for_loadout("auto", &codewhale_config::FleetLoadout::Fast),
-                &no_sibling,
-            ),
-            parent,
-            "fast with no provider sibling stays on the parent/default model",
+            fleet_model_route("glm-5.2"),
+            ModelRoute::Fixed("glm-5.2".to_string()),
         );
     }
 
