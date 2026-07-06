@@ -25,7 +25,9 @@ const PARTIAL_SUFFIX: &str = ".tmp";
 #[serde(tag = "record", rename_all = "snake_case")]
 pub enum FleetLedgerRecord {
     RunCreated {
-        run: FleetRun,
+        // Boxed: FleetRun is by far the largest payload; boxing keeps the enum
+        // small (clippy::large_enum_variant). Serde treats Box<T> as T.
+        run: Box<FleetRun>,
     },
     RunStatusChanged {
         run_id: FleetRunId,
@@ -62,7 +64,9 @@ pub enum FleetLedgerRecord {
         memory_mb: Option<u64>,
     },
     ReceiptRecorded {
-        receipt: FleetReceipt,
+        // Boxed for the same reason as RunCreated: FleetReceipt is the largest
+        // variant payload. Serde treats Box<T> as T.
+        receipt: Box<FleetReceipt>,
     },
     AlertSent {
         run_id: FleetRunId,
@@ -171,7 +175,7 @@ impl FleetLedger {
 
     pub fn create_run(&self, run: &FleetRun) -> Result<()> {
         self.append_record(&FleetLedgerRecord::RunCreated {
-            run: sanitize_run_for_ledger(run),
+            run: Box::new(sanitize_run_for_ledger(run)),
         })
     }
 
@@ -247,7 +251,9 @@ impl FleetLedger {
     }
 
     pub fn record_receipt(&self, receipt: FleetReceipt) -> Result<()> {
-        self.append_record(&FleetLedgerRecord::ReceiptRecorded { receipt })
+        self.append_record(&FleetLedgerRecord::ReceiptRecorded {
+            receipt: Box::new(receipt),
+        })
     }
 
     pub fn record_alert(
@@ -336,7 +342,7 @@ impl FleetLedger {
         let mut lines = Vec::new();
         for run in state.runs.values() {
             lines.push(serde_json::to_string(&FleetLedgerRecord::RunCreated {
-                run: run.clone(),
+                run: Box::new(run.clone()),
             })?);
             if let Some(status) = state.run_status_overrides.get(&run.id.0) {
                 lines.push(serde_json::to_string(
@@ -407,7 +413,7 @@ impl FleetLedger {
         for receipt in state.receipts.values() {
             lines.push(serde_json::to_string(
                 &FleetLedgerRecord::ReceiptRecorded {
-                    receipt: receipt.clone(),
+                    receipt: Box::new(receipt.clone()),
                 },
             )?);
         }
@@ -467,7 +473,7 @@ fn artifact_event_key(event: &FleetWorkerEvent, artifact: &FleetArtifactRef) -> 
 fn apply_record(state: &mut FleetLedgerState, record: FleetLedgerRecord) {
     match record {
         FleetLedgerRecord::RunCreated { run } => {
-            state.runs.insert(run.id.0.clone(), run);
+            state.runs.insert(run.id.0.clone(), *run);
         }
         FleetLedgerRecord::RunStatusChanged {
             run_id,
@@ -630,7 +636,7 @@ fn apply_record(state: &mut FleetLedgerState, record: FleetLedgerRecord) {
         }
         FleetLedgerRecord::ReceiptRecorded { receipt } => {
             let key = task_key(&receipt.run_id.0, &receipt.task_id);
-            state.receipts.insert(key, receipt);
+            state.receipts.insert(key, *receipt);
         }
         FleetLedgerRecord::AlertSent { .. } => {
             // Alerts are audit-only for state reconstruction.
