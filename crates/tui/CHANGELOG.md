@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.8.67] - 2026-07-04
+## [0.8.67] - 2026-07-05
 
 ### Added
 
@@ -53,10 +53,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`longcat`, with `long-cat`, `meituan-longcat`, and `meituan` aliases),
   `LONGCAT_API_KEY` discovery, the `LongCat-2.0` default model, provider
   picker wiring, model completions, provider docs, and web provider facts.
-- Added Workflow runtime foundations only: the internal JS authoring/runtime
-  crates compile and replay example workflows, but 0.8.67 does not ship a
-  product-ready Workflow surface yet. There is no model-facing `workflow` tool,
-  no `/workflow` runner, and no TUI run view in this release; those are tracked
+- Fleet: added per-provider setup cards (Persistence, Constitution, Hotbar,
+  Tools/MCP, Remote Runtime) with a unified setup catalog and provider-specific
+  credential links. Provider setup progress is persisted transactionally with
+  rollback guards, Codex OAuth is kept out of provider key storage, and a
+  headless QA contract verifies setup readiness across providers.
+- Fleet: added Fleet starter profiles with role-aware loadouts (scout→Fast,
+  manager→Inherit, etc.), `/fleet setup` profile-authoring wizard, Fleet
+  effective-permission recording, and route intent-source tracking.
+- Fleet: added 'operator' as a built-in Fleet roster member — the preferred
+  helm Fleet slot for workflow coordination. Operator plans, routes, reviews
+  outputs, and calls other Fleet slots as needed. This is a roster role, not a
+  separate app mode. The full Operation/Operate-mode architecture is deferred
+  to 0.9.0.
+- Workflow: declarative workflows now run through the production driver, the
+  workflow tool is wired to sub-agent dispatch, public Workflow surfaces are
+  renamed, and typed workflow-run and status receipts are emitted for
+  debugging and verification.
+- Added provider-agnostic Fleet rosters and loadouts: provider-specific
+  subagent limits, launch concurrency, and admission caps are derived from
+  config without hardcoding any single provider.
+- Added Workflow runtime foundations: the internal JS authoring/runtime crates
+  compile and replay example workflows. 0.8.67 ships usable Fleet and Workflow
+  setup; the product-ready `/workflow` runner and TUI run view remain tracked
   for v0.8.68 (#2974, #4038).
 
 ### Changed
@@ -82,6 +101,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Fixed session save/load to persist and restore the active model provider
+  across restarts. Previously sessions created under one provider (e.g.
+  DeepSeek) would silently load under a different active provider. Provider,
+  subagent limits, fallback chain, context window, and reasoning effort are now
+  restored from saved session metadata, with `"deepseek"` as the default for
+  legacy sessions.
 - Raised the streamed model-response idle timeout and matched the TUI stall
   watchdog to the configured stream budget so long reasoning pauses are not
   recovered as stalled turns (#2487, #3998).
