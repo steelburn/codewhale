@@ -375,8 +375,9 @@ fn member_posture(member: &AgentProfile) -> String {
     format!("{} worker · {write} · {shell}", agent_type.as_str())
 }
 
-/// The routing truth for a member: explicit model pin, else loadout class,
-/// else same-route inheritance. `[subagents]` overrides still win at dispatch.
+/// The routing truth for a member: an explicit concrete model pin, else the
+/// member inherits the operator (the active session model). `[subagents]`
+/// overrides still win at dispatch.
 fn member_routing(member: &AgentProfile) -> String {
     if let Some(model) = member
         .profile
@@ -387,10 +388,7 @@ fn member_routing(member: &AgentProfile) -> String {
     {
         return format!("model {model} (pinned)");
     }
-    match member.profile.loadout.as_str() {
-        "inherit" => "inherit session route".to_string(),
-        loadout => format!("loadout {loadout}"),
-    }
+    "↳ inherits operator (active model)".to_string()
 }
 
 fn member_detail_lines(member: &AgentProfile) -> Vec<Line<'static>> {
@@ -635,15 +633,21 @@ mod tests {
             member_posture(&reviewer),
             "review worker · read-only · shell read-only"
         );
-        assert_eq!(member_routing(&reviewer), "inherit session route");
+        assert_eq!(
+            member_routing(&reviewer),
+            "↳ inherits operator (active model)"
+        );
 
-        // Built-in scout: fast loadout label is the routing truth.
+        // Built-in scout: unpinned, so it inherits the operator model.
         let scout = FleetRoster::built_ins_only().get("scout").unwrap().clone();
         assert_eq!(
             member_posture(&scout),
             "explore worker · read-only · shell read-only"
         );
-        assert_eq!(member_routing(&scout), "loadout fast");
+        assert_eq!(
+            member_routing(&scout),
+            "↳ inherits operator (active model)"
+        );
 
         // Builder writes with full shell.
         let builder = FleetRoster::built_ins_only()
@@ -655,7 +659,7 @@ mod tests {
             "implementer worker · write · shell full"
         );
 
-        // A pinned model beats the loadout label.
+        // A pinned concrete model is shown instead of the inherit hint.
         let mut pinned = reviewer.clone();
         pinned.profile.model = Some("glm-5.2".to_string());
         assert_eq!(member_routing(&pinned), "model glm-5.2 (pinned)");
@@ -710,7 +714,10 @@ mod tests {
         let view = FleetRosterView::from_parts(operator(), FleetRoster::load(&config, tmp.path()));
         let extra = view.members.iter().find(|m| m.id == "docs-writer").unwrap();
         assert_eq!(extra.origin, ProfileOrigin::Config);
-        assert_eq!(member_routing(extra), "loadout fast");
+        assert_eq!(
+            member_routing(extra),
+            "↳ inherits operator (active model)"
+        );
     }
 
     #[test]
