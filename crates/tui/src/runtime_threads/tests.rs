@@ -2295,6 +2295,7 @@ async fn compaction_lifecycle_emits_item_events_with_compaction_counts() -> Resu
                             message: "auto compact done".to_string(),
                             messages_before: Some(7),
                             messages_after: Some(3),
+                            summary_prompt: None,
                         })
                         .await;
                     let _ = tx_event
@@ -2327,6 +2328,10 @@ async fn compaction_lifecycle_emits_item_events_with_compaction_counts() -> Resu
                             message: "manual compact done".to_string(),
                             messages_before: Some(5),
                             messages_after: Some(2),
+                            summary_prompt: Some(
+                                "## 📋 Conversation Summary (Auto-Generated)\n\nkey facts."
+                                    .to_string(),
+                            ),
                         })
                         .await;
                     let _ = tx_event
@@ -2416,6 +2421,16 @@ async fn compaction_lifecycle_emits_item_events_with_compaction_counts() -> Resu
             && ev.payload.get("messages_before").and_then(Value::as_u64) == Some(5)
             && ev.payload.get("messages_after").and_then(Value::as_u64) == Some(2)
     }));
+
+    // The manual compact carried a summary_prompt → it must be persisted into
+    // the thread record so engine reloads restore it. The auto compact carried
+    // None → exactly one summary section, from the manual pass.
+    let record = manager.get_thread(&thread.id).await?;
+    let record_prompt = record.system_prompt.expect("record keeps a system prompt");
+    assert!(record_prompt.contains(COMPACTION_SUMMARY_BEGIN));
+    assert!(record_prompt.contains("Conversation Summary (Auto-Generated)"));
+    assert!(record_prompt.contains("key facts."));
+    assert_eq!(record_prompt.matches(COMPACTION_SUMMARY_BEGIN).count(), 1);
     Ok(())
 }
 
@@ -2932,4 +2947,67 @@ async fn fork_at_user_message_does_not_mutate_source() -> Result<()> {
         );
     }
     Ok(())
+}
+
+// ── compaction summary persistence (merge_summary_into_prompt) ──
+
+#[test]
+fn summary_merge_appends_section_to_base_prompt() {
+    let merged = merge_summary_into_prompt(
+        Some("You are a helpful agent."),
+        "## 📋 Conversation Summary (Auto-Generated)\n\nUser prefers lists.",
+    );
+    assert!(merged.starts_with("You are a helpful agent."));
+    assert!(merged.contains(COMPACTION_SUMMARY_BEGIN));
+    assert!(merged.contains("User prefers lists."));
+    assert!(merged.ends_with(COMPACTION_SUMMARY_END));
+    // Reload restore keys on the marker: SyncSession maps the record to
+    // SystemPrompt::Text and extract_compaction_summary_prompt checks
+    // `contains("Conversation Summary (Auto-Generated)")`.
+    assert!(merged.contains("Conversation Summary (Auto-Generated)"));
+}
+
+#[test]
+fn summary_merge_replaces_existing_section_idempotently() {
+    let first = merge_summary_into_prompt(Some("Base prompt."), "summary v1");
+    let second = merge_summary_into_prompt(Some(&first), "summary v2");
+    assert!(second.contains("summary v2"));
+    assert!(!second.contains("summary v1"));
+    assert_eq!(
+        second.matches(COMPACTION_SUMMARY_BEGIN).count(),
+        1,
+        "repeated compactions must swap the section, not stack duplicates"
+    );
+    assert!(second.starts_with("Base prompt."));
+}
+
+#[test]
+fn summary_merge_handles_missing_base() {
+    let merged = merge_summary_into_prompt(None, "only summary");
+    assert!(merged.starts_with(COMPACTION_SUMMARY_BEGIN));
+    assert!(merged.contains("only summary"));
+    let empty_base = merge_summary_into_prompt(Some(""), "only summary");
+    assert!(empty_base.starts_with(COMPACTION_SUMMARY_BEGIN));
+}
+
+#[test]
+fn summary_strip_preserves_text_after_section() {
+    let with_tail = format!(
+        "Base.\n\n{COMPACTION_SUMMARY_BEGIN}\nold summary\n{COMPACTION_SUMMARY_END}\n\nTrailing rules."
+    );
+    let stripped = strip_summary_section(&with_tail);
+    assert!(stripped.contains("Base."));
+    assert!(stripped.contains("Trailing rules."));
+    assert!(!stripped.contains("old summary"));
+    // Re-merge keeps the tail intact.
+    let merged = merge_summary_into_prompt(Some(&with_tail), "new summary");
+    assert!(merged.contains("Trailing rules."));
+    assert!(merged.contains("new summary"));
+}
+
+#[test]
+fn summary_strip_handles_missing_end_sentinel() {
+    let broken = format!("Base.\n\n{COMPACTION_SUMMARY_BEGIN}\ntruncated…");
+    let stripped = strip_summary_section(&broken);
+    assert_eq!(stripped, "Base.");
 }

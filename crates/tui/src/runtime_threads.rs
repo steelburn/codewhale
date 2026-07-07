@@ -47,6 +47,54 @@ const EVENT_CHANNEL_CAPACITY: usize = 1024;
 const MAX_ACTIVE_THREADS_DEFAULT: usize = 8;
 const SUMMARY_LIMIT: usize = 280;
 
+/// Sentinel delimiters wrapping the compaction summary section persisted in a
+/// thread record's `system_prompt`. The section carries the engine-rendered
+/// summary (which contains the `Conversation Summary (Auto-Generated)` marker,
+/// so `SyncSession` → `extract_compaction_summary_prompt` restores it on
+/// engine reload). Delimiters make replacement idempotent: each completed
+/// compaction swaps the section in place instead of stacking duplicates.
+/// External `PATCH /v1/threads/{id}` callers that rewrite `system_prompt`
+/// should preserve this section verbatim or the summary is lost on reload.
+const COMPACTION_SUMMARY_BEGIN: &str = "<!-- compaction-summary:begin -->";
+const COMPACTION_SUMMARY_END: &str = "<!-- compaction-summary:end -->";
+
+/// Merge a rendered compaction summary into a thread record's system prompt,
+/// replacing any previously persisted summary section.
+fn merge_summary_into_prompt(base: Option<&str>, summary_text: &str) -> String {
+    let stripped = base.map(strip_summary_section).unwrap_or_default();
+    let mut out = stripped.trim_end().to_string();
+    if !out.is_empty() {
+        out.push_str("\n\n");
+    }
+    out.push_str(COMPACTION_SUMMARY_BEGIN);
+    out.push('\n');
+    out.push_str(summary_text.trim());
+    out.push('\n');
+    out.push_str(COMPACTION_SUMMARY_END);
+    out
+}
+
+/// Remove a previously persisted compaction summary section, if present.
+fn strip_summary_section(base: &str) -> String {
+    let Some(start) = base.find(COMPACTION_SUMMARY_BEGIN) else {
+        return base.to_string();
+    };
+    let end = base[start..]
+        .find(COMPACTION_SUMMARY_END)
+        .map(|rel| start + rel + COMPACTION_SUMMARY_END.len());
+    let mut out = base[..start].trim_end().to_string();
+    if let Some(end) = end {
+        let tail = base[end..].trim_start();
+        if !tail.is_empty() {
+            if !out.is_empty() {
+                out.push_str("\n\n");
+            }
+            out.push_str(tail);
+        }
+    }
+    out
+}
+
 fn validated_record_id<'a>(id: &'a str, label: &str) -> Result<&'a str> {
     let trimmed = id.trim();
     if trimmed.is_empty() {
@@ -3129,7 +3177,42 @@ impl RuntimeThreadManager {
                     message,
                     messages_before,
                     messages_after,
+                    summary_prompt,
                 } => {
+                    // Persist the summary into the thread record so engine
+                    // reloads (LRU eviction / restart) restore it: reload
+                    // passes the record prompt through SyncSession, where
+                    // `extract_compaction_summary_prompt` picks the summary
+                    // back up. Without this the summary lives only in engine
+                    // memory and silently dies with the engine.
+                    if let Some(summary) =
+                        summary_prompt.as_deref().filter(|s| !s.trim().is_empty())
+                    {
+                        match self.get_thread(&thread_id).await {
+                            Ok(mut thread) => {
+                                let merged = merge_summary_into_prompt(
+                                    thread.system_prompt.as_deref(),
+                                    summary,
+                                );
+                                if thread.system_prompt.as_deref() != Some(merged.as_str()) {
+                                    thread.system_prompt = Some(merged);
+                                    thread.updated_at = Utc::now();
+                                    if let Err(e) = self.store.save_thread(&thread) {
+                                        tracing::warn!(
+                                            thread_id = %thread_id,
+                                            "Failed to persist compaction summary to thread record: {e}"
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    thread_id = %thread_id,
+                                    "Failed to load thread for compaction summary persistence: {e}"
+                                );
+                            }
+                        }
+                    }
                     if let Some(item_id) = compaction_items.remove(&id) {
                         let mut item = self.store.load_item(&item_id)?;
                         item.status = TurnItemLifecycleStatus::Completed;

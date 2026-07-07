@@ -700,6 +700,7 @@ impl Engine {
         messages_before: Option<usize>,
         messages_after: Option<usize>,
     ) {
+        let summary_prompt = self.rendered_compaction_summary();
         let _ = self
             .tx_event
             .send(Event::CompactionCompleted {
@@ -708,8 +709,28 @@ impl Engine {
                 message,
                 messages_before,
                 messages_after,
+                summary_prompt,
             })
             .await;
+    }
+
+    /// Render the accumulated compaction summary prompt to plain text so it
+    /// can travel in events and be persisted by host layers. All emit sites
+    /// run after `merge_compaction_summary`, so this reflects the summary
+    /// state the engine will use for subsequent requests.
+    fn rendered_compaction_summary(&self) -> Option<String> {
+        self.session
+            .compaction_summary_prompt
+            .as_ref()
+            .map(|prompt| match prompt {
+                SystemPrompt::Text(text) => text.clone(),
+                SystemPrompt::Blocks(blocks) => blocks
+                    .iter()
+                    .map(|block| block.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n\n"),
+            })
+            .filter(|text| !text.trim().is_empty())
     }
 
     pub(super) async fn emit_compaction_failed(&mut self, id: String, auto: bool, message: String) {

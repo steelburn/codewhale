@@ -116,6 +116,12 @@ pub enum Event {
         /// Number of messages after compaction.
         #[allow(dead_code)]
         messages_after: Option<usize>,
+        /// Rendered text of the accumulated compaction summary prompt, if any.
+        /// Host layers (e.g. the /v1 runtime) persist this into the thread
+        /// record so the summary survives engine reloads — without it the
+        /// summary lives only in engine memory and is lost on LRU eviction
+        /// or restart (SyncSession re-extracts it from the record prompt).
+        summary_prompt: Option<String>,
     },
 
     /// Context purge started.
