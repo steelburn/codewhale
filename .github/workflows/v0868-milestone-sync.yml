@@ -58,6 +58,11 @@ jobs:
           script: |
             const issue = context.payload.issue;
             if (!issue) return;
+            // Only auto-label freshly opened issues. Running on `labeled`
+            // events re-adds labels (e.g. agent-ready) that a maintainer or
+            // triage agent deliberately removed, breaking the
+            // "agent-ready = startable now" contract on the v0.8.68 board.
+            if (context.payload.action !== 'opened') return;
 
             const title = (issue.title || '').toLowerCase();
             const body = (issue.body || '').toLowerCase();
