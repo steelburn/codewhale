@@ -90,7 +90,7 @@ export const FACTS: RepoFacts = {
     {
       "id": "xiaomi-mimo",
       "label": "Xiaomi MiMo",
-      "env": "XIAOMI_MIMO_API_KEY / XIAOMI_API_KEY / MIMO_API_KEY"
+      "env": "XIAOMI_MIMO_TOKEN_PLAN_API_KEY / MIMO_TOKEN_PLAN_API_KEY / XIAOMI_MIMO_API_KEY / XIAOMI_API_KEY / MIMO_API_KEY"
     },
     {
       "id": "novita",
