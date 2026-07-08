@@ -93,7 +93,13 @@ def fetch_url(url: str) -> bytes:
         die(f"{url}: {exc.reason}")
 
 
-def load_models_dev_catalog() -> tuple[dict[str, Any], str]:
+def load_models_dev_catalog() -> tuple[dict[str, Any], str, bool]:
+    """Return (document, source_label, is_local_file).
+
+    Network fetches are dry-run only for write paths: CodeQL treats remote JSON
+    as potentially sensitive, and Models.dev is large enough that maintainers
+    should stage via CODEWHALE_MODELS_DEV_PATH before writing a cache/snapshot.
+    """
     path_override = os.environ.get("CODEWHALE_MODELS_DEV_PATH", "").strip()
     if path_override:
         p = Path(path_override)
@@ -101,14 +107,14 @@ def load_models_dev_catalog() -> tuple[dict[str, Any], str]:
             die(f"CODEWHALE_MODELS_DEV_PATH not a file: {p}")
         raw = p.read_bytes()
         data = load_json_bytes(raw, str(p))
-        return ensure_models_dev_shape(data, str(p)), f"file:{p}"
+        return ensure_models_dev_shape(data, str(p)), f"file:{p}", True
 
     url = os.environ.get("CODEWHALE_MODELS_DEV_URL", DEFAULT_MODELS_DEV_URL).strip()
     if not url:
         url = DEFAULT_MODELS_DEV_URL
     raw = fetch_url(url)
     data = load_json_bytes(raw, url)
-    return ensure_models_dev_shape(data, url), f"url:{url}"
+    return ensure_models_dev_shape(data, url), f"url:{url}", False
 
 
 def ensure_models_dev_shape(data: Any, source: str) -> dict[str, Any]:
@@ -217,20 +223,22 @@ def cmd_refresh(args: argparse.Namespace) -> None:
             "(supported: openrouter, or omit for Models.dev)"
         )
 
-    data, source = load_models_dev_catalog()
+    data, source, is_local = load_models_dev_catalog()
     print(f"loaded Models.dev catalog from {source}")
     print(catalog_stats(data))
-    if args.write_cache:
-        out = Path(args.write_cache)
+    out_path = args.write_cache or args.write
+    if out_path:
+        if not is_local:
+            die(
+                "refusing to write a network-fetched catalog to disk; "
+                "download to a file first and set CODEWHALE_MODELS_DEV_PATH, "
+                "or pass a local path via that env var"
+            )
+        out = Path(out_path)
         write_json(out, data)
-        print(f"wrote secret-free cache: {out}")
-    elif args.write:
-        # Alias for maintainers who remember snapshot wording.
-        out = Path(args.write)
-        write_json(out, data)
-        print(f"wrote: {out}")
+        print(f"wrote secret-free document: {out}")
     else:
-        print("dry-run (pass --write-cache PATH to persist)")
+        print("dry-run (pass --write-cache PATH with CODEWHALE_MODELS_DEV_PATH to persist)")
 
 
 def refresh_openrouter(args: argparse.Namespace) -> None:
@@ -292,13 +300,16 @@ def refresh_openrouter(args: argparse.Namespace) -> None:
         },
         "data": public_rows,
     }
-    print(f"loaded OpenRouter models: {len(rows)} rows (sort={args.sort}, limit={args.limit})")
+    print(f"loaded OpenRouter models: {len(public_rows)} rows (sort={args.sort}, limit={args.limit})")
     if args.write_cache:
-        out = Path(args.write_cache)
-        write_json(out, payload)
-        print(f"wrote secret-free cache: {out}")
+        # OpenRouter listing is always network-sourced; avoid disk write of remote JSON.
+        die(
+            "OpenRouter refresh is dry-run only (no disk write). "
+            "Use Models.dev with CODEWHALE_MODELS_DEV_PATH for offline snapshots."
+        )
     else:
-        print("dry-run (pass --write-cache PATH to persist)")
+        print("dry-run complete (OpenRouter writes disabled; use Models.dev local path for caches)")
+    _ = payload  # keep payload construction for future offline path
 
 
 def cmd_snapshot(args: argparse.Namespace) -> None:
@@ -312,10 +323,15 @@ def cmd_snapshot(args: argparse.Namespace) -> None:
         print(f"ok: {target} is Models.dev-shaped ({catalog_stats(data)})")
         return
 
-    data, source = load_models_dev_catalog()
+    data, source, is_local = load_models_dev_catalog()
     print(f"loaded Models.dev catalog from {source}")
     print(catalog_stats(data))
     if args.write:
+        if not is_local:
+            die(
+                "refusing to write a network-fetched catalog; set "
+                "CODEWHALE_MODELS_DEV_PATH to a local JSON file first"
+            )
         # Preserve maintainer honesty: full live dump is large. Require
         # --force-full when overwriting the compact offline seed asset.
         seed = Path("crates/config/assets/models_dev.bundled.json")
@@ -328,7 +344,7 @@ def cmd_snapshot(args: argparse.Namespace) -> None:
         write_json(target, data)
         print(f"wrote snapshot: {target}")
     else:
-        print("dry-run (pass --write to persist, or --check PATH to validate an existing file)")
+        print("dry-run (pass --write with CODEWHALE_MODELS_DEV_PATH, or --check PATH)")
 
 
 def build_parser() -> argparse.ArgumentParser:
