@@ -484,7 +484,6 @@
     "CtxMenuHelp": "Trợ giúp",
     "CtxMenuHelpDesc": "phím tắt và lệnh",
     "FanoutCounts": "{done} hoàn thành · {running} đang chạy · {failed} thất bại · {pending} chờ",
-    "ModePickerPrompt": "Chọn cách CodeWhale hoạt động:",
     "AppModeAgent": "Tác nhân",
     "AppModeAuto": "Tự động",
     "AppModeYolo": "YOLO",

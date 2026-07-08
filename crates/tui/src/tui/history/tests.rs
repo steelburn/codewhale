@@ -1333,6 +1333,56 @@ fn generic_tool_cell_renders_rlm_with_rlm_label_not_swarm() {
     );
 }
 
+#[test]
+fn exploring_card_search_reads_as_find_not_read() {
+    // #4145: a completed grep grouped under the exploration card must not
+    // render `read done · Searching …`; the header verb has to agree with the
+    // `Searching for …` label.
+    let cell = super::ExploringCell {
+        entries: vec![super::ExploringEntry {
+            label: "Searching for `TranscriptScroll`".to_string(),
+            status: ToolStatus::Success,
+        }],
+    };
+    let header: String = cell.lines_with_motion(80, true)[0]
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect::<String>();
+    assert!(
+        header.contains("find done"),
+        "search card header should read `find done`: {header:?}"
+    );
+    assert!(
+        !header.contains("read done"),
+        "search card must not pair `read done` with a search label: {header:?}"
+    );
+    assert!(
+        header.contains("Searching for `TranscriptScroll`"),
+        "search label should remain intact: {header:?}"
+    );
+}
+
+#[test]
+fn exploring_card_read_keeps_read_verb() {
+    // The fix only re-verbs search-only cards — a plain read stays `read`.
+    let cell = super::ExploringCell {
+        entries: vec![super::ExploringEntry {
+            label: "Reading src/foo.rs".to_string(),
+            status: ToolStatus::Success,
+        }],
+    };
+    let header: String = cell.lines_with_motion(80, true)[0]
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect::<String>();
+    assert!(
+        header.contains("read done"),
+        "read card header should read `read done`: {header:?}"
+    );
+}
+
 // === Reasoning treatment tests (v0.6.6 UI redesign) ===
 
 #[test]

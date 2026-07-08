@@ -574,8 +574,7 @@ pub enum MessageId {
     // Agent fanout card.
     FanoutCounts,
 
-    // App mode picker (prompt, names, hints) and composer vim indicator.
-    ModePickerPrompt,
+    // App mode picker (names, hints) and composer vim indicator.
     AppModeAgent,
     AppModeAuto,
     AppModeYolo,
@@ -1201,7 +1200,6 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::CtxMenuHelp,
     MessageId::CtxMenuHelpDesc,
     MessageId::FanoutCounts,
-    MessageId::ModePickerPrompt,
     MessageId::AppModeAgent,
     MessageId::AppModeAuto,
     MessageId::AppModeYolo,
@@ -1624,11 +1622,10 @@ mod tests {
 
     #[test]
     fn mode_picker_strings_are_translated_in_non_english_locales() {
-        // The picker prompt and the three mode hints are full sentences; every
-        // shipped non-English locale must provide a real translation rather than
-        // leaking the English string through the fallback chain.
+        // The mode hints are full sentences; every shipped non-English locale
+        // must provide a real translation rather than leaking the English
+        // string through the fallback chain.
         let sentences = [
-            MessageId::ModePickerPrompt,
             MessageId::AppModeAgentHint,
             MessageId::AppModeAutoHint,
             MessageId::AppModePlanHint,

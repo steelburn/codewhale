@@ -6137,7 +6137,7 @@ mod tests {
         assert!(text.contains("configured_slots=2"));
         assert!(text.contains("Bindable actions:"));
         assert!(text.contains("13 bindable actions"));
-        assert!(text.contains("Press H to customize slots; Enter records this Hotbar snapshot."));
+        assert!(text.contains("Enter records this Hotbar snapshot. Press H to customize slots."));
     }
 
     #[test]
@@ -6271,7 +6271,7 @@ mod tests {
         assert!(text.contains("feishu"));
         assert!(text.contains("Remote mode:"));
         assert!(text.contains("--apply not implemented"));
-        assert!(text.contains("Press R to preview; Enter records this Remote snapshot."));
+        assert!(text.contains("Enter records this Remote snapshot. Press R to preview."));
     }
 
     #[test]

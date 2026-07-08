@@ -484,7 +484,6 @@
     "CtxMenuHelp": "帮助",
     "CtxMenuHelpDesc": "快捷键和命令",
     "FanoutCounts": "{done} 已完成 · {running} 运行中 · {failed} 失败 · {pending} 等待中",
-    "ModePickerPrompt": "选择 CodeWhale 的运行方式：",
     "AppModeAgent": "智能体",
     "AppModeAuto": "自动",
     "AppModeYolo": "YOLO",

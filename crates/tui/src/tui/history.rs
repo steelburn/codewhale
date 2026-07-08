@@ -835,8 +835,13 @@ impl ExploringCell {
         } else {
             "running"
         };
-        lines.push(render_tool_header_with_summary(
-            "Workspace",
+        // Search-only exploration cards read with the `find` verb so a
+        // completed grep renders `find done · Searching for …` instead of the
+        // incoherent `read done · Searching …` (#4145). Read/list or mixed
+        // cards keep the neutral `read` verb the Workspace card has always used.
+        let family = exploring_card_family(&self.entries);
+        lines.push(render_tool_header_with_family_and_summary(
+            family,
             header_summary.as_deref(),
             header_state,
             status,
@@ -1707,6 +1712,24 @@ fn exploring_header_summary(entries: &[ExploringEntry]) -> Option<String> {
         [] => None,
         [entry] => Some(entry.label.clone()),
         entries => Some(format!("{} items", entries.len())),
+    }
+}
+
+/// Choose the verb family for an exploring card's header. A card whose entries
+/// are all searches reads with the `find` verb so the completed action agrees
+/// with its `Searching for …` labels (#4145); every other exploration mix keeps
+/// the neutral `read` verb the Workspace card uses. The search signal is the
+/// English label prefix produced by `exploring_label` in `tool_routing`.
+fn exploring_card_family(entries: &[ExploringEntry]) -> crate::tui::widgets::tool_card::ToolFamily {
+    use crate::tui::widgets::tool_card::ToolFamily;
+    let all_search = !entries.is_empty()
+        && entries
+            .iter()
+            .all(|entry| entry.label.starts_with("Searching"));
+    if all_search {
+        ToolFamily::Find
+    } else {
+        ToolFamily::Read
     }
 }
 

@@ -8,7 +8,6 @@
     "TranslationFailed": "翻譯失敗",
     "FooterBalancePrefix": "餘額",
     "FanoutCounts": "{done} 已完成 · {running} 運行中 · {failed} 失敗 · {pending} 等待中",
-    "ModePickerPrompt": "選擇 CodeWhale 的運作方式：",
     "AppModeAgent": "智能體",
     "AppModeAuto": "自動",
     "AppModeYolo": "YOLO",

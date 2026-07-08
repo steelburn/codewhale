@@ -484,7 +484,6 @@
     "CtxMenuHelp": "ヘルプ",
     "CtxMenuHelpDesc": "キー操作とコマンド",
     "FanoutCounts": "{done} 完了 · {running} 実行中 · {failed} 失敗 · {pending} 保留",
-    "ModePickerPrompt": "CodeWhale の動作方法を選択してください:",
     "AppModeAgent": "エージェント",
     "AppModeAuto": "自動",
     "AppModeYolo": "YOLO",

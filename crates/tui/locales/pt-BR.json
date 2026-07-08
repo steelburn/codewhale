@@ -484,7 +484,6 @@
     "CtxMenuHelp": "Ajuda",
     "CtxMenuHelpDesc": "atalhos de teclado e comandos",
     "FanoutCounts": "{done} concluído · {running} em execução · {failed} falhou · {pending} pendente",
-    "ModePickerPrompt": "Escolha como o CodeWhale deve operar:",
     "AppModeAgent": "Agente",
     "AppModeAuto": "Automático",
     "AppModeYolo": "YOLO",
