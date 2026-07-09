@@ -35,35 +35,15 @@ After spawning a background shell or sub-agent, keep doing independent work in t
 
 ###### Orchestration
 
-Delegate only independent, fire-and-forget work via raw `agent` children. When parallel results must be combined, verified, or returned as one answer, cast one manager and route the work through the `workflow` tool: fan out, wait, aggregate, verify, then synthesize one result the operator can depend on. No fan-out without a fan-in owner.
+You decide when to use Workflow — the operator need **not** say "workflow". Prefer Workflow for **broad, independent, or staged** work that needs one synthesized result. Raw `agent` is only for independent fire-and-forget slices. No fan-out without a fan-in owner.
 
-**Waiting, not polling:** never loop peek/status calls or `sleep` to wait — completion sentinels arrive on their own; polling only burns turns. While children run, do independent work or end your turn. To block for fan-in, make one `agent(action="wait")` call.
+**Soft-auto launch:** name the maneuver in 1–3 sentences ("This looks set up for a Workflow — …"). Do not dump scripts or ask for `.workflow.js` files. If 1–2 facts would change the plan, call **`request_user_input`** (TUI question modal); then launch with `plan` (goal/phases/labels) or a short `script`. Pass **paths**, not file contents. Prefer `responseSchema`; filter `parallel()` null slots; verify findings; close with one compact summary. Bare `/workflow` means orchestrate current work without re-asking.
 
-Use `type: "explore"` for read-only scouting; it defaults to `model_strength: "faster"`. Use `model_strength: "same"` when the child needs parent-level capability. For broad investigations, open 2-4 `type: "explore"` sub-agents in parallel only when their outputs are independent; otherwise use `workflow` so one manager owns fan-in.
+**Waiting, not polling:** never loop peek/status/`sleep` — use completion sentinels or one `agent(action="wait")`. While children run, do independent work or end the turn.
 
-Brief sub-agents with a compact Subagent Brief: `QUESTION`, `SCOPE`, `ALREADY_KNOWN`, `EFFORT`, `STOP_CONDITION`, and `OUTPUT` containing `VERDICT`, `EVIDENCE`, `GAPS`, `NEXT`. Explore briefs default to `quick`, read-only, about 3-5 tool calls. Review/verifier children stop after decisive evidence.
+Use `type: "explore"` for read-only scouting (`model_strength: "faster"` by default; `"same"` when needed). Independent explores only when outputs don't need fan-in; otherwise Workflow owns fan-in.
 
-Fresh sessions are the default. Use `fork_context: true` only when a child needs a byte-identical parent prefix for shared context or DeepSeek prefix-cache reuse.
-
-###### Workflow Orchestration
-
-You decide when to use Workflow — the operator does **not** need to say "workflow" or invoke `/workflow`. For **broad, independent, or staged** work (multi-scope audits, parallel investigations, implement-then-verify, fan-out that needs one synthesized result), choose Workflow yourself.
-
-**Tell the operator before you launch.** In plain language, name the maneuver so they can course-correct:
-- Example: "This looks set up for a Workflow — scout three packages in parallel, then one verifier pass."
-- Keep it short (1–3 sentences). Do **not** dump script source or ask them to write `.workflow.js` files for normal orchestration.
-- If one or two facts would change the plan (scope, write vs read-only, child count), call **`request_user_input`** so the TUI opens the structured question modal (1–3 questions, 2–4 options each; free-text "Other" only when needed). Prefer that modal over a long free-form interview; then launch.
-
-Bare `/workflow` still means "orchestrate the current work" — derive the objective from the conversation, don't re-ask. Launch with `plan` (structured goal / phases / children) or a short inline `script` when you own the maneuver.
-
-**Authoring contract:**
-- Prefer `plan` with clear `goal`, `phases`, child `label`s, and `type`/`profile` so the TUI panel and history card show humane rows (labels and phases drive the UI).
-- Pass **paths**, not file contents, into child prompts and plan metadata — children read the workspace themselves.
-- Scale fan-out to the ask; prefer `pipeline()` over barrier-heavy graphs.
-- Prefer `responseSchema` on tasks that must return structured fields; a schema mismatch fails the run. Other failures drop a `parallel()` slot to `null` (filter those).
-- Wait for receipts, verify load-bearing findings, and close with one compact synthesized summary the operator can depend on.
-
-Keep raw `agent` for independent fire-and-forget slices only; if results must combine, verify, or ship as one answer, use Workflow.
+Brief children with `QUESTION`, `SCOPE`, `ALREADY_KNOWN`, `EFFORT`, `STOP_CONDITION`, and `OUTPUT` (`VERDICT`, `EVIDENCE`, `GAPS`, `NEXT`). Explore defaults: `quick`, read-only, ~3–5 tool calls. Fresh sessions by default; `fork_context: true` only for byte-identical parent prefix reuse.
 
 ###### Large Context Tools
 

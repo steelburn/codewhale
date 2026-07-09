@@ -3267,17 +3267,14 @@ mod tests {
         let prompt = AGENT_MODE;
         for phrase in [
             "You decide when to use Workflow",
-            "does **not** need to say \"workflow\"",
+            "need **not** say \"workflow\"",
             "broad, independent, or staged",
-            "Tell the operator before you launch",
             "This looks set up for a Workflow",
             "`request_user_input`",
-            "TUI opens the structured question modal",
-            "Do **not** dump script source",
+            "TUI question modal",
             "Pass **paths**, not file contents",
-            "labels and phases drive the UI",
             "Prefer `responseSchema`",
-            "one compact synthesized summary",
+            "one compact summary",
         ] {
             assert!(
                 prompt.contains(phrase),
