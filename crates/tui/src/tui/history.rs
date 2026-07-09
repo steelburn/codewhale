@@ -692,7 +692,7 @@ impl ExecCell {
 
         // Foreground shell waits block the turn but do not need a verbose
         // transcript card — spinner + running badge + Ctrl+B hint only.
-        // Command, live output, and artifact paths belong in the Tasks sidebar
+        // Command, live output, and artifact paths belong in the Activity sidebar
         // and `/jobs` detail surfaces.
         if compact_foreground_wait {
             return wrap_card_rail(lines);

@@ -1283,7 +1283,7 @@ fn task_panel_lines(app: &App, content_width: usize, max_rows: usize) -> Vec<Lin
     task_panel_rows(app, content_width, max_rows).0
 }
 
-/// Build the Tasks panel lines together with a parallel per-line click-action
+/// Build the Activity panel lines together with a parallel per-line click-action
 /// vector (#3028). Producing both in a single pass keeps the action indices
 /// aligned with the rendered lines no matter how the layout evolves.
 fn task_panel_rows(

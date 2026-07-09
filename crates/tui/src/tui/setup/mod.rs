@@ -2661,10 +2661,10 @@ impl SetupWizardView {
                 tr(self.locale, MessageId::SetupRuntimePresetSafetyFloor).to_string(),
                 Style::default().fg(palette::TEXT_MUTED),
             )),
-            Line::from(Span::styled(
-                tr(self.locale, MessageId::SetupRuntimePostureReviewHint).to_string(),
-                Style::default().fg(palette::TEXT_MUTED),
-            )),
+            self.setup_review_hint_line(
+                MessageId::SetupRuntimePostureReviewHint,
+                Some("Press M for work mode or C for config."),
+            ),
             Line::from(Span::styled(
                 tr(self.locale, MessageId::SetupRuntimePresetApplyHint).to_string(),
                 Style::default().fg(palette::TEXT_MUTED),
@@ -2711,10 +2711,7 @@ impl SetupWizardView {
                 &self.facts.operate_concurrency_result,
             ),
             self.detail_row(MessageId::SetupOperateReadinessLabel, &readiness),
-            Line::from(Span::styled(
-                tr(self.locale, MessageId::SetupOperateReviewHint).to_string(),
-                Style::default().fg(palette::TEXT_MUTED),
-            )),
+            self.setup_review_hint_line(MessageId::SetupOperateReviewHint, None),
         ]
     }
 
@@ -2728,10 +2725,10 @@ impl SetupWizardView {
                 MessageId::SetupHotbarActionsLabel,
                 &self.facts.hotbar_actions_result,
             ),
-            Line::from(Span::styled(
-                tr(self.locale, MessageId::SetupHotbarReviewHint).to_string(),
-                Style::default().fg(palette::TEXT_MUTED),
-            )),
+            self.setup_review_hint_line(
+                MessageId::SetupHotbarReviewHint,
+                Some("Press H to customize slots."),
+            ),
         ]
     }
 
@@ -2753,10 +2750,7 @@ impl SetupWizardView {
                 MessageId::SetupToolsMcpPluginsLabel,
                 &self.facts.tools_mcp_plugins_result,
             ),
-            Line::from(Span::styled(
-                tr(self.locale, MessageId::SetupToolsMcpReviewHint).to_string(),
-                Style::default().fg(palette::TEXT_MUTED),
-            )),
+            self.setup_review_hint_line(MessageId::SetupToolsMcpReviewHint, None),
         ]
     }
 
@@ -2778,10 +2772,10 @@ impl SetupWizardView {
                 MessageId::SetupRemoteModeLabel,
                 &self.facts.remote_mode_result,
             ),
-            Line::from(Span::styled(
-                tr(self.locale, MessageId::SetupRemoteReviewHint).to_string(),
-                Style::default().fg(palette::TEXT_MUTED),
-            )),
+            self.setup_review_hint_line(
+                MessageId::SetupRemoteReviewHint,
+                Some("Press R to preview."),
+            ),
         ]
     }
 
@@ -2811,10 +2805,7 @@ impl SetupWizardView {
                 MessageId::SetupPersistenceNotesLabel,
                 &self.facts.persistence.notes_result,
             ),
-            Line::from(Span::styled(
-                tr(self.locale, MessageId::SetupPersistenceReviewHint).to_string(),
-                Style::default().fg(palette::TEXT_MUTED),
-            )),
+            self.setup_review_hint_line(MessageId::SetupPersistenceReviewHint, None),
         ]
     }
 
@@ -2880,6 +2871,24 @@ impl SetupWizardView {
         let next_action = tr(self.locale, self.next_action_id()).to_string();
         lines.push(self.detail_row(MessageId::SetupReportNextActionLabel, &next_action));
         lines
+    }
+
+    fn setup_review_hint_line(
+        &self,
+        hint_id: MessageId,
+        english_action: Option<&'static str>,
+    ) -> Line<'static> {
+        let hint = if self.locale == Locale::En {
+            let mut hint = "Enter records this setup snapshot.".to_string();
+            if let Some(action) = english_action {
+                hint.push(' ');
+                hint.push_str(action);
+            }
+            hint
+        } else {
+            tr(self.locale, hint_id).to_string()
+        };
+        Line::from(Span::styled(hint, Style::default().fg(palette::TEXT_MUTED)))
     }
 
     fn ready_label(&self, ready: bool) -> String {
@@ -5559,7 +5568,7 @@ mod tests {
         assert!(text.contains("Fleet roster:"));
         assert!(text.contains("3 Fleet members"));
         assert!(text.contains("plan limit not probed"));
-        assert!(text.contains("Enter records this Operate/Fleet snapshot."));
+        assert!(text.contains("Enter records this setup snapshot."));
     }
 
     #[test]
@@ -5619,7 +5628,7 @@ mod tests {
         assert!(text.contains("configured_slots=2"));
         assert!(text.contains("Bindable actions:"));
         assert!(text.contains("13 bindable actions"));
-        assert!(text.contains("Enter records this Hotbar snapshot. Press H to customize slots."));
+        assert!(text.contains("Enter records this setup snapshot. Press H to customize slots."));
     }
 
     #[test]
@@ -5686,7 +5695,7 @@ mod tests {
         assert!(text.contains("/tmp/skills"));
         assert!(text.contains("Tools dir:"));
         assert!(text.contains("Plugins dir:"));
-        assert!(text.contains("Enter records this Tools/MCP snapshot."));
+        assert!(text.contains("Enter records this setup snapshot."));
     }
 
     #[test]
@@ -5753,7 +5762,7 @@ mod tests {
         assert!(text.contains("feishu"));
         assert!(text.contains("Remote mode:"));
         assert!(text.contains("--apply not implemented"));
-        assert!(text.contains("Enter records this Remote snapshot. Press R to preview."));
+        assert!(text.contains("Enter records this setup snapshot. Press R to preview."));
     }
 
     #[test]
@@ -5823,7 +5832,7 @@ mod tests {
         assert!(text.contains("Constitution:"));
         assert!(text.contains("Memory:"));
         assert!(text.contains("Notes:"));
-        assert!(text.contains("Enter records this Persistence snapshot."));
+        assert!(text.contains("Enter records this setup snapshot."));
     }
 
     #[test]

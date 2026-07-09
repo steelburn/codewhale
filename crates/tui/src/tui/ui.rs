@@ -4230,7 +4230,7 @@ async fn run_event_loop(
                 continue;
             }
 
-            // y / Y in the Tasks sidebar: yank the current turn id (y)
+            // y / Y in the Activity sidebar: yank the current turn id (y)
             // or copy full task detail (Y) to the system clipboard.
             // Only active when the composer is empty to avoid stealing
             // keystrokes from typed input (#2000).
@@ -4557,7 +4557,7 @@ async fn run_event_loop(
                         && key_shortcuts::has_control_like_modifier(key.modifiers) =>
                 {
                     app.set_sidebar_focus(SidebarFocus::Tasks);
-                    app.status_message = Some("Sidebar focus: tasks".to_string());
+                    app.status_message = Some("Sidebar focus: activity".to_string());
                     continue;
                 }
                 KeyCode::Char('3')
@@ -4594,7 +4594,7 @@ async fn run_event_loop(
                         && !key.modifiers.contains(KeyModifiers::CONTROL) =>
                 {
                     app.set_sidebar_focus(SidebarFocus::Tasks);
-                    app.status_message = Some("Sidebar focus: tasks".to_string());
+                    app.status_message = Some("Sidebar focus: activity".to_string());
                     continue;
                 }
                 KeyCode::Char('#')
@@ -8559,7 +8559,7 @@ async fn apply_command_result(
             AppAction::ShellJob(action) => {
                 handle_shell_job_action(app, action);
                 // Immediately sync the task panel after cancel/poll so the
-                // Tasks sidebar stays accurate without waiting for the
+                // Activity sidebar stays accurate without waiting for the
                 // next 2.5 s periodic refresh (#2937).
                 refresh_active_task_panel(app, task_manager).await;
             }
