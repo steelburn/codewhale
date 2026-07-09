@@ -5,9 +5,7 @@
 //! Plan usage is credit/quota based and is intentionally left unknown until a
 //! reliable balance endpoint exists.
 
-#[cfg(test)]
-use chrono::TimeZone;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use codewhale_config::pricing::TokenUsage;
 
 use crate::config::ApiProvider;
@@ -121,12 +119,18 @@ pub fn has_pricing_for_model(model: &str) -> bool {
     pricing_for_model(model).is_some()
 }
 
-fn pricing_for_model_at(model: &str, _now: DateTime<Utc>) -> Option<ModelPricing> {
+fn pricing_for_model_at(model: &str, now: DateTime<Utc>) -> Option<ModelPricing> {
     let lower = model.to_lowercase();
     if lower.starts_with("deepseek-ai/") {
         // NVIDIA NIM-hosted DeepSeek uses NVIDIA's catalog/account terms, not
         // DeepSeek Platform pricing. Avoid showing misleading DeepSeek costs.
         return None;
+    }
+    if lower == "claude-sonnet-5" {
+        // Time-aware introductory pricing; resolved ahead of the catalog so
+        // the intro rate is honored while it lasts (same pattern as
+        // deepseek_v4_pro_pricing() / #2489).
+        return Some(claude_sonnet_5_pricing(now));
     }
     if let Some(pricing) = known_pricing_for_model(&lower) {
         return Some(pricing);
@@ -153,6 +157,31 @@ fn known_pricing_for_model(model_lower: &str) -> Option<ModelPricing> {
         "openai/gpt-5.6-terra" | "gpt-5.6-terra" => Some(usd_only_pricing(0.25, 2.50, 15.00)),
         "openai/gpt-5.6-luna" | "gpt-5.6-luna" => Some(usd_only_pricing(0.10, 1.00, 6.00)),
         "meta/muse-spark-1.1" | "muse-spark-1.1" => Some(usd_only_pricing(1.25, 1.25, 4.25)),
+        // Anthropic first-party rates including the published cache-read
+        // discounts (2026-07-09 audit,
+        // https://platform.claude.com/docs/en/about-claude/pricing). These sit
+        // above the catalog lookup because the bundled catalog cannot carry a
+        // cache-read rate yet. Cache-write rates (1.25x-2x input) exist
+        // upstream but `CurrencyPricing` has no cache-write field.
+        "claude-opus-4-8" => Some(usd_only_pricing(0.50, 5.00, 25.00)),
+        "claude-sonnet-4-6" => Some(usd_only_pricing(0.30, 3.00, 15.00)),
+        "claude-haiku-4-5" => Some(usd_only_pricing(0.10, 1.00, 5.00)),
+        // Claude Fable 5 (GA 2026-06-09). Its newer tokenizer produces ~30%
+        // more tokens for the same text than prior Claude models, so raw
+        // per-token rate comparisons against other Claude rows undercount its
+        // effective cost. Cache-write is 12.50 (5m) / 20.00 (1h) upstream.
+        "claude-fable-5" => Some(usd_only_pricing(1.00, 10.00, 50.00)),
+        // Z.ai GLM-5.2 cache-read rate per https://docs.z.ai/guides/overview/pricing
+        // (cache storage limited-time free).
+        "z-ai/glm-5.2" | "glm-5.2" => Some(usd_only_pricing(0.26, 1.40, 4.40)),
+        // Moonshot K2.7 Code cache-read rate per
+        // https://platform.kimi.ai/docs/pricing/chat-k27-code
+        "moonshotai/kimi-k2.7-code" | "kimi-k2.7-code" => Some(usd_only_pricing(0.19, 0.95, 4.00)),
+        // gpt-5-codex is deprecated upstream on the ChatGPT-OAuth path
+        // (successor: gpt-5.3-codex); API usage is still billed at these rates.
+        // https://developers.openai.com/api/docs/models/gpt-5.3-codex
+        "openai/gpt-5-codex" | "gpt-5-codex" => Some(usd_only_pricing(0.125, 1.25, 10.00)),
+        "openai/gpt-5.3-codex" | "gpt-5.3-codex" => Some(usd_only_pricing(0.175, 1.75, 14.00)),
         _ => None,
     };
     if explicit.is_some() {
@@ -168,27 +197,37 @@ fn known_pricing_for_model(model_lower: &str) -> Option<ModelPricing> {
         ));
     }
     match model_lower {
-        "moonshotai/kimi-k2.6" | "kimi-k2.6" => Some(usd_only_pricing(0.34, 0.68, 3.41)),
-        "z-ai/glm-5.1" | "glm-5.1" => Some(usd_only_pricing(0.182, 0.98, 3.08)),
+        "moonshotai/kimi-k2.6" | "kimi-k2.6" => Some(usd_only_pricing(0.16, 0.95, 4.00)),
+        "z-ai/glm-5.1" | "glm-5.1" => Some(usd_only_pricing(0.26, 1.40, 4.40)),
+        // GLM-5 Turbo pricing per https://docs.z.ai/guides/overview/pricing
+        "z-ai/glm-5-turbo" | "glm-5-turbo" => Some(usd_only_pricing(0.24, 1.20, 4.00)),
         "minimax/minimax-m3" | "minimax-m3" => Some(usd_only_pricing(0.06, 0.30, 1.20)),
+        // Arcee publishes no cache rate for Trinity Large Thinking, so the
+        // cache-hit rate equals the input rate (no-discount representation).
+        // https://docs.arcee.ai/get-started/pricing
         "arcee-ai/trinity-large-thinking" | "trinity-large-thinking" => {
-            Some(usd_only_pricing(0.06, 0.22, 0.85))
+            Some(usd_only_pricing(0.25, 0.25, 0.80))
         }
         "openai/gpt-5.5" | "gpt-5.5" => Some(usd_only_pricing(0.50, 5.00, 30.00)),
+        // GPT-5.5 Pro does not offer a cached input discount, so the cache-hit
+        // rate equals the input rate.
+        // https://developers.openai.com/api/docs/models/gpt-5.5-pro
         "openai/gpt-5.5-pro" | "gpt-5.5-pro" => Some(usd_only_pricing(30.00, 30.00, 180.00)),
 
         "qwen/qwen3.6-flash" => Some(usd_only_pricing(0.1875, 0.1875, 1.125)),
-        "qwen/qwen3.6-35b-a3b" => Some(usd_only_pricing(0.05, 0.15, 1.00)),
+        "qwen/qwen3.6-35b-a3b" => Some(usd_only_pricing(0.05, 0.14, 1.00)),
         "qwen/qwen3.6-max-preview" => Some(usd_only_pricing(1.04, 1.04, 6.24)),
-        "qwen/qwen3.6-27b" => Some(usd_only_pricing(0.2885, 0.2885, 3.17)),
+        "qwen/qwen3.6-27b" => Some(usd_only_pricing(0.15, 0.285, 2.40)),
         "qwen/qwen3.6-plus" => Some(usd_only_pricing(0.325, 0.325, 1.95)),
+        // Cache-write is 0.40 upstream; CurrencyPricing has no cache-write field.
+        "qwen/qwen3.7-plus" => Some(usd_only_pricing(0.064, 0.32, 1.28)),
         "qwen/qwen3.7-max" => Some(usd_only_pricing(0.25, 1.25, 3.75)),
 
         "google/gemma-4-31b-it" => Some(usd_only_pricing(0.09, 0.12, 0.35)),
         "google/gemma-4-26b-a4b-it" => Some(usd_only_pricing(0.06, 0.06, 0.33)),
         "tencent/hy3-preview" => Some(usd_only_pricing(0.021, 0.063, 0.21)),
         "nvidia/nemotron-3-ultra-550b-a55b" | "nvidia/nemotron-3-ultra" => {
-            Some(usd_only_pricing(0.15, 0.50, 2.50))
+            Some(usd_only_pricing(0.10, 0.50, 2.20))
         }
         _ => None,
     }
@@ -206,6 +245,21 @@ fn usd_only_pricing(
             output_per_million,
         },
         cny: None,
+    }
+}
+
+/// Claude Sonnet 5 pricing (https://platform.claude.com/docs/en/about-claude/pricing):
+/// introductory 2.00 / 10.00 (cache-read 0.20) through 2026-08-31 UTC, then
+/// the standard 3.00 / 15.00 (cache-read 0.30).
+fn claude_sonnet_5_pricing(now: DateTime<Utc>) -> ModelPricing {
+    let intro_ends = Utc
+        .with_ymd_and_hms(2026, 9, 1, 0, 0, 0)
+        .single()
+        .expect("valid intro-pricing cutoff");
+    if now < intro_ends {
+        usd_only_pricing(0.20, 2.00, 10.00)
+    } else {
+        usd_only_pricing(0.30, 3.00, 15.00)
     }
 }
 
@@ -388,17 +442,10 @@ mod tests {
     #[test]
     fn catalog_sourced_models_have_usd_pricing() {
         for (model, input, output) in [
-            ("glm-5.2", 1.4, 4.4),
-            ("z-ai/glm-5.2", 1.4, 4.4),
-            ("kimi-k2.7-code", 0.95, 4.0),
-            ("moonshotai/kimi-k2.7-code", 0.95, 4.0),
             ("minimax-m2.7", 0.3, 1.2),
             ("minimax/minimax-m2.7", 0.3, 1.2),
             ("trinity-mini", 0.045, 0.15),
             ("arcee-ai/trinity-mini", 0.045, 0.15),
-            ("claude-opus-4-8", 5.0, 25.0),
-            ("claude-sonnet-4-6", 3.0, 15.0),
-            ("claude-haiku-4-5", 1.0, 5.0),
             ("step-3.7-flash", 0.2, 1.15),
             ("fugu-ultra-20260615", 5.0, 30.0),
             ("fugu-ultra", 5.0, 30.0),
@@ -420,14 +467,33 @@ mod tests {
             ..Default::default()
         };
         for (model, hit, miss, output) in [
-            ("kimi-k2.6", 0.34, 0.68, 3.41),
-            ("z-ai/glm-5.1", 0.182, 0.98, 3.08),
+            ("kimi-k2.6", 0.16, 0.95, 4.00),
+            ("kimi-k2.7-code", 0.19, 0.95, 4.00),
+            ("moonshotai/kimi-k2.7-code", 0.19, 0.95, 4.00),
+            ("z-ai/glm-5.1", 0.26, 1.40, 4.40),
+            ("glm-5.2", 0.26, 1.40, 4.40),
+            ("z-ai/glm-5.2", 0.26, 1.40, 4.40),
+            ("glm-5-turbo", 0.24, 1.20, 4.00),
+            ("z-ai/glm-5-turbo", 0.24, 1.20, 4.00),
             ("qwen/qwen3.6-plus", 0.325, 0.325, 1.95),
-            ("trinity-large-thinking", 0.06, 0.22, 0.85),
+            ("qwen/qwen3.6-35b-a3b", 0.05, 0.14, 1.00),
+            ("qwen/qwen3.6-27b", 0.15, 0.285, 2.40),
+            // No published cache rate: cache-hit billed at the input rate.
+            ("trinity-large-thinking", 0.25, 0.25, 0.80),
+            ("nvidia/nemotron-3-ultra-550b-a55b", 0.10, 0.50, 2.20),
+            ("claude-opus-4-8", 0.50, 5.00, 25.00),
+            ("claude-sonnet-4-6", 0.30, 3.00, 15.00),
+            ("claude-haiku-4-5", 0.10, 1.00, 5.00),
+            ("claude-fable-5", 1.00, 10.00, 50.00),
             ("gpt-5.5", 0.50, 5.00, 30.00),
+            // GPT-5.5 Pro has no cached-input discount: cache-hit == input.
+            ("gpt-5.5-pro", 30.00, 30.00, 180.00),
             ("gpt-5.6-sol", 0.50, 5.00, 30.00),
             ("gpt-5.6-terra", 0.25, 2.50, 15.00),
             ("gpt-5.6-luna", 0.10, 1.00, 6.00),
+            ("gpt-5-codex", 0.125, 1.25, 10.00),
+            ("gpt-5.3-codex", 0.175, 1.75, 14.00),
+            ("qwen/qwen3.7-plus", 0.064, 0.32, 1.28),
             ("muse-spark-1.1", 1.25, 1.25, 4.25),
         ] {
             let pricing = pricing_for_model_at(model, Utc::now()).expect(model);
@@ -539,6 +605,32 @@ mod tests {
         assert_eq!(pricing.usd.input_cache_miss_per_million, 0.25);
         assert_eq!(pricing.usd.output_per_million, 1.25);
         assert!(pricing.cny.is_none());
+    }
+
+    #[test]
+    fn sonnet_5_uses_intro_pricing_before_2026_08_31_expiry() {
+        let before_expiry = Utc
+            .with_ymd_and_hms(2026, 8, 31, 23, 59, 59)
+            .single()
+            .unwrap();
+        let pricing = pricing_for_model_at("claude-sonnet-5", before_expiry).unwrap();
+
+        assert_eq!(pricing.usd.input_cache_hit_per_million, 0.20);
+        assert_eq!(pricing.usd.input_cache_miss_per_million, 2.00);
+        assert_eq!(pricing.usd.output_per_million, 10.00);
+        assert!(pricing.cny.is_none());
+    }
+
+    #[test]
+    fn sonnet_5_uses_standard_pricing_after_intro_window() {
+        let after_expiry = Utc.with_ymd_and_hms(2026, 9, 1, 0, 0, 0).single().unwrap();
+        let pricing = pricing_for_model_at("claude-sonnet-5", after_expiry).unwrap();
+
+        assert_eq!(pricing.usd.input_cache_hit_per_million, 0.30);
+        assert_eq!(pricing.usd.input_cache_miss_per_million, 3.00);
+        assert_eq!(pricing.usd.output_per_million, 15.00);
+        assert!(pricing.cny.is_none());
+        assert!(has_pricing_for_model("claude-sonnet-5"));
     }
 
     #[test]

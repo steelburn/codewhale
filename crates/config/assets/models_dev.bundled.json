@@ -4,9 +4,9 @@
     "schema": "Matches crates/config/src/models_dev.rs ModelsDevCatalog ({ models, providers }).",
     "role": "NOT a competing source of truth. Preferred metadata is the live Models.dev catalog published into ProviderLake (#4187). This asset is used only when live/cache rows are unavailable (offline startup, failed refresh, or empty cache).",
     "source": "Compact offline seed of verified in-repo defaults (context/output from crates/tui/src/models.rs; USD pricing from crates/tui/src/pricing.rs) for providers CodeWhale ships with. It is intentionally smaller than a full Models.dev dump; live refresh supersedes these rows on (provider, wire_model_id) identity.",
-    "honesty": "Pricing is intentionally OMITTED where the repo does not publish a trustworthy per-token rate: DeepSeek-native rows (priced via the time-aware DeepSeek table elsewhere, kept UnknownOrStale at the route layer), aggregator-hosted DeepSeek rows (aggregator account terms, not DeepSeek Platform pricing), Anthropic rows (no in-repo per-token table), and Xiaomi MiMo Token-Plan rows (credit/quota based). Absent pricing surfaces as PricingSku::UnknownOrStale, never a fabricated zero.",
+    "honesty": "Pricing is intentionally OMITTED where the repo does not publish a trustworthy per-token rate: DeepSeek-native rows (priced via the time-aware DeepSeek table elsewhere, kept UnknownOrStale at the route layer), aggregator-hosted DeepSeek rows (aggregator account terms, not DeepSeek Platform pricing), and Xiaomi MiMo rows (published PAYG rates apply only to sk- pay-as-you-go keys; the catalog cannot distinguish that billing surface from credit/quota Token Plan keys, so MiMo stays unpriced). Absent pricing surfaces as PricingSku::UnknownOrStale, never a fabricated zero.",
     "default_rows": "Each provider's `default: true` wire id equals that provider's built-in DEFAULT_*_MODEL so RouteResolver::new() and the descriptor stay in agreement when offline.",
-    "coverage": "14 providers, 38 chat offerings (offline seed only)."
+    "coverage": "14 providers, 42 chat offerings (offline seed only)."
   },
   "models": {
     "deepseek-v4-pro": {
@@ -77,7 +77,8 @@
           "reasoning_options": [{ "type": "effort", "values": ["high", "max"] }],
           "tool_call": true,
           "modalities": { "input": ["text"], "output": ["text"] },
-          "limit": { "context": 1000000, "output": 131072 }
+          "limit": { "context": 1000000, "output": 131072 },
+          "cost": { "input": 1.40, "output": 4.40, "cache_read": 0.26 }
         },
         "glm-5.1": {
           "id": "glm-5.1",
@@ -87,7 +88,7 @@
           "tool_call": true,
           "modalities": { "input": ["text"], "output": ["text"] },
           "limit": { "context": 202752, "output": 131072 },
-          "cost": { "input": 0.98, "output": 3.08, "cache_read": 0.182 }
+          "cost": { "input": 1.40, "output": 4.40, "cache_read": 0.26 }
         },
         "GLM-5-Turbo": {
           "id": "GLM-5-Turbo",
@@ -96,7 +97,8 @@
           "reasoning": true,
           "tool_call": true,
           "modalities": { "input": ["text"], "output": ["text"] },
-          "limit": { "context": 202752, "output": 131072 }
+          "limit": { "context": 202752, "output": 131072 },
+          "cost": { "input": 1.20, "output": 4.00, "cache_read": 0.24 }
         }
       }
     },
@@ -115,7 +117,8 @@
           "reasoning": true,
           "tool_call": true,
           "modalities": { "input": ["text"], "output": ["text"] },
-          "limit": { "context": 262144, "output": 262144 }
+          "limit": { "context": 262144, "output": 262144 },
+          "cost": { "input": 0.95, "output": 4.00, "cache_read": 0.19 }
         },
         "kimi-k2.6": {
           "id": "kimi-k2.6",
@@ -125,7 +128,7 @@
           "tool_call": true,
           "modalities": { "input": ["text"], "output": ["text"] },
           "limit": { "context": 262144, "output": 262144 },
-          "cost": { "input": 0.68, "output": 3.41, "cache_read": 0.34 }
+          "cost": { "input": 0.95, "output": 4.00, "cache_read": 0.16 }
         }
       }
     },
@@ -270,6 +273,16 @@
           "modalities": { "input": ["text", "image", "pdf"], "output": ["text"] },
           "limit": { "context": 1050000, "input": 922000, "output": 128000 },
           "cost": { "input": 1.00, "output": 6.00, "cache_read": 0.10, "cache_write": 1.25 }
+        },
+        "gpt-5.3-codex": {
+          "id": "gpt-5.3-codex",
+          "name": "GPT-5.3 Codex",
+          "family": "gpt-codex",
+          "reasoning": true,
+          "tool_call": true,
+          "modalities": { "input": ["text"], "output": ["text"] },
+          "limit": { "context": 400000, "output": 128000 },
+          "cost": { "input": 1.75, "output": 14.00, "cache_read": 0.175 }
         }
       }
     },
@@ -288,7 +301,8 @@
           "reasoning": true,
           "tool_call": true,
           "modalities": { "input": ["text"], "output": ["text"] },
-          "limit": { "context": 1000000, "output": 64000 }
+          "limit": { "context": 1000000, "output": 128000 },
+          "cost": { "input": 3.00, "output": 15.00, "cache_read": 0.30, "cache_write": 3.75 }
         },
         "claude-opus-4-8": {
           "id": "claude-opus-4-8",
@@ -297,7 +311,8 @@
           "reasoning": true,
           "tool_call": true,
           "modalities": { "input": ["text"], "output": ["text"] },
-          "limit": { "context": 1000000, "output": 128000 }
+          "limit": { "context": 1000000, "output": 128000 },
+          "cost": { "input": 5.00, "output": 25.00, "cache_read": 0.50, "cache_write": 6.25 }
         },
         "claude-haiku-4-5": {
           "id": "claude-haiku-4-5",
@@ -306,7 +321,28 @@
           "reasoning": true,
           "tool_call": true,
           "modalities": { "input": ["text"], "output": ["text"] },
-          "limit": { "context": 200000, "output": 64000 }
+          "limit": { "context": 200000, "output": 64000 },
+          "cost": { "input": 1.00, "output": 5.00, "cache_read": 0.10, "cache_write": 1.25 }
+        },
+        "claude-sonnet-5": {
+          "id": "claude-sonnet-5",
+          "name": "Claude Sonnet 5",
+          "family": "claude",
+          "reasoning": true,
+          "tool_call": true,
+          "modalities": { "input": ["text"], "output": ["text"] },
+          "limit": { "context": 1000000, "output": 128000 },
+          "cost": { "input": 3.00, "output": 15.00, "cache_read": 0.30 }
+        },
+        "claude-fable-5": {
+          "id": "claude-fable-5",
+          "name": "Claude Fable 5",
+          "family": "claude",
+          "reasoning": true,
+          "tool_call": true,
+          "modalities": { "input": ["text"], "output": ["text"] },
+          "limit": { "context": 1000000, "output": 128000 },
+          "cost": { "input": 10.00, "output": 50.00, "cache_read": 1.00, "cache_write": 12.50 }
         }
       }
     },
@@ -366,7 +402,16 @@
           "tool_call": true,
           "modalities": { "input": ["text"], "output": ["text"] },
           "limit": { "context": 262144, "output": 262140 },
-          "cost": { "input": 0.15, "output": 1.00, "cache_read": 0.05 }
+          "cost": { "input": 0.14, "output": 1.00, "cache_read": 0.05 }
+        },
+        "qwen/qwen3.7-plus": {
+          "id": "qwen/qwen3.7-plus",
+          "name": "Qwen3.7 Plus",
+          "family": "qwen",
+          "reasoning": true,
+          "tool_call": true,
+          "modalities": { "input": ["text"], "output": ["text"] },
+          "cost": { "input": 0.32, "output": 1.28, "cache_read": 0.064, "cache_write": 0.40 }
         },
         "minimax/minimax-m3": {
           "id": "minimax/minimax-m3",
@@ -442,7 +487,7 @@
     "novita": {
       "id": "novita",
       "name": "Novita AI",
-      "api": "https://api.novita.ai/v3/openai",
+      "api": "https://api.novita.ai/openai/v1",
       "npm": "@ai-sdk/openai-compatible",
       "env": ["NOVITA_API_KEY"],
       "models": {
@@ -515,7 +560,7 @@
           "tool_call": true,
           "modalities": { "input": ["text"], "output": ["text"] },
           "limit": { "context": 262144, "output": 262144 },
-          "cost": { "input": 0.22, "output": 0.85, "cache_read": 0.06 }
+          "cost": { "input": 0.25, "output": 0.80 }
         },
         "trinity-mini": {
           "id": "trinity-mini",

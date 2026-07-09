@@ -134,6 +134,8 @@ const SEED_MODEL_IDS: &[(&str, ModelProvider)] = &[
     // --- Anthropic (config DEFAULT_ANTHROPIC_MODEL + models.rs rows) ---
     ("claude-opus-4-8", ModelProvider::Anthropic),
     ("claude-sonnet-4-6", ModelProvider::Anthropic),
+    ("claude-sonnet-5", ModelProvider::Anthropic),
+    ("claude-fable-5", ModelProvider::Anthropic),
     ("claude-haiku-4-5", ModelProvider::Anthropic),
     // --- OpenAI public API + Codex (config DEFAULT_OPENAI_CODEX_MODEL) ---
     ("gpt-5.5", ModelProvider::OpenAi),
@@ -264,6 +266,8 @@ mod tests {
             ("deepseek-coder:1.3b", Some(128_000)),
             ("claude-opus-4-8", Some(1_000_000)),
             ("claude-sonnet-4-6", Some(1_000_000)),
+            ("claude-sonnet-5", Some(1_000_000)),
+            ("claude-fable-5", Some(1_000_000)),
             ("claude-haiku-4-5", Some(200_000)),
             ("gpt-5.5", Some(1_050_000)),
             ("gpt-5.6", Some(1_050_000)),
