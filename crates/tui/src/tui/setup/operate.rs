@@ -39,12 +39,24 @@ impl SetupOperateFacts {
                     .unwrap_or("disabled for active provider"),
             )
         };
-        let runtime_ready = subagents_enabled && max_subagents > 0 && launch_concurrency > 0;
+        let runtime_configured = subagents_enabled && max_subagents > 0 && launch_concurrency > 0;
+        // Configuration and roster presence are useful facts, but this release
+        // cannot yet prove host-enforced Workflow dispatch plus terminal
+        // receipts. Keep Operate readiness blocked until that capability exists.
+        let runtime_ready = false;
         let runtime_result = if let Some(reason) = runtime_disabled_reason {
             format!("worker runtime disabled ({reason})")
+        } else if runtime_configured {
+            format!(
+                "worker runtime configuration present for {}; max_subagents={}, launch_concurrency={}, admission={}; verified Operate dispatch and terminal receipts unavailable in this release",
+                app.api_provider.as_str(),
+                max_subagents,
+                launch_concurrency,
+                max_admitted
+            )
         } else {
             format!(
-                "worker runtime enabled for {}; max_subagents={}, launch_concurrency={}, admission={}",
+                "worker runtime has no launch capacity for {}; max_subagents={}, launch_concurrency={}, admission={}",
                 app.api_provider.as_str(),
                 max_subagents,
                 launch_concurrency,

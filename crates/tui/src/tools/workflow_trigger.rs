@@ -6,14 +6,9 @@
 //! ask setup questions via `request_user_input` (TUI modal) before calling
 //! `workflow` / `plan`.
 //!
-//! Pure decision helper; does not start workflows itself. Public API is live for
-//! unit tests and upcoming runtime wiring — keep reachable from non-test builds
-//! via [`soft_auto_policy_is_linked`].
-
-// Soft-auto policy is consulted primarily by the model (prompt) and tests today;
-// runtime auto-launch will call [`evaluate_workflow_trigger`] next. Until then,
-// private helpers trip `dead_code` on bin builds under `-D warnings`.
-#![allow(dead_code)]
+//! Operate admission also consumes this policy at the host boundary. Operate
+//! only keeps a turn local when it is provably one-step; everything else must
+//! produce real Workflow/Fleet activity or an explicit readiness blocker.
 
 /// Signals the parent can supply without full conversation replay.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -26,7 +21,7 @@ pub struct WorkflowTriggerSignals {
     pub risky_writes_unclear_decomposition: bool,
     /// Estimated child count if Workflow launched now.
     pub estimated_children: usize,
-    /// Soft cap from `[workflow].auto_start_child_limit` (default 8).
+    /// Soft cap from `[workflow].auto_start_child_limit` (default 16).
     pub auto_start_child_limit: usize,
     /// Approximate parent context tokens in use (for high-volume signal).
     pub context_tokens: usize,
@@ -42,10 +37,62 @@ impl WorkflowTriggerSignals {
             highly_interactive: false,
             risky_writes_unclear_decomposition: false,
             estimated_children: 0,
-            auto_start_child_limit: 8,
+            auto_start_child_limit: 16,
             context_tokens: 0,
             high_context_token_threshold: 80_000,
         }
+    }
+}
+
+/// Host-level admission decision for an Operate turn.
+///
+/// Unlike the general soft-auto decision, absence of a trigger is not enough to
+/// let Operate behave like Act. Local execution is allowed only for an explicit,
+/// deterministic one-step request; ambiguous work fails closed into the
+/// orchestration path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OperateAdmissionDecision {
+    LocalOneStep { reason: &'static str },
+    RequiresOrchestration { reason: &'static str },
+}
+
+impl OperateAdmissionDecision {
+    #[must_use]
+    pub fn allows_local_execution(&self) -> bool {
+        matches!(self, Self::LocalOneStep { .. })
+    }
+
+    #[must_use]
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Self::LocalOneStep { reason } | Self::RequiresOrchestration { reason } => reason,
+        }
+    }
+}
+
+/// Decide whether an Operate request is safe to keep local.
+///
+/// This intentionally has a stricter fallback than [`evaluate_workflow_trigger`]:
+/// Operate is an orchestration posture, so an unrecognized or ambiguous request
+/// is not silently admitted to the ordinary Act tool loop.
+#[must_use]
+pub fn evaluate_operate_admission(
+    user_text: &str,
+    signals: &WorkflowTriggerSignals,
+) -> OperateAdmissionDecision {
+    let workflow_decision = evaluate_workflow_trigger(user_text, signals);
+    if workflow_decision.should_trigger() {
+        return OperateAdmissionDecision::RequiresOrchestration {
+            reason: workflow_decision.reason(),
+        };
+    }
+
+    if let Some(reason) = explicit_local_one_step_reason(user_text, signals) {
+        return OperateAdmissionDecision::LocalOneStep { reason };
+    }
+
+    OperateAdmissionDecision::RequiresOrchestration {
+        reason: "request is not provably a single local step",
     }
 }
 
@@ -171,6 +218,56 @@ fn child_overhead_exceeds_benefit(lower: &str, signals: &WorkflowTriggerSignals)
     tiny.iter().any(|needle| lower.contains(needle))
 }
 
+fn explicit_local_one_step_reason(
+    user_text: &str,
+    _signals: &WorkflowTriggerSignals,
+) -> Option<&'static str> {
+    let text = user_text.trim();
+    let lower = text.to_ascii_lowercase();
+    let compound = has_compound_or_shell_syntax(&lower);
+    let orchestration_language = has_fanout_language(&lower)
+        || has_staged_work_language(&lower)
+        || has_independent_verification_language(&lower);
+
+    if !compound && !orchestration_language && is_strict_read_only_operate_request(&lower) {
+        return Some("explicit one-step read-only request");
+    }
+    None
+}
+
+fn has_compound_or_shell_syntax(lower: &str) -> bool {
+    lower.lines().count() > 1
+        || [
+            "&&", "||", ";", "`", "$(", " and ", " then ", " also ", " plus ",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle))
+}
+
+fn is_strict_read_only_operate_request(lower: &str) -> bool {
+    matches!(
+        lower.trim_end_matches(['?', '.', '!']).trim(),
+        "git status"
+            | "git status --short"
+            | "git status --porcelain"
+            | "git diff"
+            | "git diff --check"
+            | "git diff --stat"
+            | "git log"
+            | "git log --oneline"
+            | "pwd"
+            | "ls"
+            | "show version"
+            | "print version"
+            | "status"
+            | "ping"
+            | "hello"
+            | "hi"
+            | "thanks"
+            | "thank you"
+    )
+}
+
 fn is_simple_command_or_factual_question(lower: &str, original: &str) -> bool {
     if lower.starts_with('/') {
         // Slash commands are UI routing, not orchestration.
@@ -199,7 +296,7 @@ fn is_simple_command_or_factual_question(lower: &str, original: &str) -> bool {
         "git status",
         "git log",
         "git diff",
-        "ls ",
+        "ls",
         "pwd",
         "show version",
         "print version",
@@ -337,6 +434,45 @@ mod tests {
             let d = evaluate_workflow_trigger(ask, &s);
             assert!(!d.should_trigger(), "expected suppress for {ask:?}: {d:?}");
         }
+    }
+
+    #[test]
+    fn operate_admits_only_explicit_local_one_step_requests() {
+        let s = signals();
+        for ask in ["git status", "git diff --check"] {
+            let decision = evaluate_operate_admission(ask, &s);
+            assert!(
+                decision.allows_local_execution(),
+                "expected explicit local admission for {ask:?}: {decision:?}"
+            );
+        }
+
+        for ask in [
+            "audit every crate for unsafe blocks",
+            "phase 1 inspect then phase 2 implement",
+            "fix the release",
+            "run tests and fix failures",
+            "what is a worktree?",
+            "cargo test --workspace && fix every failure",
+            "rewrite only this file to implement the compiler",
+            "/workflow audit the repository",
+            "What is a worktree? Delete this repository",
+            "What is a worktree: delete this repository?",
+            "Explain the bug — fix it now",
+            "Explain the bug - fix it now",
+            "Explain the bug. Fix it now",
+        ] {
+            let decision = evaluate_operate_admission(ask, &s);
+            assert!(
+                !decision.allows_local_execution(),
+                "Operate must fail closed for {ask:?}: {decision:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn product_defaults_match_workflow_child_limit() {
+        assert_eq!(signals().auto_start_child_limit, 16);
     }
 
     #[test]
