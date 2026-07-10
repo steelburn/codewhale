@@ -12,7 +12,7 @@ mod worktree;
 
 pub use registry::{LaneRecord, LaneRegistry, LaneStatus, lanes_dir};
 pub use runtime::{
-    InlineRuntime, LaneStartSpec, RuntimeBackend, RuntimeBackendKind, TmuxRuntime, backend_for,
-    resolve_backend,
+    InlineRuntime, LaneLogProxySpec, LaneStartSpec, RuntimeBackend, RuntimeBackendKind,
+    TmuxRuntime, backend_for, resolve_backend, run_lane_log_proxy,
 };
 pub use worktree::{WorktreeProvision, provision_worktree, remove_worktree_if_expired};

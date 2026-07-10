@@ -172,6 +172,10 @@ pub fn map_exec_stream_line(line: &str) -> Option<FleetWorkerEventPayload> {
                 .map(str::to_string);
             Some(FleetWorkerEventPayload::RunningTool { tool, call_id })
         }
+        "workflow_event" => Some(FleetWorkerEventPayload::WorkflowEvent {
+            workflow_run_id: value.get("run_id")?.as_str()?.to_string(),
+            event: value.get("event")?.clone(),
+        }),
         // Streaming model output / tool results mean the worker is alive and
         // making progress; surface a coarse Running heartbeat.
         "content" | "tool_result" => Some(FleetWorkerEventPayload::Running),
@@ -721,6 +725,22 @@ mod tests {
         match map_exec_stream_line(r#"{"type":"error","error":"boom"}"#) {
             Some(FleetWorkerEventPayload::Failed { reason, .. }) => assert_eq!(reason, "boom"),
             other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_line_maps_workflow_receipt_to_typed_event() {
+        let line =
+            r#"{"type":"workflow_event","run_id":"workflow_1","event":{"type":"task_completed"}}"#;
+        match map_exec_stream_line(line) {
+            Some(FleetWorkerEventPayload::WorkflowEvent {
+                workflow_run_id,
+                event,
+            }) => {
+                assert_eq!(workflow_run_id, "workflow_1");
+                assert_eq!(event["type"], "task_completed");
+            }
+            other => panic!("expected typed workflow receipt, got {other:?}"),
         }
     }
 

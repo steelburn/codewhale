@@ -17,7 +17,8 @@ use codewhale_app_server::{
     AppServerOptions, run as run_app_server, run_stdio as run_app_server_stdio,
 };
 use codewhale_config::{
-    CliRuntimeOverrides, ConfigStore, ProviderKind, ResolvedRuntimeOptions, RuntimeApiKeySource,
+    CliRuntimeOverrides, ConfigStore, ProviderKind, ProviderSource, ResolvedRuntimeOptions,
+    RuntimeApiKeySource,
 };
 use codewhale_execpolicy::{AskForApproval, ExecPolicyContext, ExecPolicyEngine};
 use codewhale_mcp::{McpServerDefinition, run_stdio_server};
@@ -229,6 +230,12 @@ path used by stream-json wrappers.
     Exec(TuiPassthroughArgs),
     /// Manage durable Agent Fleet runs via the TUI runtime.
     Fleet(TuiPassthroughArgs),
+    /// Internal model-free Workflow tool dispatcher used by Lane Runtime.
+    #[command(name = "workflow-tool", hide = true)]
+    WorkflowTool(TuiPassthroughArgs),
+    /// Internal detached-runtime output/receipt supervisor.
+    #[command(name = "lane-log-proxy", hide = true)]
+    LaneLogProxy(LaneLogProxyArgs),
     /// Run checked-in Workflows through a Lane Runtime backend.
     #[command(after_help = "\
 Examples:
@@ -236,8 +243,8 @@ Examples:
   codewhale workflow run stopship --fleet v0868-stopship --runtime inline --verify
 
 `workflow run` validates the checked-in Workflow source and named Fleet roster,
-creates a Lane record, then starts the existing headless Workflow tool through
-the selected Runtime backend.
+creates a Lane record, then dispatches the Workflow tool directly through the
+selected Runtime backend without an operator model turn.
 ")]
     Workflow(WorkflowArgs),
     /// Manage running workflow instances (Lanes) and Runtime backends (#4176).
@@ -385,6 +392,22 @@ struct TuiPassthroughArgs {
     args: Vec<String>,
 }
 
+#[derive(Debug, Args)]
+struct LaneLogProxyArgs {
+    #[arg(long, value_name = "PATH")]
+    log_path: PathBuf,
+    #[arg(long, value_name = "PATH")]
+    receipt_path: PathBuf,
+    #[arg(long, value_name = "PATH")]
+    receipt_tmp_path: PathBuf,
+    #[arg(long, value_name = "PATH")]
+    environment_path: Option<PathBuf>,
+    #[arg(long)]
+    lane_id: String,
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+    command: Vec<String>,
+}
+
 /// `codewhale lane …` — running workflow instances (#4176).
 #[derive(Debug, Args)]
 struct LaneArgs {
@@ -510,7 +533,6 @@ enum WorkflowCommand {
     },
 }
 
-#[derive(Debug)]
 struct LaneStartRequest {
     workflow: Option<String>,
     fleet: Option<String>,
@@ -522,6 +544,8 @@ struct LaneStartRequest {
     worktree_path: Option<PathBuf>,
     worktree_ttl_secs: Option<u64>,
     command: Vec<String>,
+    environment: Vec<(String, String)>,
+    cwd: Option<PathBuf>,
 }
 
 fn start_lane(request: LaneStartRequest) -> Result<()> {
@@ -540,6 +564,8 @@ fn start_lane(request: LaneStartRequest) -> Result<()> {
         worktree_path,
         worktree_ttl_secs,
         command,
+        environment,
+        cwd,
     } = request;
     let kind = RuntimeBackendKind::parse(&runtime)?;
     let reg = LaneRegistry::open_default()?;
@@ -569,7 +595,12 @@ fn start_lane(request: LaneStartRequest) -> Result<()> {
     };
     let spec = LaneStartSpec {
         command: cmd,
-        cwd: None,
+        cwd,
+        environment,
+        log_proxy: (kind == RuntimeBackendKind::Tmux)
+            .then(std::env::current_exe)
+            .transpose()
+            .context("resolve current Codewhale executable for tmux log proxy")?,
         worktree,
     };
     let backend = resolve_backend(kind);
@@ -594,7 +625,12 @@ fn run_lane_command(args: LaneArgs) -> Result<()> {
     match args.command {
         LaneCommand::List { json } => {
             let reg = LaneRegistry::open_default()?;
-            let lanes = reg.list()?;
+            let mut lanes = reg.list()?;
+            for lane in &mut lanes {
+                if let Err(err) = backend_for(lane).reconcile(&reg, lane) {
+                    eprintln!("warning: could not reconcile lane `{}`: {err:#}", lane.id);
+                }
+            }
             if json {
                 println!("{}", serde_json::to_string_pretty(&lanes)?);
             } else if lanes.is_empty() {
@@ -620,7 +656,8 @@ fn run_lane_command(args: LaneArgs) -> Result<()> {
         }
         LaneCommand::Status { lane_id, json } => {
             let reg = LaneRegistry::open_default()?;
-            let lane = reg.load(&lane_id)?;
+            let mut lane = reg.load(&lane_id)?;
+            backend_for(&lane).reconcile(&reg, &mut lane)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&lane)?);
             } else {
@@ -642,6 +679,13 @@ fn run_lane_command(args: LaneArgs) -> Result<()> {
                 );
                 println!("branch:   {}", lane.branch.as_deref().unwrap_or("-"));
                 println!("tmux:     {}", lane.tmux_session.as_deref().unwrap_or("-"));
+                println!(
+                    "socket:   {}",
+                    lane.tmux_socket
+                        .as_ref()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|| "-".to_string())
+                );
                 println!("attach:   {}", lane.attach_target.as_deref().unwrap_or("-"));
                 println!("log:      {}", lane.log_path.display());
             }
@@ -649,9 +693,16 @@ fn run_lane_command(args: LaneArgs) -> Result<()> {
         }
         LaneCommand::Attach { lane_id, print } => {
             let reg = LaneRegistry::open_default()?;
-            let lane = reg.load(&lane_id)?;
+            let mut lane = reg.load(&lane_id)?;
             let backend = backend_for(&lane);
+            backend.reconcile(&reg, &mut lane)?;
             let Some(attach) = backend.attach_command(&lane) else {
+                if !lane.status.is_active() {
+                    bail!(
+                        "lane `{lane_id}` is {} and has no active attach target",
+                        lane.status.as_str()
+                    );
+                }
                 bail!(
                     "lane `{lane_id}` runtime `{}` has no attach target",
                     lane.runtime.as_str()
@@ -662,7 +713,13 @@ fn run_lane_command(args: LaneArgs) -> Result<()> {
                 return Ok(());
             }
             if let Some(session) = lane.tmux_session.as_deref() {
+                let socket = lane
+                    .tmux_socket
+                    .as_deref()
+                    .context("tmux lane is missing its pinned server socket")?;
                 let status = Command::new("tmux")
+                    .arg("-S")
+                    .arg(socket)
                     .args(["attach", "-t", session])
                     .status();
                 match status {
@@ -690,12 +747,18 @@ fn run_lane_command(args: LaneArgs) -> Result<()> {
             if !path.exists() {
                 bail!("log file missing: {}", path.display());
             }
-            let content = std::fs::read_to_string(&path)?;
-            let lines: Vec<&str> = content.lines().collect();
+            let content = std::fs::read(&path)?;
+            let lines: Vec<&[u8]> = content
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+                .collect();
             let start = lines.len().saturating_sub(tail);
+            let mut stdout = std::io::stdout().lock();
             for line in &lines[start..] {
-                println!("{line}");
+                stdout.write_all(String::from_utf8_lossy(line).as_bytes())?;
+                stdout.write_all(b"\n")?;
             }
+            stdout.flush()?;
             if !follow {
                 return Ok(());
             }
@@ -703,15 +766,16 @@ fn run_lane_command(args: LaneArgs) -> Result<()> {
             file.seek(std::io::SeekFrom::End(0))?;
             let mut reader = std::io::BufReader::new(file);
             loop {
-                let mut line = String::new();
-                match reader.read_line(&mut line) {
+                let mut line = Vec::new();
+                match reader.read_until(b'\n', &mut line) {
                     Ok(0) => {
                         thread::sleep(Duration::from_millis(200));
                         continue;
                     }
                     Ok(_) => {
-                        print!("{line}");
-                        let _ = std::io::stdout().flush();
+                        let mut stdout = std::io::stdout().lock();
+                        stdout.write_all(String::from_utf8_lossy(&line).as_bytes())?;
+                        stdout.flush()?;
                     }
                     Err(err) => return Err(err.into()),
                 }
@@ -747,11 +811,30 @@ fn run_lane_command(args: LaneArgs) -> Result<()> {
             worktree_path,
             worktree_ttl_secs,
             command,
+            environment: Vec::new(),
+            cwd: None,
         }),
     }
 }
 
-fn run_workflow_command(args: WorkflowArgs) -> Result<()> {
+fn run_lane_log_proxy_command(args: LaneLogProxyArgs) -> Result<()> {
+    let exit_code = codewhale_lane::run_lane_log_proxy(codewhale_lane::LaneLogProxySpec {
+        command: args.command,
+        log_path: args.log_path,
+        receipt_path: args.receipt_path,
+        receipt_tmp_path: args.receipt_tmp_path,
+        environment_path: args.environment_path,
+        lane_id: args.lane_id,
+    })?;
+    std::process::exit(exit_code);
+}
+
+fn run_workflow_command(
+    cli: &Cli,
+    resolved_runtime: &ResolvedRuntimeOptions,
+    config_path: &Path,
+    args: WorkflowArgs,
+) -> Result<()> {
     match args.command {
         WorkflowCommand::Run {
             workflow,
@@ -767,10 +850,17 @@ fn run_workflow_command(args: WorkflowArgs) -> Result<()> {
             worktree_path,
             worktree_ttl_secs,
         } => {
-            let workspace = workflow_workspace_root()?;
+            let workspace = workflow_workspace_root(cli.workspace.as_deref())?;
             let source_path =
                 resolve_workflow_source_path(&workflow, source_path.as_ref(), &workspace)?;
             validate_workflow_source_file(&source_path)?;
+
+            let source_root = if let Some(repo) = worktree_repo.as_deref() {
+                repo.canonicalize()
+                    .with_context(|| format!("resolve --worktree-repo {}", repo.display()))?
+            } else {
+                workspace.clone()
+            };
 
             let roots = named_fleet_search_roots(&workspace);
             let named_fleet = codewhale_workflow::load_named_fleet(&fleet, &roots)
@@ -781,16 +871,19 @@ fn run_workflow_command(args: WorkflowArgs) -> Result<()> {
                     .with_context(|| format!("validate stopship roles in fleet `{fleet}`"))?;
             }
 
-            let command = workflow_exec_command(
-                &workspace,
-                &source_path,
-                &workflow,
-                &fleet,
-                issue.as_deref(),
-                goal.as_deref(),
+            let process = workflow_exec_command(WorkflowExecSpec {
+                cli,
+                resolved_runtime,
+                config_path,
+                source_root: &source_root,
+                source_path: &source_path,
+                workflow: &workflow,
+                fleet: &fleet,
+                issue: issue.as_deref(),
+                goal: goal.as_deref(),
                 token_budget,
                 verify,
-            )?;
+            })?;
             start_lane(LaneStartRequest {
                 workflow: Some(workflow),
                 fleet: Some(fleet),
@@ -801,13 +894,20 @@ fn run_workflow_command(args: WorkflowArgs) -> Result<()> {
                 branch,
                 worktree_path,
                 worktree_ttl_secs,
-                command,
+                command: process.command,
+                environment: process.environment,
+                cwd: Some(workspace),
             })
         }
     }
 }
 
-fn workflow_workspace_root() -> Result<PathBuf> {
+fn workflow_workspace_root(explicit: Option<&Path>) -> Result<PathBuf> {
+    if let Some(path) = explicit {
+        return path
+            .canonicalize()
+            .with_context(|| format!("resolve workflow workspace {}", path.display()));
+    }
     let cwd = std::env::current_dir().context("resolve current directory")?;
     let output = Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
@@ -819,7 +919,8 @@ fn workflow_workspace_root() -> Result<PathBuf> {
         let text = String::from_utf8_lossy(&output.stdout);
         let root = text.trim();
         if !root.is_empty() {
-            return Ok(PathBuf::from(root));
+            let root = PathBuf::from(root);
+            return Ok(root.canonicalize().unwrap_or(root));
         }
     }
     Ok(cwd)
@@ -923,23 +1024,48 @@ fn display_roots(roots: &[PathBuf]) -> String {
         .join(", ")
 }
 
-fn workflow_exec_command(
-    workspace: &Path,
-    source_path: &Path,
-    workflow: &str,
-    fleet: &str,
-    issue: Option<&str>,
-    goal: Option<&str>,
+struct WorkflowExecSpec<'a> {
+    cli: &'a Cli,
+    resolved_runtime: &'a ResolvedRuntimeOptions,
+    config_path: &'a Path,
+    source_root: &'a Path,
+    source_path: &'a Path,
+    workflow: &'a str,
+    fleet: &'a str,
+    issue: Option<&'a str>,
+    goal: Option<&'a str>,
     token_budget: Option<u64>,
     verify: bool,
-) -> Result<Vec<String>> {
-    let dispatcher = std::env::current_exe()
-        .ok()
-        .filter(|path| path.is_file())
-        .unwrap_or_else(|| PathBuf::from("codewhale"));
+}
+
+struct WorkflowProcessSpec {
+    command: Vec<String>,
+    environment: Vec<(String, String)>,
+}
+
+fn workflow_exec_command(spec: WorkflowExecSpec<'_>) -> Result<WorkflowProcessSpec> {
+    let WorkflowExecSpec {
+        cli,
+        resolved_runtime,
+        config_path,
+        source_root,
+        source_path,
+        workflow,
+        fleet,
+        issue,
+        goal,
+        token_budget,
+        verify,
+    } = spec;
     let source_arg = source_path
-        .strip_prefix(workspace)
-        .unwrap_or(source_path)
+        .strip_prefix(source_root)
+        .with_context(|| {
+            format!(
+                "workflow source {} must be inside execution root {}",
+                source_path.display(),
+                source_root.display()
+            )
+        })?
         .display()
         .to_string();
     let mut payload = serde_json::json!({
@@ -957,20 +1083,72 @@ fn workflow_exec_command(
     if let Some(token_budget) = token_budget {
         payload["token_budget"] = serde_json::json!(token_budget);
     }
-    let prompt = format!(
-        "Run the CodeWhale `workflow` tool with this exact JSON input, wait for completion, and report the resulting run_id/status. Do not describe the workflow instead of running it.\n\n```json\n{}\n```",
-        serde_json::to_string_pretty(&payload)?
+    let input_json = serde_json::to_string(&payload)?;
+    let passthrough = vec![
+        "workflow-tool".to_string(),
+        "--approval-source".to_string(),
+        "explicit-workflow-command".to_string(),
+        "--input-json".to_string(),
+        input_json,
+    ];
+    let command =
+        build_tui_command_with_paths(cli, resolved_runtime, passthrough, Some(config_path), None)?;
+    lane_process_spec_from_command(&command)
+}
+
+fn valid_lane_environment_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    chars
+        .next()
+        .is_some_and(|ch| ch == '_' || ch.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+fn shell_owned_lane_environment(key: &str) -> bool {
+    matches!(
+        key,
+        "PWD" | "OLDPWD" | "SHLVL" | "_" | "TERM" | "TMUX" | "TMUX_PANE"
+    )
+}
+
+fn lane_process_spec_from_command(command: &Command) -> Result<WorkflowProcessSpec> {
+    let mut argv = Vec::new();
+    argv.push(command.get_program().to_string_lossy().into_owned());
+    argv.extend(
+        command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned()),
     );
-    Ok(vec![
-        dispatcher.display().to_string(),
-        "--workspace".to_string(),
-        workspace.display().to_string(),
-        "exec".to_string(),
-        "--auto".to_string(),
-        "--output-format".to_string(),
-        "stream-json".to_string(),
-        prompt,
-    ])
+    let mut environment = std::collections::BTreeMap::new();
+    for (key, value) in std::env::vars_os() {
+        let (Some(key), Some(value)) = (key.to_str(), value.to_str()) else {
+            continue;
+        };
+        if valid_lane_environment_key(key) && !shell_owned_lane_environment(key) {
+            environment.insert(key.to_string(), value.to_string());
+        }
+    }
+    for (key, value) in command.get_envs() {
+        let key = key
+            .to_str()
+            .context("workflow runtime environment key is not UTF-8")?
+            .to_string();
+        if let Some(value) = value {
+            environment.insert(
+                key,
+                value
+                    .to_str()
+                    .context("workflow runtime environment value is not UTF-8")?
+                    .to_string(),
+            );
+        } else {
+            environment.remove(&key);
+        }
+    }
+    Ok(WorkflowProcessSpec {
+        command: argv,
+        environment: environment.into_iter().collect(),
+    })
 }
 
 /// Flags for `codewhale remote-setup`. Forwarded to the TUI binary, which owns
@@ -1279,8 +1457,25 @@ pub fn run_cli() -> std::process::ExitCode {
     }
 }
 
+fn split_lane_log_proxy_command(
+    command: Option<Commands>,
+) -> (Option<LaneLogProxyArgs>, Option<Commands>) {
+    match command {
+        Some(Commands::LaneLogProxy(args)) => (Some(args), None),
+        command => (None, command),
+    }
+}
+
 fn run() -> Result<()> {
     let mut cli = Cli::parse();
+
+    // The detached log proxy must not depend on user config parsing: its job
+    // is to frame child output and publish a terminal receipt even when the
+    // delegated command's own config is malformed.
+    let (proxy, command) = split_lane_log_proxy_command(cli.command.take());
+    if let Some(args) = proxy {
+        return run_lane_log_proxy_command(args);
+    }
 
     let mut store = ConfigStore::load(cli.config.clone())?;
     let runtime_overrides = CliRuntimeOverrides {
@@ -1297,8 +1492,6 @@ fn run() -> Result<()> {
         yolo: Some(cli.yolo),
         verbosity: cli.verbosity.clone(),
     };
-    let command = cli.command.take();
-
     match command {
         Some(Commands::Run(args)) => {
             let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
@@ -1349,7 +1542,16 @@ fn run() -> Result<()> {
             let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
             delegate_to_tui(&cli, &resolved_runtime, tui_args("fleet", args))
         }
-        Some(Commands::Workflow(args)) => run_workflow_command(args),
+        Some(Commands::WorkflowTool(args)) => {
+            let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
+            delegate_to_tui(&cli, &resolved_runtime, tui_args("workflow-tool", args))
+        }
+        Some(Commands::LaneLogProxy(_)) => unreachable!("lane log proxy dispatched above"),
+        Some(Commands::Workflow(args)) => {
+            let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
+            let config_path = store.path().to_path_buf();
+            run_workflow_command(&cli, &resolved_runtime, &config_path, args)
+        }
         Some(Commands::Lane(args)) => run_lane_command(args),
         Some(Commands::Review(args)) => {
             let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
@@ -2799,8 +3001,28 @@ fn build_tui_command(
     resolved_runtime: &ResolvedRuntimeOptions,
     passthrough: Vec<String>,
 ) -> Result<Command> {
+    build_tui_command_with_paths(
+        cli,
+        resolved_runtime,
+        passthrough,
+        cli.config.as_deref(),
+        cli.workspace.as_deref(),
+    )
+}
+
+fn build_tui_command_with_paths(
+    cli: &Cli,
+    resolved_runtime: &ResolvedRuntimeOptions,
+    passthrough: Vec<String>,
+    config_path: Option<&Path>,
+    workspace_path: Option<&Path>,
+) -> Result<Command> {
     let tui = locate_sibling_tui_binary()?;
-    let mut verbosity = resolved_runtime.verbosity.clone();
+    let mut verbosity = if cli.profile.is_some() {
+        cli.verbosity.clone()
+    } else {
+        resolved_runtime.verbosity.clone()
+    };
     if verbosity.is_none()
         && passthrough
             .iter()
@@ -2810,13 +3032,13 @@ fn build_tui_command(
     }
 
     let mut cmd = Command::new(&tui);
-    if let Some(config) = cli.config.as_ref() {
+    if let Some(config) = config_path {
         cmd.arg("--config").arg(config);
     }
     if let Some(profile) = cli.profile.as_ref() {
         cmd.arg("--profile").arg(profile);
     }
-    if let Some(workspace) = cli.workspace.as_ref() {
+    if let Some(workspace) = workspace_path {
         cmd.arg("--workspace").arg(workspace);
     }
     // Accepted for older scripts, but no longer forwarded: the interactive TUI
@@ -2840,7 +3062,9 @@ fn build_tui_command(
     if let Some(provider) = cli.provider.map(ProviderKind::from) {
         cmd.env("DEEPSEEK_PROVIDER", provider.as_str());
     }
-    if matches!(keyring_bridge_source, Some(RuntimeApiKeySource::Keyring))
+    if !(cli.profile.is_some()
+        && matches!(resolved_runtime.provider_source, ProviderSource::Config))
+        && matches!(keyring_bridge_source, Some(RuntimeApiKeySource::Keyring))
         && let Some(api_key) = keyring_bridge_api_key
     {
         // TUI reloads auth_mode from config/profile, but it does not re-query the
@@ -2884,10 +3108,19 @@ fn build_tui_command(
         cmd.env("DEEPSEEK_YOLO", "true");
     }
     if let Some(api_key) = cli.api_key.as_ref() {
-        cmd.env("DEEPSEEK_API_KEY", api_key);
-        for var in provider_env_vars(resolved_runtime.provider) {
-            if *var != "DEEPSEEK_API_KEY" {
-                cmd.env(var, api_key);
+        // `--profile` is resolved by the TUI after this facade starts it, so
+        // the base ConfigStore provider may not be the effective provider.
+        // Carry the explicit secret through a provider-neutral, source-marked
+        // slot; the TUI applies it after profile/OAuth resolution and before
+        // saved API-key slots. Preserve legacy provider envs only when their
+        // identity is already unambiguous here.
+        cmd.env("CODEWHALE_CLI_API_KEY", api_key);
+        if cli.profile.is_none() || cli.provider.is_some() {
+            cmd.env("DEEPSEEK_API_KEY", api_key);
+            for var in provider_env_vars(resolved_runtime.provider) {
+                if *var != "DEEPSEEK_API_KEY" {
+                    cmd.env(var, api_key);
+                }
             }
         }
         cmd.env("DEEPSEEK_API_KEY_SOURCE", "cli");
@@ -3089,6 +3322,14 @@ mod tests {
             // Safety: tests using this helper serialize with env_lock() and
             // restore the original value in Drop.
             unsafe { std::env::set_var(name, value) };
+            Self { name, previous }
+        }
+
+        fn remove(name: &'static str) -> Self {
+            let previous = std::env::var_os(name);
+            // Safety: tests using this helper serialize with env_lock() and
+            // restore the original value in Drop.
+            unsafe { std::env::remove_var(name) };
             Self { name, previous }
         }
     }
@@ -3655,31 +3896,143 @@ mod tests {
     }
 
     #[test]
+    fn hidden_lane_log_proxy_parses_child_argv_and_preserves_other_commands() {
+        let cli = parse_ok(&[
+            "codewhale",
+            "lane-log-proxy",
+            "--log-path",
+            "/tmp/lane.ndjson",
+            "--receipt-path",
+            "/tmp/lane.exit.json",
+            "--receipt-tmp-path",
+            "/tmp/lane.exit.json.tmp",
+            "--environment-path",
+            "/tmp/lane.env.json",
+            "--lane-id",
+            "lane-proof",
+            "--",
+            "/bin/echo",
+            "--child-flag",
+            "hello",
+        ]);
+        let (proxy, command) = split_lane_log_proxy_command(cli.command);
+        assert!(command.is_none());
+        let proxy = proxy.expect("proxy args");
+        assert_eq!(proxy.lane_id, "lane-proof");
+        assert_eq!(
+            proxy.command,
+            ["/bin/echo", "--child-flag", "hello"].map(str::to_string)
+        );
+
+        let cli = parse_ok(&["codewhale", "lane", "list", "--json"]);
+        let (proxy, command) = split_lane_log_proxy_command(cli.command);
+        assert!(proxy.is_none());
+        assert!(matches!(
+            command,
+            Some(Commands::Lane(LaneArgs {
+                command: LaneCommand::List { json: true }
+            }))
+        ));
+    }
+
+    #[test]
     fn workflow_run_resolves_stopship_alias_and_payload() {
+        let _lock = env_lock();
+        let (_dir, _tui) = install_fake_tui_binary();
+        let _provider = ScopedEnvVar::remove("DEEPSEEK_PROVIDER");
+        let _model = ScopedEnvVar::remove("DEEPSEEK_MODEL");
+        let _base_url = ScopedEnvVar::remove("DEEPSEEK_BASE_URL");
+        let _api_key = ScopedEnvVar::remove("DEEPSEEK_API_KEY");
+        let _cli_api_key = ScopedEnvVar::remove("CODEWHALE_CLI_API_KEY");
         let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("..")
             .join("..");
+        let cli = parse_ok(&[
+            "codewhale",
+            "--profile",
+            "workflow-profile",
+            "--model",
+            "explicit-workflow-model",
+            "--api-key",
+            "explicit-profile-key",
+            "--workspace",
+            workspace.to_str().expect("workspace UTF-8"),
+        ]);
+        let resolved = resolved_runtime_for_test(ProviderKind::Deepseek, ProviderSource::Config);
         let source = resolve_workflow_source_path("stopship", None, &workspace)
             .expect("stopship workflow source");
         assert!(source.ends_with("workflows/v0868_stopship_lane.workflow.js"));
 
-        let command = workflow_exec_command(
-            &workspace,
-            &source,
-            "stopship",
-            "v0868-stopship",
-            Some("4090"),
-            Some("fix stopship"),
-            Some(25_000),
-            true,
-        )
+        let process = workflow_exec_command(WorkflowExecSpec {
+            cli: &cli,
+            resolved_runtime: &resolved,
+            config_path: &workspace.join("config.toml"),
+            source_root: &workspace,
+            source_path: &source,
+            workflow: "stopship",
+            fleet: "v0868-stopship",
+            issue: Some("4090"),
+            goal: Some("fix stopship"),
+            token_budget: Some(25_000),
+            verify: true,
+        })
         .expect("command");
-        let joined = command.join("\n");
-        assert!(joined.contains("\"source_path\": \"workflows/v0868_stopship_lane.workflow.js\""));
-        assert!(joined.contains("\"fleet\": \"v0868-stopship\""));
-        assert!(joined.contains("\"issue\": \"4090\""));
-        assert!(joined.contains("\"token_budget\": 25000"));
-        assert!(joined.contains("\"verify\": true"));
+        let joined = process.command.join("\n");
+        assert!(joined.contains("workflow-tool"));
+        assert!(joined.contains("explicit-workflow-command"));
+        assert!(joined.contains("--input-json"));
+        assert!(!process.command.iter().any(|arg| arg == "exec"));
+        assert!(!process.command.iter().any(|arg| arg == "--workspace"));
+        assert!(
+            process
+                .command
+                .windows(2)
+                .any(|pair| pair == ["--profile", "workflow-profile"])
+        );
+        assert!(!joined.contains("Run the CodeWhale"));
+        assert!(joined.contains("\"source_path\":\"workflows/v0868_stopship_lane.workflow.js\""));
+        assert!(joined.contains("\"fleet\":\"v0868-stopship\""));
+        assert!(joined.contains("\"issue\":\"4090\""));
+        assert!(joined.contains("\"token_budget\":25000"));
+        assert!(joined.contains("\"verify\":true"));
+        assert!(
+            process.environment.iter().any(|(key, value)| {
+                key == "DEEPSEEK_MODEL" && value == "explicit-workflow-model"
+            })
+        );
+        assert!(
+            !process
+                .environment
+                .iter()
+                .any(|(key, _)| key == "DEEPSEEK_PROVIDER")
+        );
+        assert!(
+            !process
+                .environment
+                .iter()
+                .any(|(key, _)| key == "DEEPSEEK_BASE_URL")
+        );
+        assert!(
+            !process
+                .environment
+                .iter()
+                .any(|(key, _)| key == "DEEPSEEK_API_KEY")
+        );
+        assert!(process.environment.iter().any(|(key, value)| {
+            key == "CODEWHALE_CLI_API_KEY" && value == "explicit-profile-key"
+        }));
+        assert!(
+            !process
+                .command
+                .iter()
+                .any(|argument| argument.contains("explicit-profile-key"))
+        );
+        assert!(
+            process
+                .environment
+                .iter()
+                .all(|(_, value)| value != "test-model")
+        );
     }
 
     #[test]
@@ -4881,7 +5234,7 @@ mod tests {
             approval_policy: None,
             sandbox_mode: None,
             yolo: None,
-            verbosity: None,
+            verbosity: Some("normal".to_string()),
             http_headers: resolved_headers,
         };
 
@@ -4894,6 +5247,8 @@ mod tests {
         assert_eq!(command_env(&cmd, "DEEPSEEK_API_KEY_SOURCE"), None);
         assert_eq!(command_env(&cmd, "DEEPSEEK_AUTH_MODE"), None);
         assert_eq!(command_env(&cmd, "DEEPSEEK_HTTP_HEADERS"), None);
+        assert_eq!(command_env(&cmd, "CODEWHALE_VERBOSITY"), None);
+        assert_eq!(command_env(&cmd, "DEEPSEEK_VERBOSITY"), None);
         let args: Vec<String> = cmd
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())

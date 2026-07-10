@@ -3454,14 +3454,15 @@ impl Config {
 
     /// Read the API key.
     ///
-    /// Precedence: **explicit in-memory override → provider/root config
-    /// → environment**.
+    /// Precedence: **route-specific OAuth → source-marked explicit CLI key →
+    /// provider/root config → ambient provider environment**.
     ///
     /// The in-memory `self.api_key` override is only honored when the user
     /// explicitly set the field (not the legacy `API_KEYRING_SENTINEL`
     /// placeholder, not empty whitespace).
     pub fn deepseek_api_key(&self) -> Result<String> {
         let provider = self.api_provider();
+        let explicit_cli_key = explicit_cli_api_key_override();
 
         // 0. DeepSeek compatibility slot. The legacy top-level `api_key`
         // belongs to DeepSeek only; provider-specific keys below must win for
@@ -3475,7 +3476,10 @@ impl Config {
         //   codewhale --provider deepseek --api-key ark-... --base-url ... --model auto
         if matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN)
             && std::env::var("DEEPSEEK_API_KEY_SOURCE").as_deref() == Ok("cli")
-            && let Some(env_key) = provider_env_api_key(provider)
+            && let Some(env_key) = explicit_cli_key
+                .as_ref()
+                .cloned()
+                .or_else(|| provider_env_api_key(provider))
             && !env_key.trim().is_empty()
         {
             return Ok(env_key);
@@ -3514,6 +3518,14 @@ impl Config {
         // `get_credentials`.
         if provider == ApiProvider::OpenaiCodex {
             return Ok(crate::oauth::get_credentials()?.access_token);
+        }
+
+        // The dispatcher cannot know the effective provider until the TUI
+        // applies `--profile`. A provider-neutral, source-marked CLI override
+        // therefore wins over saved API-key slots here, after OAuth routes
+        // have made their own credential decision.
+        if let Some(value) = explicit_cli_key {
+            return Ok(value);
         }
 
         // 1. Config file (provider-scoped slot). This intentionally wins
@@ -6289,6 +6301,18 @@ pub fn has_api_key(config: &Config) -> bool {
     has_api_key_for(config, config.api_provider())
 }
 
+fn provider_uses_oauth_credentials(config: &Config, provider: ApiProvider) -> bool {
+    provider == ApiProvider::OpenaiCodex
+        || (provider == ApiProvider::Moonshot
+            && config
+                .provider_config_for(provider)
+                .is_some_and(provider_config_uses_kimi_oauth))
+        || (provider == ApiProvider::Xai
+            && config
+                .provider_config_for(provider)
+                .is_some_and(provider_config_uses_xai_oauth))
+}
+
 #[must_use]
 pub fn active_provider_has_config_api_key(config: &Config) -> bool {
     let provider = config.api_provider();
@@ -6337,7 +6361,10 @@ pub fn active_provider_has_config_api_key(config: &Config) -> bool {
 
 #[must_use]
 pub fn active_provider_has_env_api_key(config: &Config) -> bool {
-    provider_env_api_key(config.api_provider()).is_some()
+    let provider = config.api_provider();
+    (!provider_uses_oauth_credentials(config, provider)
+        && explicit_cli_api_key_override().is_some())
+        || provider_env_api_key(provider).is_some()
 }
 
 #[must_use]
@@ -6350,6 +6377,12 @@ pub fn active_provider_uses_env_only_api_key(config: &Config) -> bool {
 /// prompt for a key inline.
 #[must_use]
 pub fn has_api_key_for(config: &Config, provider: ApiProvider) -> bool {
+    if provider == config.api_provider()
+        && !provider_uses_oauth_credentials(config, provider)
+        && explicit_cli_api_key_override().is_some()
+    {
+        return true;
+    }
     if provider
         .env_vars()
         .iter()
@@ -6626,6 +6659,16 @@ fn provider_env_api_key(provider: ApiProvider) -> Option<String> {
             .ok()
             .filter(|value| !value.trim().is_empty())
     })
+}
+
+fn explicit_cli_api_key_override() -> Option<String> {
+    (std::env::var("DEEPSEEK_API_KEY_SOURCE").as_deref() == Ok("cli"))
+        .then(|| {
+            std::env::var("CODEWHALE_CLI_API_KEY")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .flatten()
 }
 
 fn missing_provider_api_key_message(provider: ApiProvider) -> Result<String> {

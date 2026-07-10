@@ -48,12 +48,25 @@ use crate::utils::spawn_supervised;
 pub struct WorkflowTool {
     manager: SharedSubAgentManager,
     runtime: SubAgentRuntime,
+    approval_decision: &'static str,
 }
 
 impl WorkflowTool {
     #[must_use]
     pub fn new(manager: SharedSubAgentManager, runtime: SubAgentRuntime) -> Self {
-        Self { manager, runtime }
+        Self {
+            manager,
+            runtime,
+            approval_decision: "approved",
+        }
+    }
+
+    /// Mark execution as approved by the user's explicit `workflow run`
+    /// command rather than by an Engine tool-call approval gate.
+    #[must_use]
+    pub(crate) fn with_explicit_cli_approval(mut self) -> Self {
+        self.approval_decision = "approved_explicit_cli_command";
+        self
     }
 }
 
@@ -506,6 +519,7 @@ impl ToolSpec for WorkflowTool {
                     self.runtime.clone(),
                     state,
                     wait,
+                    self.approval_decision,
                 )
                 .await
             }
@@ -517,6 +531,7 @@ impl ToolSpec for WorkflowTool {
                     self.runtime.clone(),
                     state,
                     true,
+                    self.approval_decision,
                 )
                 .await
             }
@@ -534,6 +549,7 @@ async fn start_workflow(
     runtime: SubAgentRuntime,
     state: Arc<WorkflowWorkspaceState>,
     wait: bool,
+    approval_decision: &str,
 ) -> Result<ToolResult, ToolError> {
     let source = workflow_source(&input, context)?;
     let args = input.get("args").cloned().unwrap_or(Value::Null);
@@ -559,7 +575,7 @@ async fn start_workflow(
     let approval_decision = if summary.is_read_only_envelope() {
         "auto_read_only"
     } else {
-        "approved"
+        approval_decision
     };
     let plan_approval = summary.to_receipt(approval_decision, now_ms());
 
@@ -3660,13 +3676,7 @@ export default workflow({
         assert_eq!(task_started["thinking"], "low");
         assert_eq!(task_started["resolved_provider"], "deepseek");
         assert_eq!(task_started["resolved_model"], "deepseek-v4-flash");
-        assert!(
-            task_started["route_source"]
-                .as_str()
-                .is_some_and(|source| source.contains("explicit model id")),
-            "{}",
-            task_started["route_source"]
-        );
+        assert_eq!(task_started["route_source"], "task.model");
         assert_eq!(task_started["worktree"], false);
         assert!(task_started["parent_task_id"].is_null());
         assert_eq!(task_started["depth"], 1);
@@ -3691,6 +3701,95 @@ export default workflow({
             .expect("child result");
         assert_eq!(child.status, SubAgentStatus::Completed);
         assert_eq!(child.result.as_deref(), Some("child done"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn named_fleet_run_emits_role_resolved_receipt_and_rejects_unknown_before_provider() {
+        let _retry_guard = workflow_test_retry_guard();
+        let _env_lock = crate::test_support::lock_test_env();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", tmp.path());
+        std::fs::create_dir_all(tmp.path().join("fleets")).expect("fleets dir");
+        std::fs::write(
+            tmp.path().join("fleets/offline.toml"),
+            r#"
+name = "offline"
+[roles]
+reviewer = "reviewer"
+"#,
+        )
+        .expect("named fleet fixture");
+
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 2);
+        let (client, calls) = fake_chat_client("role-resolved child").await;
+        let runtime = SubAgentRuntime::new(
+            client,
+            "deepseek-v4-flash".to_string(),
+            ctx.clone(),
+            true,
+            None,
+            manager.clone(),
+        );
+        let tool = WorkflowTool::new(manager, runtime);
+
+        let completed = tool
+            .execute(
+                json!({
+                    "action": "run",
+                    "fleet": "offline",
+                    "script": "return await task({ description: 'review it', type: 'review', role: 'reviewer', label: 'offline-review' });"
+                }),
+                &ctx,
+            )
+            .await
+            .expect("named fleet workflow");
+        let payload: Value = serde_json::from_str(&completed.content).expect("workflow JSON");
+        assert_eq!(payload["status"], "completed", "{payload}");
+        assert_eq!(payload["result"], "role-resolved child");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let started = payload["events"]
+            .as_array()
+            .and_then(|events| events.iter().find(|event| event["type"] == "task_started"))
+            .expect("task_started receipt");
+        assert_eq!(started["role"], "reviewer");
+        assert_eq!(started["profile"], "reviewer");
+        assert_eq!(started["resolved_role"], "reviewer");
+        assert_eq!(started["resolved_profile"], "reviewer");
+        assert_eq!(started["resolved_provider"], "deepseek");
+        assert_eq!(started["resolved_model"], "deepseek-v4-flash");
+        assert_eq!(started["route_source"], "run.model");
+        assert!(
+            payload["events"]
+                .as_array()
+                .is_some_and(|events| events.iter().any(|event| event["type"] == "task_completed"))
+        );
+
+        let rejected = tool
+            .execute(
+                json!({
+                    "action": "run",
+                    "fleet": "offline",
+                    "script": "return await task({ description: 'must not launch', type: 'review', role: 'wizard' });"
+                }),
+                &ctx,
+            )
+            .await
+            .expect("rejected workflow still returns its terminal record");
+        let rejected: Value = serde_json::from_str(&rejected.content).expect("rejected JSON");
+        assert_eq!(rejected["status"], "failed", "{rejected}");
+        assert!(
+            rejected["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("unknown fleet role `wizard`")),
+            "{rejected}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "unknown role must fail before a second provider call"
+        );
     }
 
     #[tokio::test]

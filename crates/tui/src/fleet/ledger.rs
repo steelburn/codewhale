@@ -551,6 +551,7 @@ fn apply_record(state: &mut FleetLedgerState, record: FleetLedgerRecord) {
                 | FleetWorkerEventPayload::Restarted { .. }
                 | FleetWorkerEventPayload::ModelWait { .. }
                 | FleetWorkerEventPayload::RunningTool { .. }
+                | FleetWorkerEventPayload::WorkflowEvent { .. }
                 | FleetWorkerEventPayload::Heartbeat { .. }
                 | FleetWorkerEventPayload::Starting
                 | FleetWorkerEventPayload::Running => {
@@ -822,6 +823,48 @@ mod tests {
         let state = ledger.rebuild_state().unwrap();
         assert_eq!(state.workers["worker-1"], FleetWorkerStatus::Busy);
         assert_eq!(state.heartbeats["worker-1"].cpu_percent, Some(12.5));
+    }
+
+    #[test]
+    fn fleet_ledger_replays_typed_workflow_receipt_with_distinct_run_ids() {
+        let tmp = TempDir::new().unwrap();
+        let ledger = FleetLedger::open(tmp.path()).unwrap();
+        ledger.create_run(&sample_run("fleet-run-1")).unwrap();
+        ledger
+            .enqueue(sample_entry("fleet-run-1", "task-a"))
+            .unwrap();
+        ledger
+            .append_event(FleetWorkerEvent {
+                seq: 1,
+                run_id: FleetRunId::from("fleet-run-1"),
+                worker_id: "worker-1".to_string(),
+                task_id: "task-a".to_string(),
+                timestamp: "2026-07-10T00:00:00Z".to_string(),
+                payload: FleetWorkerEventPayload::WorkflowEvent {
+                    workflow_run_id: "workflow_1".to_string(),
+                    event: serde_json::json!({"type": "task_completed"}),
+                },
+                extra: BTreeMap::new(),
+            })
+            .unwrap();
+
+        let state = ledger.rebuild_state().unwrap();
+        let event = &state.latest_events["worker-1:fleet-run-1:task-a"];
+        assert!(matches!(
+            &event.payload,
+            FleetWorkerEventPayload::WorkflowEvent {
+                workflow_run_id,
+                event,
+            } if workflow_run_id == "workflow_1" && event["type"] == "task_completed"
+        ));
+        let last_line = std::fs::read_to_string(ledger.path())
+            .unwrap()
+            .lines()
+            .last()
+            .unwrap()
+            .to_string();
+        assert_eq!(last_line.matches("\"run_id\"").count(), 1);
+        assert_eq!(last_line.matches("\"workflow_run_id\"").count(), 1);
     }
 
     #[test]

@@ -1231,6 +1231,14 @@ fn fleet_event_label(payload: &FleetWorkerEventPayload) -> String {
             .as_ref()
             .map(|call_id| format!("running_tool tool={tool} call_id={call_id}"))
             .unwrap_or_else(|| format!("running_tool tool={tool}")),
+        FleetWorkerEventPayload::WorkflowEvent {
+            workflow_run_id,
+            event,
+        } => event
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .map(|kind| format!("workflow_event run_id={workflow_run_id} type={kind}"))
+            .unwrap_or_else(|| format!("workflow_event run_id={workflow_run_id}")),
         FleetWorkerEventPayload::Heartbeat { .. } => "heartbeat".to_string(),
         FleetWorkerEventPayload::Artifact(artifact) => {
             format!("artifact kind={}", artifact_kind_label(&artifact.kind))

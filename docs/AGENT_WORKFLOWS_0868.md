@@ -130,15 +130,41 @@ codewhale workflow run stopship \
   --goal "Fix #4090, #4093, #4094. Branch implementation from main."
 
 codewhale lane list
+codewhale lane status <lane-id>          # reconciles a finished tmux process
 codewhale lane attach <lane-id>          # or: codewhale lane attach <lane-id> --print
 codewhale lane logs <lane-id>
 codewhale lane stop <lane-id>
 ```
 
 `workflow run` validates the checked-in Workflow source and named Fleet roster,
-creates the Lane record, and starts the existing headless Workflow tool via the
-selected Runtime backend. The Workflow driver resolves each `task({ role })`
-through the named fleet before spawning sub-agents.
+creates the Lane record, and invokes the existing Workflow tool directly via
+the selected Runtime backend. It does not spend an operator-model turn asking a
+model to choose the tool. The Workflow driver resolves each `task({ role })`
+through the named fleet before spawning sub-agents and emits live
+`workflow_event` NDJSON receipts for run, phase, task, gate, and terminal state.
+Inline writes each receipt to the Lane journal as it arrives. The tmux backend
+launches a hidden Rust supervisor that frames arbitrary or binary child output
+as valid NDJSON, removes its private 0600 JSON environment sidecar before the
+child starts, and atomically publishes a separate bounded exit receipt.
+`lane status` and `lane list` reconcile that receipt to `completed` or `failed`,
+and fail a Lane closed when its tmux session vanished without a receipt. Start,
+stop, and reconciliation transitions share a per-Lane lock; a failed or
+unverifiable tmux kill leaves the Lane active and never triggers worktree
+cleanup. Every tmux Lane also persists an explicit registry-owned server socket
+and uses it for start, attach, liveness, and kill operations, so later changes
+to `TMUX_TMPDIR` cannot redirect lifecycle commands to the wrong server.
+Missing tmux and the not-yet-implemented VM/CI backends fail terminally instead
+of reporting a fictional Running Lane.
+
+The public `workflow run` command is the explicit approval of the Workflow
+plan envelope and records `approved_explicit_cli_command` in the durable plan
+receipt. That approval does not silently grant child shell or full-disk
+authority: the host runner preserves the resolved profile/provider/model,
+configured `allow_shell`, sandbox, external sandbox, network, and MCP posture.
+Only a global `--yolo` request selects bypass/full-authority behavior. Runtime
+secrets are bridged outside persisted Lane argv, and an isolated worktree run
+resolves its workspace from the Runtime-owned worktree cwd rather than the
+original checkout.
 
 Validate fleet role resolution without launching agents:
 
@@ -149,12 +175,14 @@ cargo test -p codewhale-workflow --lib named_fleet
 
 ### Direct tool paths
 
-From CodeWhale TUI or headless exec:
+From CodeWhale TUI or the direct headless Workflow entrypoint:
 
 ```bash
-# Headless stopship lane (preferred for CI/VM agents today)
-codewhale exec --auto --output-format stream-json \
-  "Run workflows/v0868_stopship_lane.workflow.js on branch codex/v0868-stopship. Fix #4090, #4093, #4094. Branch from main. Use fleet profiles scout/builder/reviewer/verifier from fleets/v0868-stopship.toml."
+# Headless stopship lane (deterministic host dispatch)
+codewhale workflow run stopship \
+  --fleet v0868-stopship \
+  --runtime inline \
+  --goal "Fix #4090, #4093, #4094. Branch implementation from main."
 
 # Per-issue headless (single stopship issue)
 codewhale exec --auto --output-format stream-json \
@@ -165,7 +193,10 @@ codewhale exec --auto --output-format stream-json \
 ```
 
 Workflows use read-only scouts first, then implementation agents in sequence.
-Write agents require approval in default modes; use `--auto` for headless VM runs.
+`workflow run` is an explicit execution command and approves that checked-in
+plan envelope; its children still inherit the configured durable-task
+permission and sandbox posture. Interactive `/workflow` runs retain their
+normal approval surfaces.
 Do **not** close #4090/#4093/#4094 until human-verified on `main`.
 
 ## Per-issue implementation (single issue)

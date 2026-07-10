@@ -673,6 +673,13 @@ pub enum FleetWorkerEventPayload {
         #[serde(skip_serializing_if = "Option::is_none")]
         call_id: Option<String>,
     },
+    /// Typed receipt emitted by a Workflow running inside this worker.
+    WorkflowEvent {
+        /// Inner Workflow run id. Named distinctly from the outer Fleet run id
+        /// because payloads are flattened into `FleetWorkerEvent`.
+        workflow_run_id: String,
+        event: Value,
+    },
     Heartbeat {
         #[serde(default)]
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -1158,6 +1165,33 @@ mod tests {
         assert!(matches!(
             back[2].payload,
             FleetWorkerEventPayload::Completed { .. }
+        ));
+    }
+
+    #[test]
+    fn workflow_receipt_round_trip_keeps_outer_and_inner_run_ids_distinct() {
+        let event = FleetWorkerEvent {
+            seq: 3,
+            run_id: FleetRunId::from("fleet-run-1"),
+            worker_id: "worker-a".to_string(),
+            task_id: "task-1".to_string(),
+            timestamp: "2026-07-10T00:00:00Z".to_string(),
+            payload: FleetWorkerEventPayload::WorkflowEvent {
+                workflow_run_id: "workflow_1".to_string(),
+                event: serde_json::json!({"type": "task_completed"}),
+            },
+            extra: BTreeMap::new(),
+        };
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["run_id"], "fleet-run-1");
+        assert_eq!(value["workflow_run_id"], "workflow_1");
+        let back: FleetWorkerEvent = serde_json::from_value(value).unwrap();
+        assert!(matches!(
+            back.payload,
+            FleetWorkerEventPayload::WorkflowEvent {
+                workflow_run_id,
+                ref event,
+            } if workflow_run_id == "workflow_1" && event["type"] == "task_completed"
         ));
     }
 

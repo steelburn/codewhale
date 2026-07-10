@@ -1242,11 +1242,14 @@ fn test_apply_spawn_profile_scout_yields_explore_type_and_faster_route() {
         .expect("scout should resolve")
         .expect("member resolved");
     assert_eq!(request.agent_type, SubAgentType::Explore);
+    let selected = resolve_spawn_model_selection(&stub_runtime(), &request, Some(&member))
+        .expect("scout model selection");
     assert_eq!(
-        spawn_model_route(&request, Some(&member)),
+        selected.model_route,
         ModelRoute::Faster,
         "scout's fast loadout routes to the faster sibling"
     );
+    assert_eq!(selected.source, SpawnRouteSource::AgentProfileLoadout);
 }
 
 #[test]
@@ -1260,65 +1263,87 @@ fn test_apply_spawn_profile_synthesizer_yields_plan_type() {
 }
 
 #[test]
-fn test_spawn_model_route_profile_precedence() {
+fn spawn_model_selection_has_stable_four_tier_precedence_and_source() {
+    let mut runtime = stub_runtime();
+    runtime.model = "deepseek-v4-flash".to_string();
+    runtime
+        .role_models
+        .insert("reviewer".to_string(), "deepseek-v4-flash".to_string());
+
     let mut profile = custom_fleet_profile("reviewer");
     profile.model = Some("deepseek-v4-pro".to_string());
-    profile.loadout = codewhale_config::FleetLoadout::Fast;
     let roster = fleet_roster_with("auditor", profile);
-    let member = roster.get("auditor").expect("member").clone();
+    let member = roster.get("auditor").expect("auditor profile");
 
-    // Member model pin beats loadout.
-    let request =
-        parse_spawn_request(&json!({"prompt": "x", "profile": "auditor"})).expect("parse");
-    assert_eq!(
-        spawn_model_route(&request, Some(&member)),
-        ModelRoute::Fixed("deepseek-v4-pro".to_string())
-    );
-
-    // Explicit model_strength beats the member model pin.
     let request = parse_spawn_request(&json!({
         "prompt": "x",
-        "profile": "auditor",
-        "model_strength": "same"
-    }))
-    .expect("parse");
-    assert_eq!(
-        spawn_model_route(&request, Some(&member)),
-        ModelRoute::Inherit
-    );
-
-    // Explicit model beats the member model pin: the requested route steps
-    // aside and the configured-model path fixes the explicit id.
-    let request = parse_spawn_request(&json!({
-        "prompt": "x",
-        "profile": "auditor",
+        "role": "review",
         "model": "deepseek-v4-flash"
     }))
-    .expect("parse");
-    let requested_route = spawn_model_route(&request, Some(&member));
+    .expect("task model request");
+    let selected = resolve_spawn_model_selection(&runtime, &request, Some(member))
+        .expect("task model selection");
     assert_eq!(
-        assignment_model_route(Some("deepseek-v4-flash"), requested_route),
+        selected,
+        SpawnModelSelection {
+            model_route: ModelRoute::Fixed("deepseek-v4-flash".to_string()),
+            source: SpawnRouteSource::TaskModel,
+        }
+    );
+
+    let request = parse_spawn_request(&json!({
+        "prompt": "x",
+        "role": "review",
+        "model_strength": "faster"
+    }))
+    .expect("task strength request");
+    let selected = resolve_spawn_model_selection(&runtime, &request, Some(member))
+        .expect("task strength selection");
+    assert_eq!(selected.model_route, ModelRoute::Faster);
+    assert_eq!(selected.source, SpawnRouteSource::TaskModelStrength);
+
+    let request =
+        parse_spawn_request(&json!({"prompt": "x", "role": "review"})).expect("profile request");
+    let selected =
+        resolve_spawn_model_selection(&runtime, &request, Some(member)).expect("profile selection");
+    assert_eq!(
+        selected.model_route,
+        ModelRoute::Fixed("deepseek-v4-pro".to_string()),
+        "saved AgentProfile model must beat the configured role default"
+    );
+    assert_eq!(selected.source, SpawnRouteSource::AgentProfileModel);
+
+    let mut strong_profile = custom_fleet_profile("reviewer");
+    strong_profile.loadout = codewhale_config::FleetLoadout::Custom("strong".to_string());
+    let strong_roster = fleet_roster_with("architect", strong_profile);
+    let selected =
+        resolve_spawn_model_selection(&runtime, &request, strong_roster.get("architect"))
+            .expect("custom profile selection");
+    assert_eq!(selected.model_route, ModelRoute::Inherit);
+    assert_eq!(selected.source, SpawnRouteSource::RunModel);
+
+    let mut fast_profile = custom_fleet_profile("reviewer");
+    fast_profile.loadout = codewhale_config::FleetLoadout::Fast;
+    let fast_roster = fleet_roster_with("fast-reviewer", fast_profile);
+    let selected =
+        resolve_spawn_model_selection(&runtime, &request, fast_roster.get("fast-reviewer"))
+            .expect("fast profile selection");
+    assert_eq!(selected.model_route, ModelRoute::Faster);
+    assert_eq!(selected.source, SpawnRouteSource::AgentProfileLoadout);
+
+    let selected =
+        resolve_spawn_model_selection(&runtime, &request, None).expect("role default selection");
+    assert_eq!(
+        selected.model_route,
         ModelRoute::Fixed("deepseek-v4-flash".to_string())
     );
+    assert_eq!(selected.source, SpawnRouteSource::RoleDefault);
 
-    // Without a model pin, the loadout decides: fast -> Faster, other
-    // loadouts inherit rather than auto-downgrade to the cheap sibling.
-    let mut fast = custom_fleet_profile("scout");
-    fast.loadout = codewhale_config::FleetLoadout::Fast;
-    let roster = fleet_roster_with("recon", fast);
-    let request = parse_spawn_request(&json!({"prompt": "x", "profile": "recon"})).expect("parse");
-    assert_eq!(
-        spawn_model_route(&request, roster.get("recon")),
-        ModelRoute::Faster
-    );
-
-    let mut strong = custom_fleet_profile("builder");
-    strong.loadout = codewhale_config::FleetLoadout::Custom("strong".to_string());
-    let roster = fleet_roster_with("architect", strong);
-    assert_eq!(
-        spawn_model_route(&request, roster.get("architect")),
-        ModelRoute::Inherit
-    );
+    runtime.role_models.clear();
+    let selected =
+        resolve_spawn_model_selection(&runtime, &request, None).expect("run model selection");
+    assert_eq!(selected.model_route, ModelRoute::Inherit);
+    assert_eq!(selected.source, SpawnRouteSource::RunModel);
 }
 
 #[test]
@@ -1643,6 +1668,22 @@ fn test_parse_spawn_request_accepts_fleet_role_token_for_runtime_resolution() {
     assert!(!parsed.agent_type_explicit);
     assert_eq!(parsed.assignment.role.as_deref(), Some("release_lead"));
     assert_eq!(parsed.profile.as_deref(), Some("release_lead"));
+
+    let roster = FleetRoster::built_ins_only();
+    let mut parsed = parsed;
+    let member = apply_spawn_profile(&mut parsed, &roster)
+        .expect("release_lead should resolve")
+        .expect("release_lead should select a roster member");
+    assert_eq!(member.id, "manager");
+    assert_eq!(parsed.profile.as_deref(), Some("manager"));
+
+    let mut scout =
+        parse_spawn_request(&json!({"prompt": "map it", "role": "scout"})).expect("scout");
+    let member = apply_spawn_profile(&mut scout, &roster)
+        .expect("scout should resolve")
+        .expect("scout should select a roster member");
+    assert_eq!(member.id, "scout");
+    assert_eq!(scout.agent_type, SubAgentType::Explore);
 }
 
 #[test]
@@ -1690,13 +1731,23 @@ fn test_parse_spawn_request_accepts_full_role_vocabulary() {
         );
 
         let input = json!({ "prompt": "do work", "role": role });
-        let parsed = parse_spawn_request(&input)
+        let mut parsed = parse_spawn_request(&input)
             .unwrap_or_else(|e| panic!("role {role:?} should parse, got {e}"));
         assert_eq!(parsed.agent_type, expected_type, "type for role {role:?}");
         assert_eq!(
             parsed.assignment.role.as_deref(),
             Some(expected_role),
             "canonical role for {role:?}"
+        );
+        assert!(
+            parsed.profile.is_none(),
+            "descriptive role alias {role:?} must not become a roster profile"
+        );
+        assert!(
+            apply_spawn_profile(&mut parsed, &FleetRoster::built_ins_only())
+                .unwrap_or_else(|e| panic!("role {role:?} should apply without a profile: {e}"))
+                .is_none(),
+            "descriptive role alias {role:?} should not require roster resolution"
         );
     }
 }

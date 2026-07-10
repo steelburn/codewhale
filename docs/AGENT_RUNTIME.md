@@ -123,10 +123,13 @@ delegation. The default affords at least three nested levels.
 
 The fleet ledger persists the worker's own event stream rather than a separate,
 simulated taxonomy. `codewhale exec --output-format stream-json` emits
-`{"type": "content" | "tool_use" | "tool_result" | "metadata" | "done" |
-"error"}` lines, which map onto the fleet ledger's `FleetWorkerEventPayload`
-(`RunningTool`, `Running`, `Completed`, `Failed`, …). One vocabulary, two
-surfaces.
+`{"type": "content" | "tool_use" | "tool_result" | "workflow_event" |
+"metadata" | "done" | "error"}` lines, which map onto the fleet ledger's
+`FleetWorkerEventPayload` (`RunningTool`, `WorkflowEvent`, `Running`,
+`Completed`, `Failed`, …). `workflow_event` carries the typed
+run/phase/task/gate receipt while a Workflow is in flight and is retained as a
+typed `WorkflowEvent` in the Fleet ledger; the enclosing worker still owns the
+terminal `done` or `error`. One vocabulary, two surfaces.
 
 ## Convergence with Claude Code (#2972)
 

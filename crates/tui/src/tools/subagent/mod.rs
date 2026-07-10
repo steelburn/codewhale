@@ -4361,24 +4361,11 @@ async fn spawn_subagent_from_input(
             }
         }
     }
-    // #4193 seam 2: normalize/validate the requested model against the CHILD's
-    // (pinned) provider, not the session provider. `child_runtime` carries the
-    // provider-B client set above, so a profile-less/`inherit` member still
-    // sees the session provider here (no regression).
-    let configured_model = match spawn_request.model.clone() {
-        Some(model) => Some(normalize_requested_subagent_model(
-            &model,
-            "model",
-            child_runtime.client.api_provider(),
-        )?),
-        None => configured_model_for_role_or_type(
-            &child_runtime,
-            spawn_request.assignment.role.as_deref(),
-            &spawn_request.agent_type,
-        )?,
-    };
-    // Resolved before the prompt is moved out of the request below.
-    let requested_model_route = spawn_model_route(&spawn_request, profile_member.as_ref());
+    // Resolve the model once against the CHILD's (possibly profile-pinned)
+    // provider. The typed selection carries both precedence and provenance so
+    // a role default cannot override a saved AgentProfile model (#4177).
+    let model_selection =
+        resolve_spawn_model_selection(&child_runtime, &spawn_request, profile_member.as_ref())?;
     let (effective_prompt, _resident_conflict) = if let Some(ref file_path) =
         spawn_request.resident_file
     {
@@ -4417,10 +4404,10 @@ async fn spawn_subagent_from_input(
     // fixed-model validation then all resolve against provider B.
     let route = resolve_subagent_assignment_route(
         &child_runtime,
-        configured_model,
+        None,
         &effective_prompt,
         &spawn_request.agent_type,
-        requested_model_route,
+        model_selection.model_route,
         spawn_request.thinking,
     )
     .await;
@@ -4442,7 +4429,7 @@ async fn spawn_subagent_from_input(
     let spawn_metadata = WorkflowTaskSpawnMetadata {
         resolved_provider: child_runtime.client.api_provider().as_str().to_string(),
         resolved_model: effective_model.clone(),
-        route_source: route_source_label(&model_route),
+        route_source: model_selection.source.as_str().to_string(),
         resolved_role,
         resolved_profile,
         parent_task_id: child_runtime.parent_agent_id.clone(),
@@ -6351,6 +6338,7 @@ fn parse_spawn_request(input: &Value) -> Result<SpawnRequest, ToolError> {
     // roster role / member id (scout, release_lead). Type aliases still set
     // agent_type; non-alias roles defer to fleet profile resolution (#4177).
     let parsed_role_type = role_input.and_then(SubAgentType::from_str);
+    let role_is_type_alias = parsed_role_type.is_some();
 
     if let (Some(type_kind), Some(role_kind)) = (&parsed_type, &parsed_role_type)
         && type_kind != role_kind
@@ -6370,14 +6358,15 @@ fn parse_spawn_request(input: &Value) -> Result<SpawnRequest, ToolError> {
         .or_else(|| type_input.and_then(normalize_role_alias))
         .map(str::to_string);
 
-    // Fleet role token: either the raw role when it is not a type alias, or
-    // the alias form (e.g. implementer) used as a roster lookup key.
+    // Fleet role token: the raw role only when it is not a descriptive type
+    // alias. Type aliases remain local SubAgentType vocabulary and must not be
+    // promoted into roster lookup keys.
     let fleet_role_token = match role_input {
-        Some(raw) => {
+        Some(raw) if !role_is_type_alias => {
             let token = validate_role_name(raw)?;
             Some(token)
         }
-        None => None,
+        _ => None,
     };
 
     let role = role_alias.or_else(|| fleet_role_token.clone()).or_else(|| {
@@ -6389,8 +6378,11 @@ fn parse_spawn_request(input: &Value) -> Result<SpawnRequest, ToolError> {
     let mut profile = optional_input_str(input, &["profile", "fleet_profile", "roster_profile"])
         .map(validate_profile_name)
         .transpose()?;
-    // When the caller only declared a fleet role, use it as the profile key
-    // so `apply_spawn_profile` is the single roster resolution path (#4177).
+    // When the caller declared a non-type Fleet role, use it as the profile
+    // key so `apply_spawn_profile` is the single roster resolution path.
+    // Descriptive SubAgentType aliases (worker/review/plan/verify/...) keep
+    // profile=None; promoting those aliases to roster ids made valid direct
+    // agent calls fail because several are not member ids (#4177).
     if profile.is_none() {
         profile = fleet_role_token.clone();
     }
@@ -6671,39 +6663,111 @@ fn spawn_profile_prompt_overlay(member: &crate::fleet::profile::AgentProfile) ->
     Some(overlay)
 }
 
-/// Requested model route for a spawn, honoring fleet profile precedence:
-/// explicit `model` param > explicit `model_strength` param > member model
-/// pin (Fixed) > member loadout > parse-time default. An explicit `model`
-/// still wins downstream via the configured-model path (which turns it into
-/// a Fixed route), as does a `role_models` override where one matches today.
-fn spawn_model_route(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpawnRouteSource {
+    TaskModel,
+    TaskModelStrength,
+    AgentProfileModel,
+    AgentProfileLoadout,
+    RoleDefault,
+    RunModel,
+}
+
+impl SpawnRouteSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::TaskModel => "task.model",
+            Self::TaskModelStrength => "task.model_strength",
+            Self::AgentProfileModel => "agent_profile.model",
+            Self::AgentProfileLoadout => "agent_profile.loadout",
+            Self::RoleDefault => "role.default",
+            Self::RunModel => "run.model",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SpawnModelSelection {
+    model_route: ModelRoute,
+    source: SpawnRouteSource,
+}
+
+/// Resolve the child model once, with receipt-grade precedence provenance:
+/// explicit task field > saved AgentProfile > configured role/type default >
+/// operator run model. Keeping the route and its source together prevents a
+/// later configured-model lookup from silently overriding a profile pin.
+fn resolve_spawn_model_selection(
+    runtime: &SubAgentRuntime,
     request: &SpawnRequest,
     member: Option<&crate::fleet::profile::AgentProfile>,
-) -> ModelRoute {
-    let Some(member) = member else {
-        return request.model_strength.model_route();
-    };
-    if request.model.is_some() || request.model_strength_explicit {
-        return request.model_strength.model_route();
+) -> Result<SpawnModelSelection, ToolError> {
+    if let Some(model) = request.model.as_deref() {
+        let model =
+            normalize_requested_subagent_model(model, "model", runtime.client.api_provider())?;
+        return Ok(SpawnModelSelection {
+            model_route: ModelRoute::Fixed(model),
+            source: SpawnRouteSource::TaskModel,
+        });
     }
-    if let Some(model) = member
-        .profile
-        .model
-        .as_deref()
-        .map(str::trim)
-        .filter(|model| !model.is_empty() && !model.eq_ignore_ascii_case("auto"))
-    {
-        return ModelRoute::Fixed(model.to_string());
+    if request.model_strength_explicit {
+        return Ok(SpawnModelSelection {
+            model_route: request.model_strength.model_route(),
+            source: SpawnRouteSource::TaskModelStrength,
+        });
     }
-    match member.profile.loadout {
-        codewhale_config::FleetLoadout::Fast => ModelRoute::Faster,
-        // Inherit and the richer loadout classes (strong/balanced/...) all
-        // inherit the parent model here. The fleet dispatcher maps those
-        // classes to Auto, but in this seam Auto routes to the cheap sibling —
-        // a silent downgrade for e.g. a "strong" member. Inheriting keeps the
-        // existing non-profile default behavior.
-        _ => ModelRoute::Inherit,
+    if let Some(member) = member {
+        if let Some(model) = member
+            .profile
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty() && !model.eq_ignore_ascii_case("auto"))
+        {
+            let model = normalize_requested_subagent_model(
+                model,
+                &format!("fleet.profiles.{}.model", member.id),
+                runtime.client.api_provider(),
+            )?;
+            return Ok(SpawnModelSelection {
+                model_route: ModelRoute::Fixed(model),
+                source: SpawnRouteSource::AgentProfileModel,
+            });
+        }
+        if member.profile.loadout == codewhale_config::FleetLoadout::Fast {
+            return Ok(SpawnModelSelection {
+                model_route: ModelRoute::Faster,
+                source: SpawnRouteSource::AgentProfileLoadout,
+            });
+        }
+        // Richer custom loadouts (strong/balanced/...) have no exact
+        // ModelRoute equivalent here. Auto means "cheap sibling" in the
+        // sub-agent router, so those and explicit Inherit both preserve the
+        // operator run model and report that model's actual source.
+        return Ok(SpawnModelSelection {
+            model_route: ModelRoute::Inherit,
+            source: SpawnRouteSource::RunModel,
+        });
     }
+    if let Some(model) = configured_model_for_role_or_type(
+        runtime,
+        request.assignment.role.as_deref(),
+        &request.agent_type,
+    )? {
+        return Ok(SpawnModelSelection {
+            model_route: ModelRoute::Fixed(model),
+            source: SpawnRouteSource::RoleDefault,
+        });
+    }
+    if request.model_strength == SubAgentModelStrength::Faster {
+        return Ok(SpawnModelSelection {
+            model_route: ModelRoute::Faster,
+            source: SpawnRouteSource::RoleDefault,
+        });
+    }
+    Ok(SpawnModelSelection {
+        model_route: ModelRoute::Inherit,
+        source: SpawnRouteSource::RunModel,
+    })
 }
 
 /// Effective absolute `max_spawn_depth` for a child, combining the inherited

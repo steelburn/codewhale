@@ -2453,6 +2453,44 @@ fn deepseek_dispatcher_env_key_overrides_config_key() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn provider_neutral_cli_key_wins_after_profile_provider_switch() -> Result<()> {
+    let _lock = lock_test_env();
+    let _source = EnvVarGuard::set("DEEPSEEK_API_KEY_SOURCE", "cli");
+    let _cli_key = EnvVarGuard::set("CODEWHALE_CLI_API_KEY", "explicit-profile-key");
+    let _anthropic_env = EnvVarGuard::remove("ANTHROPIC_API_KEY");
+    let mut providers = ProvidersConfig::default();
+    providers.anthropic.api_key = Some("saved-anthropic-key".to_string());
+    let config = Config {
+        provider: Some("anthropic".to_string()),
+        providers: Some(providers),
+        ..Default::default()
+    };
+
+    assert_eq!(config.deepseek_api_key()?, "explicit-profile-key");
+    assert!(has_api_key(&config));
+    assert!(active_provider_has_env_api_key(&config));
+    Ok(())
+}
+
+#[test]
+fn provider_neutral_cli_key_requires_dispatcher_source_marker() -> Result<()> {
+    let _lock = lock_test_env();
+    let _source = EnvVarGuard::remove("DEEPSEEK_API_KEY_SOURCE");
+    let _cli_key = EnvVarGuard::set("CODEWHALE_CLI_API_KEY", "untrusted-generic-key");
+    let _anthropic_env = EnvVarGuard::remove("ANTHROPIC_API_KEY");
+    let mut providers = ProvidersConfig::default();
+    providers.anthropic.api_key = Some("saved-anthropic-key".to_string());
+    let config = Config {
+        provider: Some("anthropic".to_string()),
+        providers: Some(providers),
+        ..Default::default()
+    };
+
+    assert_eq!(config.deepseek_api_key()?, "saved-anthropic-key");
+    Ok(())
+}
+
 fn config_with_provider_scoped_key(provider: &str, api_key: &str) -> Config {
     let mut providers = ProvidersConfig::default();
     match provider {

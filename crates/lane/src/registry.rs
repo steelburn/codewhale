@@ -1,6 +1,6 @@
 //! Durable lane registry under `$CODEWHALE_HOME/lanes/`.
 
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -60,6 +60,11 @@ pub struct LaneRecord {
     /// tmux session name when `runtime == tmux`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tmux_session: Option<String>,
+    /// Explicit tmux server socket used for this Lane. Pinning the socket keeps
+    /// start/attach/stop/reconcile in the same server namespace even when
+    /// `TMUX_TMPDIR` or the caller environment changes between commands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tmux_socket: Option<PathBuf>,
     /// Absolute path to the stream-json / NDJSON journal for this lane.
     pub log_path: PathBuf,
     pub started_at: String,
@@ -198,6 +203,7 @@ impl LaneRegistry {
             worktree_path: None,
             branch: None,
             tmux_session: None,
+            tmux_socket: None,
             log_path,
             started_at: LaneRecord::now_rfc3339(),
             stopped_at: None,
@@ -208,21 +214,140 @@ impl LaneRegistry {
         Ok(record)
     }
 
-    pub fn mark_running(&self, record: &mut LaneRecord) -> Result<()> {
-        record.status = LaneStatus::Running;
-        self.save(record)
+    /// Atomically promote a Pending Lane to Running.
+    ///
+    /// A concurrent `lane stop` is allowed to win while a backend is still
+    /// launching. In that case this returns `false`, reloads the terminal
+    /// record, and the backend must tear down any process it just created.
+    pub fn mark_running_if_pending(&self, record: &mut LaneRecord) -> Result<bool> {
+        self.mark_running_if_pending_with(record, || Ok(()), || Ok(()))
     }
 
-    pub fn mark_stopped(&self, record: &mut LaneRecord, status: LaneStatus) -> Result<()> {
-        record.status = status;
-        record.stopped_at = Some(LaneRecord::now_rfc3339());
-        self.save(record)
+    /// Atomically launch backend state and promote a Pending Lane to Running.
+    ///
+    /// The per-Lane lock spans the durable Pending check, `before_transition`,
+    /// and the Running save. A concurrent stop therefore either wins before
+    /// launch (and this returns `false` without calling the closure) or waits
+    /// until the Running record is visible. Backend metadata is first saved in
+    /// the Pending record so a failed final save still leaves enough data for
+    /// a later stop. `rollback` is attempted if that final save fails.
+    pub fn mark_running_if_pending_with<Start, Rollback>(
+        &self,
+        record: &mut LaneRecord,
+        before_transition: Start,
+        rollback: Rollback,
+    ) -> Result<bool>
+    where
+        Start: FnOnce() -> Result<()>,
+        Rollback: FnOnce() -> Result<()>,
+    {
+        let lock_path = self.root.join(format!("{}.lock", record.id));
+        let lock_file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .with_context(|| format!("open lane lock {}", lock_path.display()))?;
+        let mut lock = fd_lock::RwLock::new(lock_file);
+        let _guard = lock
+            .write()
+            .with_context(|| format!("lock lane record {}", record.id))?;
+
+        let current = self.load(&record.id)?;
+        if current.status != LaneStatus::Pending {
+            *record = current;
+            return Ok(false);
+        }
+
+        // `record` carries backend metadata (tmux session, worktree, attach
+        // target) populated during launch. Persist it while still Pending so
+        // a failed launch/final save remains discoverable and stoppable.
+        record.status = LaneStatus::Pending;
+        record.stopped_at = None;
+        self.save(record)?;
+
+        before_transition()?;
+        record.status = LaneStatus::Running;
+        record.stopped_at = None;
+        if let Err(save_error) = self.save(record) {
+            record.status = LaneStatus::Pending;
+            if let Err(rollback_error) = rollback() {
+                return Err(save_error).context(format!(
+                    "persist running Lane; backend rollback also failed: {rollback_error:#}"
+                ));
+            }
+            return Err(save_error).context("persist running Lane after backend launch");
+        }
+        Ok(true)
+    }
+
+    /// Atomically transition an active Lane to a terminal state.
+    ///
+    /// Detached tmux reconciliation, an explicit stop, and a second status
+    /// reader can race in separate CLI processes. Serialize those terminal
+    /// decisions on a per-Lane advisory lock, reload the live record under the
+    /// lock, and only let the first active -> terminal transition win.
+    pub fn mark_terminal_if_active(
+        &self,
+        record: &mut LaneRecord,
+        status: LaneStatus,
+    ) -> Result<bool> {
+        self.mark_terminal_if_active_with(record, status, |_| Ok(()))
+    }
+
+    /// Atomically perform backend teardown and transition an active Lane.
+    ///
+    /// `before_transition` runs while holding the per-Lane lifecycle lock.
+    /// If teardown fails, the record remains active. This keeps a failed tmux
+    /// kill from being persisted as Stopped and prevents cleanup racing a
+    /// concurrent reconciliation decision.
+    pub fn mark_terminal_if_active_with<F>(
+        &self,
+        record: &mut LaneRecord,
+        status: LaneStatus,
+        before_transition: F,
+    ) -> Result<bool>
+    where
+        F: FnOnce(&LaneRecord) -> Result<()>,
+    {
+        if status.is_active() {
+            bail!("terminal lane transition requires a terminal status");
+        }
+
+        let lock_path = self.root.join(format!("{}.lock", record.id));
+        let lock_file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .with_context(|| format!("open lane lock {}", lock_path.display()))?;
+        let mut lock = fd_lock::RwLock::new(lock_file);
+        let _guard = lock
+            .write()
+            .with_context(|| format!("lock lane record {}", record.id))?;
+
+        let mut current = self.load(&record.id)?;
+        if !current.status.is_active() {
+            *record = current;
+            return Ok(false);
+        }
+        before_transition(&current)?;
+        current.status = status;
+        current.stopped_at = Some(LaneRecord::now_rfc3339());
+        current.attach_target = None;
+        self.save(&current)?;
+        *record = current;
+        Ok(true)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, mpsc};
     use tempfile::tempdir;
 
     #[test]
@@ -253,5 +378,112 @@ mod tests {
         let listed = reg2.list().unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, id);
+    }
+
+    #[test]
+    fn terminal_lane_cannot_launch_after_stop_wins() {
+        let dir = tempdir().unwrap();
+        let reg = LaneRegistry::open(dir.path()).unwrap();
+        let mut record = reg
+            .create_pending(None, None, None, None, RuntimeBackendKind::Tmux, None)
+            .unwrap();
+        assert!(
+            reg.mark_terminal_if_active(&mut record, LaneStatus::Stopped)
+                .unwrap()
+        );
+        let starts = AtomicUsize::new(0);
+        assert!(
+            !reg.mark_running_if_pending_with(
+                &mut record,
+                || {
+                    starts.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+                || Ok(()),
+            )
+            .unwrap()
+        );
+        assert_eq!(starts.load(Ordering::SeqCst), 0);
+        assert_eq!(record.status, LaneStatus::Stopped);
+        assert_eq!(reg.load(&record.id).unwrap().status, LaneStatus::Stopped);
+    }
+
+    #[test]
+    fn start_and_stop_are_serialized_across_backend_launch() {
+        let dir = tempdir().unwrap();
+        let reg = LaneRegistry::open(dir.path()).unwrap();
+        let record = reg
+            .create_pending(None, None, None, None, RuntimeBackendKind::Tmux, None)
+            .unwrap();
+        let id = record.id.clone();
+        let starts = Arc::new(AtomicUsize::new(0));
+        let teardowns = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        let start_reg = reg.clone();
+        let start_count = Arc::clone(&starts);
+        let start_thread = std::thread::spawn(move || {
+            let mut record = record;
+            let started = start_reg
+                .mark_running_if_pending_with(
+                    &mut record,
+                    || {
+                        start_count.fetch_add(1, Ordering::SeqCst);
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                        Ok(())
+                    },
+                    || Ok(()),
+                )
+                .unwrap();
+            assert!(started);
+        });
+        entered_rx.recv().unwrap();
+
+        let stop_reg = reg.clone();
+        let stop_id = id.clone();
+        let teardown_count = Arc::clone(&teardowns);
+        let (stopped_tx, stopped_rx) = mpsc::channel();
+        let stop_thread = std::thread::spawn(move || {
+            let mut record = stop_reg.load(&stop_id).unwrap();
+            let stopped = stop_reg
+                .mark_terminal_if_active_with(&mut record, LaneStatus::Stopped, |_| {
+                    teardown_count.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+                .unwrap();
+            stopped_tx.send(stopped).unwrap();
+        });
+        assert!(matches!(
+            stopped_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        release_tx.send(()).unwrap();
+        start_thread.join().unwrap();
+        assert!(stopped_rx.recv().unwrap());
+        stop_thread.join().unwrap();
+
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        assert_eq!(teardowns.load(Ordering::SeqCst), 1);
+        assert_eq!(reg.load(&id).unwrap().status, LaneStatus::Stopped);
+    }
+
+    #[test]
+    fn teardown_failure_keeps_durable_lane_active() {
+        let dir = tempdir().unwrap();
+        let reg = LaneRegistry::open(dir.path()).unwrap();
+        let mut record = reg
+            .create_pending(None, None, None, None, RuntimeBackendKind::Tmux, None)
+            .unwrap();
+        assert!(reg.mark_running_if_pending(&mut record).unwrap());
+        let error = reg
+            .mark_terminal_if_active_with(&mut record, LaneStatus::Stopped, |_| {
+                bail!("backend still alive")
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("backend still alive"));
+        assert_eq!(record.status, LaneStatus::Running);
+        assert_eq!(reg.load(&record.id).unwrap().status, LaneStatus::Running);
     }
 }
