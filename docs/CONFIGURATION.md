@@ -977,6 +977,9 @@ The payload includes common hook metadata plus post-turn accounting:
   "session_id": "sess_12345678",
   "workspace": "/path/to/workspace",
   "mode": "agent",
+  "created_at": "2026-07-12T10:30:00+00:00",
+  "model_backed": true,
+  "provider": "deepseek",
   "model": "deepseek-chat",
   "turn_id": "turn_12345678",
   "status": "completed",
@@ -1001,6 +1004,11 @@ The payload includes common hook metadata plus post-turn accounting:
   "stop_hook_active": false
 }
 ```
+
+`created_at` anchors time-window pricing; `provider` and `model` identify the
+effective route used for model-backed turns. Shell-only lifecycle completions
+set `model_backed` to `false` and may report a `null` provider; offline
+scorecards exclude those records from model token and cost totals.
 
 For `interrupted` or `failed` turns, `status` reflects that terminal
 state and `error` carries the engine error string when one is available.

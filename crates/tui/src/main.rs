@@ -810,9 +810,11 @@ struct SessionDiagnosticsArgs {
 #[derive(Args, Debug, Clone)]
 struct ScorecardArgs {
     /// JSON file with the recorded turns to score: an array of
-    /// `{ "turn_id", "provider", "model", "usage": {…} }`. `provider` is
-    /// optional (and `effective_provider` is accepted as an alias); legacy rows
-    /// without provider remain readable but their cost is unavailable.
+    /// `{ "turn_id", "provider", "model", "usage": {…} }`. `turn_end` hooks
+    /// emit this route provenance plus `created_at`; persisted runtime exports
+    /// may instead use `id`, `effective_provider`, and `effective_model`.
+    /// Shell-only hook rows marked `model_backed: false` are excluded. Legacy
+    /// rows without provider remain readable but their cost is unavailable.
     #[arg(long, value_name = "FILE")]
     input: PathBuf,
     /// Optional baseline scorecard-metrics JSON to compare against. When set,
@@ -1675,8 +1677,10 @@ fn run_scorecard(args: ScorecardArgs) -> Result<()> {
 
     let inputs: Vec<TurnInput<'_>> = recorded
         .iter()
+        .filter(|r| r.contributes_to_scorecard())
         .map(|r| TurnInput {
             turn_id: r.turn_id.clone(),
+            created_at: r.created_at.as_ref(),
             provider: r.provider.as_deref(),
             model: r.model.clone(),
             usage: &r.usage,

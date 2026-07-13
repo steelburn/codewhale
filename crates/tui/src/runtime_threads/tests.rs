@@ -742,6 +742,8 @@ async fn thread_lifecycle_persists_across_restart() -> Result<()> {
             let _ = tx_event
                 .send(EngineEvent::TurnStarted {
                     turn_id: "engine_turn_1".to_string(),
+                    created_at: chrono::Utc::now(),
+                    route: None,
                 })
                 .await;
             let _ = tx_event
@@ -832,6 +834,8 @@ async fn completed_turn_without_engine_output_fails() -> Result<()> {
             let _ = tx_event
                 .send(EngineEvent::TurnStarted {
                     turn_id: "engine_empty_turn".to_string(),
+                    created_at: chrono::Utc::now(),
+                    route: None,
                 })
                 .await;
             let _ = tx_event
@@ -1286,6 +1290,8 @@ async fn multi_turn_continuity_same_thread() -> Result<()> {
             let _ = tx_event
                 .send(EngineEvent::TurnStarted {
                     turn_id: format!("engine_turn_{turn_index}"),
+                    created_at: chrono::Utc::now(),
+                    route: None,
                 })
                 .await;
             let _ = tx_event
@@ -1486,6 +1492,8 @@ async fn interrupt_turn_marks_interrupted_after_cleanup() -> Result<()> {
             let _ = tx_event
                 .send(EngineEvent::TurnStarted {
                     turn_id: "engine_turn_interrupt".to_string(),
+                    created_at: chrono::Utc::now(),
+                    route: None,
                 })
                 .await;
             let _ = tx_event
@@ -2260,6 +2268,8 @@ async fn steer_turn_on_active_turn_records_item_and_event() -> Result<()> {
             let _ = tx_event
                 .send(EngineEvent::TurnStarted {
                     turn_id: "engine_turn_steer".to_string(),
+                    created_at: chrono::Utc::now(),
+                    route: None,
                 })
                 .await;
             if let Some(steer) = rx_steer.recv().await {
@@ -2373,6 +2383,8 @@ async fn compaction_lifecycle_emits_item_events_with_compaction_counts() -> Resu
                     let _ = tx_event
                         .send(EngineEvent::TurnStarted {
                             turn_id: "engine_turn_auto".to_string(),
+                            created_at: chrono::Utc::now(),
+                            route: None,
                         })
                         .await;
                     let _ = tx_event

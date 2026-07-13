@@ -9,10 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Make offline `scorecard` pricing provider-aware: input records accept effective
-  provider provenance, legacy/unknown routes remain explicitly unpriced, and
-  Codex OAuth no longer inherits OpenAI API dollar rates (#4335). This builds
-  on the scorecard introduced by @findshan in #3388.
+- Make offline `scorecard` pricing provider-aware: `turn_end` records carry the
+  effective route, runtime exports and supported aliases ingest cleanly,
+  legacy/unknown routes remain explicitly unpriced, and route-scoped cache and
+  recorded-time pricing replace model-only guesses (#4335). This builds on the
+  scorecard introduced by @findshan in #3388.
 
 ## [0.8.68] - 2026-07-13
 

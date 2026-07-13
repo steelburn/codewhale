@@ -437,6 +437,27 @@ fn catalog_cost_estimate_from_offering(
     pricing.estimate_cost(&usage).map(CostEstimate::usd_only)
 }
 
+/// Deterministic provider-aware estimate at the turn's recorded time.
+#[must_use]
+pub(crate) fn calculate_turn_cost_estimate_for_provider_at(
+    provider: ApiProvider,
+    model: &str,
+    usage: &Usage,
+    recorded_at: DateTime<Utc>,
+) -> Option<CostEstimate> {
+    if provider == ApiProvider::OpenaiCodex {
+        return None;
+    }
+    let pricing = pricing_for_model_at(model, recorded_at)?;
+    Some(CostEstimate {
+        usd: calculate_turn_cost_from_usage_with_pricing(pricing.usd, usage),
+        cny: pricing
+            .cny
+            .map(|pricing| calculate_turn_cost_from_usage_with_pricing(pricing, usage))
+            .unwrap_or(0.0),
+    })
+}
+
 /// Project provider-normalized turn usage into canonical billable token
 /// classes for the shared config pricing layer (#2961 / #4318).
 ///
