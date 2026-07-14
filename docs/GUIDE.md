@@ -171,7 +171,7 @@ CodeWhale works best when you let investigation and implementation happen in
 separate steps for unfamiliar code. For small, well-understood changes, a
 single implementation request is fine.
 
-Next: [MODES.md](MODES.md) explains when to use Plan, Act, and the Operate preview.
+Next: [MODES.md](MODES.md) explains when to use Plan, Act, and Operate.
 
 ## 4. Understanding the Interface
 
@@ -220,7 +220,7 @@ CodeWhale has three visible TUI modes:
 | --- | --- | --- |
 | Plan | Exploration, design, and review before changes | Read-only investigation |
 | Act | Normal multi-step coding work | Tool use with approval gates |
-| Operate (preview) | Fleet-backed orchestration | Explicit preview; not in the Tab cycle |
+| Operate | Fleet-backed orchestration | Non-local work must produce a terminal Workflow receipt |
 
 Switch modes from the TUI with the mode picker:
 

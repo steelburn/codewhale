@@ -52,7 +52,16 @@ then a **model** (`inherit`, or a concrete model from *any configured
 provider*, not only the one the parent session is currently using), then a
 **thinking tier** (`inherit`, `off`, `low`, `medium`, `high`, `max`, or `auto`)
 — and then review the full posture (route, thinking, permissions, tools,
-workspace/org scope, and review policy) before doing anything. Picking a
+scope, and review policy) before doing anything. On Review, press **`s`** to
+choose where the profile lives:
+
+- **Project** (default) writes `.codewhale/agents/<role>.toml` and can travel
+  with this repository.
+- **Personal** writes `$CODEWHALE_HOME/agents/<role>.toml` and is available in
+  every repository on this machine. A project profile with the same id still
+  overrides the personal profile for that project.
+
+Picking a
 concrete model pins its provider explicitly: the saved profile records both
 `model` and `provider` fields, so the route it names doesn't depend on
 whichever provider happens to be active when the profile is later loaded.
@@ -73,14 +82,16 @@ drafting behind a ratify gate:
 - **Drafting is not ratifying.** The exact rendered TOML preview renders
   inline on the review step (not in a separate scrollable viewer), so nothing
   is saved until you press **`g`** or **Enter** to ratify (or press `m` again
-  to redraft). Ratifying writes the profile to `.codewhale/agents/<role>`.
+  to redraft). Ratifying writes the profile to the project or personal scope
+  shown in the preview.
 
 ## Naming: Modes, Workflow, and Fleet
 
 These names describe different layers, not competing systems. Plan and Act are
-the everyday work modes; Operate is an explicit preview while its control board
-is still being built. Workflow is an orchestration overlay that can run on top
-of those modes when the task needs a continuous workflow.
+the everyday work modes. Operate coordinates non-local work through Workflow:
+the host permits read-only discovery, blocks direct write/shell fallthrough,
+and requires a waited terminal Workflow receipt before the turn can complete.
+Workflow is the orchestration overlay that orders the work.
 
 - **Workflow** is the repeatable plan and user-facing orchestration
   overlay: a script/IR that decides which phases and agents run next, keeps
