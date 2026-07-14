@@ -1803,6 +1803,9 @@ pub struct App {
     /// Current reasoning-effort tier for DeepSeek thinking mode.
     /// Cycled via Shift+Tab; initialized from config at startup.
     pub reasoning_effort: ReasoningEffort,
+    /// Whether the current effort came from an explicit user setting rather
+    /// than compatibility inference from a retiring model alias.
+    pub(crate) reasoning_effort_explicit: bool,
     /// Last concrete thinking tier chosen while `reasoning_effort` is auto.
     pub last_effective_reasoning_effort: Option<ReasoningEffort>,
     pub workspace: PathBuf,
@@ -2772,6 +2775,8 @@ impl App {
             .ok()
             .and_then(|candidate| crate::route_budget::known_route_limits(candidate.limits))
         };
+        let reasoning_effort_explicit =
+            settings.reasoning_effort.is_some() || config.reasoning_effort_is_explicit();
         let configured_reasoning_effort = settings
             .reasoning_effort
             .as_deref()
@@ -2796,13 +2801,23 @@ impl App {
                 active_route_limits,
             )
         };
-        let reasoning_effort = if auto_model {
+        let mut reasoning_effort = if auto_model {
             ReasoningEffort::Auto
         } else {
             configured_reasoning_effort.map_or_else(ReasoningEffort::default, |s| {
                 ReasoningEffort::from_setting_for_provider(s, provider)
             })
         };
+        if !auto_model
+            && !reasoning_effort_explicit
+            && let Some(effort) = crate::config::legacy_deepseek_alias_effort_for_route(
+                provider,
+                &effective_auth_config.deepseek_base_url(),
+                &model,
+            )
+        {
+            reasoning_effort = ReasoningEffort::from_setting_for_provider(effort, provider);
+        }
 
         // Resolve the saved mode separately from the permission posture.
         let preferred_mode = AppMode::from_setting(&settings.default_mode);
@@ -2992,6 +3007,7 @@ impl App {
             active_context_window_override,
             pending_provider_switch: None,
             reasoning_effort,
+            reasoning_effort_explicit,
             last_effective_reasoning_effort: None,
             workspace,
             config_path,
@@ -3482,6 +3498,7 @@ impl App {
         self.reasoning_effort = self
             .reasoning_effort
             .cycle_next_for_provider(self.api_provider);
+        self.reasoning_effort_explicit = true;
         self.last_effective_reasoning_effort = None;
         self.needs_redraw = true;
         // Effort chip in the header is canonical — no duplicate toast.
@@ -6468,6 +6485,25 @@ impl App {
     pub fn accepts_custom_model_ids(&self) -> bool {
         self.model_ids_passthrough
             || crate::config::provider_passes_model_through(self.api_provider)
+    }
+
+    pub(crate) fn apply_provider_switch_reasoning_effort(
+        &mut self,
+        provider: ApiProvider,
+        base_url: &str,
+        model_override: Option<&str>,
+    ) {
+        let inferred = model_override.and_then(|model| {
+            crate::config::legacy_deepseek_alias_effort_for_route(provider, base_url, model)
+        });
+        self.reasoning_effort = if self.reasoning_effort_explicit {
+            self.reasoning_effort.normalize_for_provider(provider)
+        } else if let Some(effort) = inferred {
+            ReasoningEffort::from_setting_for_provider(effort, provider)
+        } else {
+            self.reasoning_effort.normalize_for_provider(provider)
+        };
+        self.last_effective_reasoning_effort = None;
     }
 
     pub fn effective_model_for_budget(&self) -> &str {

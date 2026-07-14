@@ -3511,6 +3511,113 @@ fn normalize_model_name_for_provider_canonicalizes_deepseek_api_variants() {
             .as_deref(),
         Some("deepseek-v4-flash")
     );
+
+    for provider in [
+        ApiProvider::Deepseek,
+        ApiProvider::DeepseekCN,
+        ApiProvider::DeepseekAnthropic,
+    ] {
+        for alias in ["deepseek-chat", "deepseek-reasoner"] {
+            assert_eq!(
+                canonical_model_id_for_provider(provider, alias).as_deref(),
+                Some(DEEPSEEK_ALIAS_REPLACEMENT),
+                "{provider:?} must retire {alias} before the wire boundary"
+            );
+            assert_eq!(
+                normalize_model_name_for_provider(provider, alias).as_deref(),
+                Some(DEEPSEEK_ALIAS_REPLACEMENT),
+                "{provider:?} config normalization must retire {alias}"
+            );
+        }
+    }
+}
+
+#[test]
+fn retired_deepseek_aliases_keep_mode_intent_unless_effort_is_explicit() {
+    for (alias, expected_effort) in [("deepseek-chat", "off"), ("deepseek-reasoner", "high")] {
+        for provider in [
+            ApiProvider::Deepseek,
+            ApiProvider::DeepseekCN,
+            ApiProvider::DeepseekAnthropic,
+        ] {
+            let mut config = Config {
+                provider: Some(provider.as_str().to_string()),
+                default_text_model: Some(alias.to_string()),
+                ..Default::default()
+            };
+            normalize_model_config(&mut config);
+
+            assert_eq!(
+                config.default_text_model.as_deref(),
+                Some(DEEPSEEK_ALIAS_REPLACEMENT)
+            );
+            assert_eq!(config.reasoning_effort.as_deref(), Some(expected_effort));
+        }
+    }
+
+    let mut explicit = Config {
+        provider: Some("deepseek".to_string()),
+        default_text_model: Some("deepseek-chat".to_string()),
+        reasoning_effort: Some("max".to_string()),
+        ..Default::default()
+    };
+    normalize_model_config(&mut explicit);
+    assert_eq!(
+        explicit.default_text_model.as_deref(),
+        Some(DEEPSEEK_ALIAS_REPLACEMENT)
+    );
+    assert_eq!(explicit.reasoning_effort.as_deref(), Some("max"));
+
+    let mut provider_scoped = Config {
+        provider: Some("deepseek-anthropic".to_string()),
+        providers: Some(ProvidersConfig {
+            deepseek_anthropic: ProviderConfig {
+                model: Some("deepseek-reasoner".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    normalize_model_config(&mut provider_scoped);
+    assert_eq!(
+        provider_scoped
+            .provider_config_for(ApiProvider::DeepseekAnthropic)
+            .and_then(|entry| entry.model.as_deref()),
+        Some(DEEPSEEK_ALIAS_REPLACEMENT)
+    );
+    assert_eq!(provider_scoped.reasoning_effort.as_deref(), Some("high"));
+
+    let mut custom_endpoint = Config {
+        provider: Some("deepseek".to_string()),
+        base_url: Some("https://gateway.example/v1".to_string()),
+        default_text_model: Some("deepseek-chat".to_string()),
+        ..Default::default()
+    };
+    normalize_model_config(&mut custom_endpoint);
+    assert_eq!(
+        custom_endpoint.default_text_model.as_deref(),
+        Some("deepseek-chat")
+    );
+    assert_eq!(custom_endpoint.reasoning_effort, None);
+}
+
+#[test]
+fn retired_deepseek_aliases_do_not_escape_provider_owned_namespaces() {
+    for provider in [
+        ApiProvider::NvidiaNim,
+        ApiProvider::Openrouter,
+        ApiProvider::WanjieArk,
+        ApiProvider::Custom,
+    ] {
+        for alias in ["deepseek-chat", "deepseek-reasoner"] {
+            assert_eq!(
+                canonical_model_id_for_provider(provider, alias).as_deref(),
+                Some(alias),
+                "{provider:?} owns the meaning of {alias}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -3635,6 +3742,60 @@ fn wire_model_for_provider_matches_active_provider_shape() {
         wire_model_for_provider(ApiProvider::SiliconflowCn, "deepseek-v4-pro"),
         DEFAULT_SILICONFLOW_MODEL
     );
+}
+
+#[test]
+fn wire_model_route_retires_aliases_only_on_official_deepseek_endpoints() {
+    for (provider, base_url) in [
+        (ApiProvider::Deepseek, "https://api.deepseek.com"),
+        (ApiProvider::Deepseek, "https://api.deepseek.com/v1"),
+        (ApiProvider::DeepseekCN, "https://api.deepseek.com/beta"),
+        (
+            ApiProvider::DeepseekAnthropic,
+            "https://api.deepseek.com/anthropic",
+        ),
+        (
+            ApiProvider::DeepseekAnthropic,
+            "https://api.deepseek.com/anthropic/v1/",
+        ),
+    ] {
+        for alias in ["deepseek-chat", "deepseek-reasoner"] {
+            assert_eq!(
+                wire_model_for_provider_route(provider, base_url, alias),
+                DEEPSEEK_ALIAS_REPLACEMENT,
+                "{provider:?} {base_url} must not send {alias}"
+            );
+        }
+    }
+
+    for (provider, base_url, alias) in [
+        (
+            ApiProvider::Deepseek,
+            "https://gateway.example/v1",
+            "deepseek-chat",
+        ),
+        (
+            ApiProvider::DeepseekAnthropic,
+            "https://messages.example/v1",
+            "deepseek-reasoner",
+        ),
+        (
+            ApiProvider::WanjieArk,
+            DEFAULT_WANJIE_ARK_BASE_URL,
+            "deepseek-reasoner",
+        ),
+        (
+            ApiProvider::NvidiaNim,
+            DEFAULT_NVIDIA_NIM_BASE_URL,
+            "deepseek-reasoner",
+        ),
+    ] {
+        assert_eq!(
+            wire_model_for_provider_route(provider, base_url, alias),
+            alias,
+            "{provider:?} owns the meaning of {alias}"
+        );
+    }
 }
 
 #[test]
@@ -4157,6 +4318,50 @@ fn deepseek_model_env_overrides_default_text_model() -> Result<()> {
         config.default_text_model.as_deref(),
         Some("deepseek-v4-flash-20260423")
     );
+    Ok(())
+}
+
+#[test]
+fn retired_deepseek_aliases_from_env_are_migrated_before_runtime() -> Result<()> {
+    let _lock = lock_test_env();
+    let temp_root = tempfile::tempdir()?;
+    let _managed_config = crate::test_support::EnvVarGuard::set(
+        "DEEPSEEK_MANAGED_CONFIG_PATH",
+        temp_root.path().join("missing-managed.toml"),
+    );
+
+    for (provider, alias, expected_effort) in [
+        ("deepseek", "deepseek-chat", "off"),
+        ("deepseek-cn", "deepseek-reasoner", "high"),
+        ("deepseek-anthropic", "deepseek-chat", "off"),
+    ] {
+        let _guard = EnvGuard::new(temp_root.path());
+        // Safety: test-only environment mutation guarded by a global mutex.
+        unsafe {
+            env::set_var("CODEWHALE_PROVIDER", provider);
+            env::set_var("CODEWHALE_MODEL", alias);
+        }
+
+        // Pass the isolated path explicitly: the process-wide default config
+        // path is cached by earlier tests and can otherwise point back at the
+        // developer's real provider-scoped model.
+        let config = Config::load(
+            Some(temp_root.path().join("isolated-alias-config.toml")),
+            None,
+        )?;
+        assert_eq!(
+            config.default_model(),
+            DEEPSEEK_ALIAS_REPLACEMENT,
+            "provider={provider} resolved={:?} root_model={:?} scoped_model={:?}",
+            config.api_provider(),
+            config.default_text_model,
+            config
+                .provider_config_for(config.api_provider())
+                .and_then(|entry| entry.model.as_deref())
+        );
+        assert_eq!(config.reasoning_effort(), Some(expected_effort));
+    }
+
     Ok(())
 }
 

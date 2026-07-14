@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::time::timeout as tokio_timeout;
 
-use crate::config::wire_model_for_provider;
+use crate::config::wire_model_for_provider_route;
 
 /// Default timeout for the initial streaming response headers.
 ///
@@ -162,7 +162,8 @@ impl DeepSeekClient {
     ) -> Result<MessageResponse> {
         let cacheable = crate::llm_response_cache::request_is_cacheable(request);
         let messages = build_chat_messages_for_request_and_provider(request, self.api_provider);
-        let model = wire_model_for_provider(self.api_provider, &request.model);
+        let model =
+            wire_model_for_provider_route(self.api_provider, &self.base_url, &request.model);
         let mut body = json!({
             "model": model.clone(),
             "messages": messages,
@@ -285,7 +286,8 @@ impl DeepSeekClient {
     ) -> Result<StreamEventBox> {
         // Try true SSE streaming via chat completions (widely supported)
         let messages = build_chat_messages_for_request_and_provider(&request, self.api_provider);
-        let model = wire_model_for_provider(self.api_provider, &request.model);
+        let model =
+            wire_model_for_provider_route(self.api_provider, &self.base_url, &request.model);
         let mut body = json!({
             "model": model.clone(),
             "messages": messages,

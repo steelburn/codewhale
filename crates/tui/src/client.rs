@@ -22,7 +22,7 @@ use codewhale_config::catalog::{
 };
 use codewhale_config::route::ReadyRouteCandidate;
 
-use crate::config::{ApiProvider, Config, RetryPolicy, wire_model_for_provider};
+use crate::config::{ApiProvider, Config, RetryPolicy, wire_model_for_provider_route};
 use crate::llm_client::{
     LlmClient, LlmError, RetryConfig as LlmRetryConfig, extract_retry_after,
     sanitize_http_error_body, with_retry,
@@ -1140,7 +1140,7 @@ impl DeepSeekClient {
         model: &str,
         target_language: &str,
     ) -> Result<String> {
-        let model = wire_model_for_provider(self.api_provider, model);
+        let model = wire_model_for_provider_route(self.api_provider, &self.base_url, model);
         if api_provider_uses_anthropic_messages(self.api_provider) {
             let response = self
                 .handle_anthropic_message(translation_message_request(text, model, target_language))
@@ -1369,7 +1369,7 @@ impl DeepSeekClient {
         }
 
         let audio_format = normalize_audio_format(&request.audio_format);
-        let model = wire_model_for_provider(self.api_provider, &model);
+        let model = wire_model_for_provider_route(self.api_provider, &self.base_url, &model);
         let model_lower = model.to_ascii_lowercase();
         let instruction = request
             .instruction
@@ -2276,7 +2276,7 @@ impl DeepSeekClient {
             );
         }
         let url = api_url_with_suffix(&self.base_url, "beta/completions", None);
-        let model = wire_model_for_provider(self.api_provider, model);
+        let model = wire_model_for_provider_route(self.api_provider, &self.base_url, model);
         let body = json!({
             "model": model,
             "prompt": prompt,
@@ -2987,6 +2987,11 @@ mod tests {
         let requests = server.received_requests().await.expect("recorded requests");
         assert_eq!(requests.len(), 1);
         let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+        assert_eq!(
+            body.get("model").and_then(Value::as_str),
+            Some("deepseek-chat"),
+            "custom Messages endpoints own their model ids: {body}"
+        );
         assert_eq!(
             body.pointer("/messages/0/role").and_then(Value::as_str),
             Some("user")

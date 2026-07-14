@@ -778,6 +778,29 @@ fn canonical_official_deepseek_model_id(model: &str) -> Option<&'static str> {
     }
 }
 
+/// Resolve model names accepted by DeepSeek's first-party endpoints.
+///
+/// The legacy aliases are intentionally handled only in this direct-provider
+/// layer. Aggregators and custom endpoints own their model namespaces; for
+/// example, Wanjie Ark still documents `deepseek-reasoner` as its native id.
+fn canonical_direct_deepseek_model_id(model: &str) -> Option<&'static str> {
+    match model.trim().to_ascii_lowercase().as_str() {
+        "deepseek-chat" | "deepseek-reasoner" => Some(DEEPSEEK_ALIAS_REPLACEMENT),
+        _ => canonical_official_deepseek_model_id(model),
+    }
+}
+
+fn legacy_deepseek_alias_reasoning_effort(model: &str) -> Option<&'static str> {
+    match model.trim().to_ascii_lowercase().as_str() {
+        // DeepSeek documents these retired aliases as the non-thinking and
+        // thinking modes of V4 Flash, respectively. Keep that intent only
+        // when the user has not already chosen an explicit reasoning tier.
+        "deepseek-chat" => Some("off"),
+        "deepseek-reasoner" => Some("high"),
+        _ => None,
+    }
+}
+
 fn canonical_openrouter_recent_model_id(model: &str) -> Option<&'static str> {
     let normalized = model.trim().to_ascii_lowercase();
     let normalized = normalized.replace(['_', ' '], "-");
@@ -1054,7 +1077,7 @@ pub fn canonical_model_id_for_provider(provider: ApiProvider, model: &str) -> Op
         ApiProvider::Deepseek | ApiProvider::DeepseekCN | ApiProvider::DeepseekAnthropic
     ) {
         let normalized = normalize_model_name(trimmed)?;
-        if let Some(canonical) = canonical_official_deepseek_model_id(&normalized) {
+        if let Some(canonical) = canonical_direct_deepseek_model_id(&normalized) {
             if canonical.eq_ignore_ascii_case(&normalized)
                 || normalized.to_ascii_lowercase() == canonical
             {
@@ -1123,6 +1146,41 @@ pub fn wire_model_for_provider(provider: ApiProvider, model: &str) -> String {
         return trimmed.to_string();
     }
     normalize_model_name_for_provider(provider, trimmed).unwrap_or_else(|| trimmed.to_string())
+}
+
+/// Resolve the final request model while respecting custom endpoint
+/// namespaces. Provider-only normalization cannot distinguish DeepSeek's
+/// first-party API from a self-hosted OpenAI-compatible endpoint configured
+/// under the legacy `deepseek` provider name, so actual HTTP clients use this
+/// route-aware boundary.
+#[must_use]
+pub fn wire_model_for_provider_route(provider: ApiProvider, base_url: &str, model: &str) -> String {
+    let trimmed = model.trim();
+    if trimmed.is_empty() {
+        return trimmed.to_string();
+    }
+    if base_url_is_custom_for_provider(provider, base_url) {
+        return trimmed.to_string();
+    }
+    wire_model_for_provider(provider, trimmed)
+}
+
+/// Recover the behavioral intent of a retiring alias only when the selected
+/// route is a first-party DeepSeek endpoint. Custom endpoints own both the id
+/// and its semantics, so they deliberately return `None` here.
+pub(crate) fn legacy_deepseek_alias_effort_for_route(
+    provider: ApiProvider,
+    base_url: &str,
+    model: &str,
+) -> Option<&'static str> {
+    if !matches!(
+        provider,
+        ApiProvider::Deepseek | ApiProvider::DeepseekCN | ApiProvider::DeepseekAnthropic
+    ) {
+        return None;
+    }
+    let effort = legacy_deepseek_alias_reasoning_effort(model)?;
+    (wire_model_for_provider_route(provider, base_url, model) != model.trim()).then_some(effort)
 }
 
 /// Hardcoded per-provider model id list used **only as a compatibility
@@ -1920,6 +1978,11 @@ pub struct Config {
     /// DeepSeek reasoning-effort tier: `"off" | "low" | "medium" | "high" | "max"`.
     /// Defaults to `"max"` at runtime if unset.
     pub reasoning_effort: Option<String>,
+    /// True only when compatibility migration inferred `reasoning_effort`
+    /// from a retiring DeepSeek alias. This distinguishes that inferred value
+    /// from a user override during an in-session provider switch.
+    #[serde(skip)]
+    pub(crate) reasoning_effort_inferred_from_legacy_alias: bool,
     /// Native tool catalog controls. This table controls built-in
     /// tool loading policy.
     #[serde(default)]
@@ -3910,10 +3973,25 @@ impl Config {
         provider_preserves_custom_base_url_model(provider, &self.deepseek_base_url())
     }
 
+    /// Whether model ids for `provider` belong to the configured endpoint.
+    ///
+    /// The active provider uses the fully resolved URL (including legacy root
+    /// fields and environment overrides). Inactive picker routes can only own
+    /// a custom namespace through their provider-scoped `base_url`.
+    pub(crate) fn model_ids_pass_through_for_provider(&self, provider: ApiProvider) -> bool {
+        if provider_passes_model_through(provider) {
+            return true;
+        }
+        if provider == self.api_provider() {
+            return self.active_provider_preserves_custom_base_url_model();
+        }
+        self.provider_config_for(provider)
+            .and_then(|entry| entry.base_url.as_deref())
+            .is_some_and(|base_url| provider_preserves_custom_base_url_model(provider, base_url))
+    }
+
     pub(crate) fn model_ids_pass_through(&self) -> bool {
-        let provider = self.api_provider();
-        provider_passes_model_through(provider)
-            || self.active_provider_preserves_custom_base_url_model()
+        self.model_ids_pass_through_for_provider(self.api_provider())
     }
 
     /// Read the API key.
@@ -4586,6 +4664,10 @@ impl Config {
         self.reasoning_effort.as_deref()
     }
 
+    pub(crate) fn reasoning_effort_is_explicit(&self) -> bool {
+        self.reasoning_effort.is_some() && !self.reasoning_effort_inferred_from_legacy_alias
+    }
+
     /// Get hooks configuration, returning default if not configured.
     pub fn hooks_config(&self) -> HooksConfig {
         self.hooks.clone().unwrap_or_default()
@@ -4670,8 +4752,10 @@ impl Config {
 }
 
 fn root_deepseek_model_is_foreign_to_direct_provider(provider: ApiProvider, model: &str) -> bool {
-    if matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN)
-        || provider_passes_model_through(provider)
+    if matches!(
+        provider,
+        ApiProvider::Deepseek | ApiProvider::DeepseekCN | ApiProvider::DeepseekAnthropic
+    ) || provider_passes_model_through(provider)
     {
         return false;
     }
@@ -5686,6 +5770,30 @@ fn apply_env_overrides(config: &mut Config) {
 }
 
 fn normalize_model_config(config: &mut Config) {
+    // Preserve the behavioral half of DeepSeek's retired aliases while
+    // migrating their model id to V4 Flash. An explicit reasoning setting is
+    // authoritative; this compatibility default only fills an omitted value.
+    // Custom endpoints retain both their model id and their own semantics.
+    if config.reasoning_effort.is_none() {
+        let provider = config.api_provider();
+        let base_url = config.deepseek_base_url();
+        if matches!(
+            provider,
+            ApiProvider::Deepseek | ApiProvider::DeepseekCN | ApiProvider::DeepseekAnthropic
+        ) && !base_url_is_custom_for_provider(provider, &base_url)
+        {
+            let alias_effort = config
+                .provider_config_for(provider)
+                .and_then(|entry| entry.model.as_deref())
+                .or(config.default_text_model.as_deref())
+                .and_then(legacy_deepseek_alias_reasoning_effort);
+            if let Some(effort) = alias_effort {
+                config.reasoning_effort = Some(effort.to_string());
+                config.reasoning_effort_inferred_from_legacy_alias = true;
+            }
+        }
+    }
+
     if let Some(model) = config.default_text_model.as_deref()
         && !provider_passes_model_through(config.api_provider())
         && !config.active_provider_preserves_custom_base_url_model()
@@ -5706,6 +5814,16 @@ fn normalize_model_config(config: &mut Config) {
             && let Some(normalized) = normalize_model_for_provider(ApiProvider::DeepseekCN, model)
         {
             providers.deepseek_cn.model = Some(normalized);
+        }
+        if let Some(model) = providers.deepseek_anthropic.model.as_deref()
+            && !provider_entry_uses_custom_base_url(
+                ApiProvider::DeepseekAnthropic,
+                &providers.deepseek_anthropic,
+            )
+            && let Some(normalized) =
+                normalize_model_for_provider(ApiProvider::DeepseekAnthropic, model)
+        {
+            providers.deepseek_anthropic.model = Some(normalized);
         }
         if let Some(model) = providers.nvidia_nim.model.as_deref()
             && !provider_entry_uses_custom_base_url(ApiProvider::NvidiaNim, &providers.nvidia_nim)
@@ -5775,6 +5893,11 @@ fn normalize_model_config(config: &mut Config) {
             providers.deepinfra.model = Some(normalized);
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) fn normalize_model_config_for_test(config: &mut Config) {
+    normalize_model_config(config);
 }
 
 fn normalize_model_for_provider(provider: ApiProvider, model: &str) -> Option<String> {
@@ -5954,6 +6077,13 @@ fn xiaomi_mimo_base_url_is_pay_as_you_go(base_url: &str) -> bool {
 }
 
 fn base_url_is_custom_for_provider(provider: ApiProvider, base_url: &str) -> bool {
+    if matches!(
+        provider,
+        ApiProvider::Deepseek | ApiProvider::DeepseekCN | ApiProvider::DeepseekAnthropic
+    ) && deepseek_base_url_is_official(provider, base_url)
+    {
+        return false;
+    }
     if (provider == ApiProvider::Siliconflow || provider == ApiProvider::SiliconflowCn)
         && siliconflow_base_url_is_official(base_url)
     {
@@ -5966,6 +6096,23 @@ fn base_url_is_custom_for_provider(provider: ApiProvider, base_url: &str) -> boo
         return false;
     }
     normalize_base_url(base_url) != normalize_base_url(default_base_url_for_provider(provider))
+}
+
+fn deepseek_base_url_is_official(provider: ApiProvider, base_url: &str) -> bool {
+    let normalized = base_url.trim().trim_end_matches('/').to_ascii_lowercase();
+    match provider {
+        ApiProvider::Deepseek | ApiProvider::DeepseekCN => matches!(
+            normalized.as_str(),
+            "https://api.deepseek.com"
+                | "https://api.deepseek.com/v1"
+                | "https://api.deepseek.com/beta"
+        ),
+        ApiProvider::DeepseekAnthropic => matches!(
+            normalized.as_str(),
+            "https://api.deepseek.com/anthropic" | "https://api.deepseek.com/anthropic/v1"
+        ),
+        _ => false,
+    }
 }
 
 fn provider_preserves_custom_base_url_model(provider: ApiProvider, base_url: &str) -> bool {
@@ -6162,6 +6309,9 @@ fn merge_config(base: Config, override_cfg: Config) -> Config {
         default_text_model: override_cfg.default_text_model.or(base.default_text_model),
         auth_mode: override_cfg.auth_mode.or(base.auth_mode),
         reasoning_effort: override_cfg.reasoning_effort.or(base.reasoning_effort),
+        reasoning_effort_inferred_from_legacy_alias: override_cfg
+            .reasoning_effort_inferred_from_legacy_alias
+            || base.reasoning_effort_inferred_from_legacy_alias,
         tools: override_cfg.tools.or(base.tools),
         skills_dir: override_cfg.skills_dir.or(base.skills_dir),
         mcp_config_path: override_cfg.mcp_config_path.or(base.mcp_config_path),

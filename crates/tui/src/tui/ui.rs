@@ -8105,6 +8105,7 @@ async fn apply_model_picker_choice(
     }
     if effort_changed {
         app.reasoning_effort = effort;
+        app.reasoning_effort_explicit = true;
         app.last_effective_reasoning_effort = None;
     }
     if model_changed || effort_changed {
@@ -8196,6 +8197,7 @@ async fn apply_picker_effort_choice(
     }
 
     app.reasoning_effort = effort;
+    app.reasoning_effort_explicit = true;
     app.last_effective_reasoning_effort = None;
     app.update_model_compaction_budget();
 
@@ -8332,7 +8334,7 @@ async fn switch_provider(
         .filter(|chain| chain.providers().len() > 1);
     app.last_fallback_reason = None;
     app.model_ids_passthrough = config.model_ids_pass_through();
-    app.reasoning_effort = app.reasoning_effort.normalize_for_provider(target);
+    app.apply_provider_switch_reasoning_effort(target, &new_base_url, model_override.as_deref());
     app.set_model_selection(new_model.clone());
     app.set_active_context_window_override(config.context_window_for_provider_config(target));
     app.set_active_route_limits(resolved_route.candidate.limits);

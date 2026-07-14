@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Retire `deepseek-chat` and `deepseek-reasoner` before they reach DeepSeek's
+  first-party OpenAI or Anthropic wire APIs, migrating both to the documented
+  `deepseek-v4-flash` replacement while preserving legacy non-thinking /
+  thinking intent when no explicit reasoning tier is set. Aggregator, Wanjie
+  Ark, self-hosted, and custom endpoint model ids remain provider-owned (#4320).
 - Make offline `scorecard` pricing provider-aware: `turn_end` records carry the
   effective route and a non-secret billing surface, runtime exports and
   supported aliases ingest cleanly, legacy/unknown routes remain explicitly

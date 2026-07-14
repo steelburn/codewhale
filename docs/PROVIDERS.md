@@ -530,9 +530,14 @@ Changing `provider`, `base_url`, or `model` can select a route that supports the
 OpenAI-compatible payload shape, but CodeWhale cannot convert arbitrary JSON
 text into a trusted tool call after the model has emitted it as prose.
 
-DeepSeek compatibility aliases `deepseek-chat` and `deepseek-reasoner` map to
-`deepseek-v4-flash` capability metadata and are scheduled to retire on
-2026-07-24 at 2026-07-24T15:59:00Z.
+DeepSeek will retire `deepseek-chat` and `deepseek-reasoner` on 2026-07-24 at
+15:59 UTC. CodeWhale migrates either name to `deepseek-v4-flash` before a
+request reaches DeepSeek's first-party OpenAI or Anthropic endpoint. If no
+reasoning tier was configured, `deepseek-chat` also migrates to `off` and
+`deepseek-reasoner` to `high`, preserving their former non-thinking / thinking
+intent; an explicit `reasoning_effort` remains authoritative. The mapping is
+deliberately not global: Wanjie Ark, aggregators, self-hosted runtimes, and
+custom endpoints continue to own their model ids.
 
 ## Reasoning Effort
 
