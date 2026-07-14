@@ -6253,9 +6253,7 @@ async fn run_mcp_command(config: &Config, workspace: &Path, command: McpCommand)
                         println!(
                             "  - {}{}",
                             tool.name,
-                            tool.description
-                                .as_ref()
-                                .map_or(String::new(), |d| format!(": {d}"))
+                            crate::mcp::format_mcp_tool_description(tool.description.as_deref())
                         );
                     }
                 }
@@ -6276,9 +6274,7 @@ async fn run_mcp_command(config: &Config, workspace: &Path, command: McpCommand)
                         println!(
                             "  - {}{}",
                             name,
-                            tool.description
-                                .as_ref()
-                                .map_or(String::new(), |d| format!(": {d}"))
+                            crate::mcp::format_mcp_tool_description(tool.description.as_deref())
                         );
                     }
                 }
