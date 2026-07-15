@@ -429,6 +429,21 @@ mod tests {
     }
 
     #[test]
+    fn trust_footer_advertises_only_explicit_trust_keys() {
+        let app = test_app_with_locale(Locale::En);
+        let lines = trust_directory::lines(&app);
+        let footer = lines
+            .last()
+            .expect("trust footer")
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert_eq!(footer, "Press 1/Y to trust and continue, 2/N/Esc to quit");
+    }
+
+    #[test]
     fn fresh_install_marker_path_uses_codewhale_not_legacy() {
         let tmp = tempfile::tempdir().expect("tempdir");
 
