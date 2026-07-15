@@ -566,7 +566,7 @@
     "ApprovalOptionDeny": "Negar esta chamada",
     "ApprovalOptionAbortTurn": "Abortar turno",
     "ApprovalBlockTitle": "aprovação",
-    "ApprovalControlsHint": "  ·  PgUp/PgDn: revisar  ·  v: parâmetros  ·  Esc: abortar",
+    "ApprovalControlsHint": "  ·  Pg↑/↓ revisar  ·  v detalhes  ·  Esc abortar",
     "ApprovalChooseHint": "Escolha: ",
     "ApprovalChooseAction": "Enter para selecionar, ou pressione y/a/d diretamente",
     "ApprovalIntentLabel": "Intenção: ",

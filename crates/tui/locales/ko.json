@@ -568,7 +568,7 @@
     "ApprovalOptionDeny": "이 호출 거부",
     "ApprovalOptionAbortTurn": "턴 중단",
     "ApprovalBlockTitle": "승인",
-    "ApprovalControlsHint": "  ·  PgUp/PgDn: 기록 검토  ·  v: 전체 매개변수  ·  Esc: 중단",
+    "ApprovalControlsHint": "  ·  Pg↑/↓ 기록  ·  v 상세  ·  Esc 중단",
     "ApprovalChooseHint": "선택: ",
     "ApprovalChooseAction": "Enter로 선택 항목 적용, 또는 y/a/d를 바로 누르세요",
     "ApprovalIntentLabel": "의도: ",

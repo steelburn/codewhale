@@ -336,15 +336,25 @@ pub(crate) fn handle_mouse_event(app: &mut App, mouse: MouseEvent) -> Vec<ViewEv
 
     // The approval prompt is intentionally inline: its card stays focused,
     // but the wheel reviews the transcript that remains visible above it.
+    // Preserve ownership of visible side surfaces, though: wheeling over the
+    // sidebar or Ocean work surface must not move an unrelated transcript.
     // Other modals still own their wheel input exclusively (#4371).
     if app.view_stack.top_kind() == Some(ModalKind::Approval) {
         match mouse.kind {
             MouseEventKind::ScrollUp => {
-                scroll_transcript_with_mouse(app, ScrollDirection::Up);
+                if !mouse_hits_rect(mouse, app.viewport.last_sidebar_area)
+                    && !mouse_hits_rect(mouse, app.work_surface.last_area)
+                {
+                    scroll_transcript_with_mouse(app, ScrollDirection::Up);
+                }
                 return Vec::new();
             }
             MouseEventKind::ScrollDown => {
-                scroll_transcript_with_mouse(app, ScrollDirection::Down);
+                if !mouse_hits_rect(mouse, app.viewport.last_sidebar_area)
+                    && !mouse_hits_rect(mouse, app.work_surface.last_area)
+                {
+                    scroll_transcript_with_mouse(app, ScrollDirection::Down);
+                }
                 return Vec::new();
             }
             _ => {}

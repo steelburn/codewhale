@@ -581,6 +581,8 @@ fn approval_modal_keeps_wheel_for_review_and_denies_without_side_effect() -> any
         .frame()
         .find_text("Deny this call")
         .expect("rendered denial option");
+    h.send(keys::key::page_up())?;
+    h.wait_for_text("❯ [1 / y]", KEY_TIMEOUT)?;
     h.send(keys::mouse::wheel_down(deny_row, deny_col))?;
     h.wait_for_text("❯ [1 / y]", KEY_TIMEOUT)?;
     h.resize(24, 80)?;

@@ -40,7 +40,7 @@
     "ApprovalOptionDeny": "拒絕本次調用",
     "ApprovalOptionAbortTurn": "終止本輪",
     "ApprovalBlockTitle": "審批",
-    "ApprovalControlsHint": "  ·  PgUp/PgDn：回看  ·  v：完整參數  ·  Esc：終止",
+    "ApprovalControlsHint": "  ·  Pg↑/↓ 回看  ·  v 詳情  ·  Esc 終止",
     "ApprovalChooseHint": "選擇：",
     "ApprovalChooseAction": "Enter 執行選中項，或直接按 y/a/d",
     "ApprovalIntentLabel": "意圖：",

@@ -566,7 +566,7 @@
     "ApprovalOptionDeny": "拒否",
     "ApprovalOptionAbortTurn": "中断",
     "ApprovalBlockTitle": "承認",
-    "ApprovalControlsHint": "  ·  PgUp/PgDn: 履歴表示  ·  v: パラメータ表示  ·  Esc: 中止",
+    "ApprovalControlsHint": "  ·  Pg↑/↓ 履歴  ·  v 詳細  ·  Esc 中止",
     "ApprovalChooseHint": "選択：",
     "ApprovalChooseAction": "Enterで選択、または y/a/d を直接入力",
     "ApprovalIntentLabel": "意図：",

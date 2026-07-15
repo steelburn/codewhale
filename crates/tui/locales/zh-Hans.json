@@ -566,7 +566,7 @@
     "ApprovalOptionDeny": "拒绝本次调用",
     "ApprovalOptionAbortTurn": "终止本轮",
     "ApprovalBlockTitle": "审批",
-    "ApprovalControlsHint": "  ·  PgUp/PgDn：回看  ·  v：完整参数  ·  Esc：终止",
+    "ApprovalControlsHint": "  ·  Pg↑/↓ 回看  ·  v 详情  ·  Esc 终止",
     "ApprovalChooseHint": "选择：",
     "ApprovalChooseAction": "Enter 执行选中项，或直接按 y/a/d",
     "ApprovalIntentLabel": "意图：",

@@ -568,7 +568,7 @@
     "ApprovalOptionDeny": "Deny this call",
     "ApprovalOptionAbortTurn": "Abort the turn",
     "ApprovalBlockTitle": "approval",
-    "ApprovalControlsHint": "  ·  PgUp/PgDn: review  ·  v: full params  ·  Esc: abort",
+    "ApprovalControlsHint": "  ·  Pg↑/↓ review  ·  v details  ·  Esc abort",
     "ApprovalChooseHint": "Choose: ",
     "ApprovalChooseAction": "Enter selected option, or press y/a/d directly",
     "ApprovalIntentLabel": "Intent: ",

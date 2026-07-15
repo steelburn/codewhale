@@ -99,9 +99,36 @@ fn approval_prompt_keeps_transcript_page_navigation_live() {
 
     assert!(handle_approval_transcript_key(
         &mut app,
+        &KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+    ));
+    assert_eq!(app.viewport.pending_scroll_delta, 0);
+
+    assert!(handle_approval_transcript_key(
+        &mut app,
+        &KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL),
+    ));
+    assert_eq!(app.viewport.pending_scroll_delta, -3);
+
+    assert!(handle_approval_transcript_key(
+        &mut app,
+        &KeyEvent::new(KeyCode::Home, KeyModifiers::NONE),
+    ));
+    assert!(app.viewport.pending_scroll_delta < -1_000_000);
+    assert!(app.user_scrolled_during_stream);
+
+    assert!(handle_approval_transcript_key(
+        &mut app,
+        &KeyEvent::new(KeyCode::End, KeyModifiers::NONE),
+    ));
+    assert_eq!(app.viewport.pending_scroll_delta, 0);
+    assert!(!app.user_scrolled_during_stream);
+
+    assert!(handle_approval_transcript_key(
+        &mut app,
         &KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
     ));
-    assert_eq!(app.viewport.pending_scroll_delta, -9);
+    assert_eq!(app.viewport.pending_scroll_delta, 3);
+    assert!(app.user_scrolled_during_stream);
 
     assert!(
         !handle_approval_transcript_key(
@@ -148,6 +175,38 @@ fn approval_mouse_wheel_reviews_transcript_without_closing_card() {
     assert!(events.is_empty());
     assert!(app.viewport.pending_scroll_delta < 0);
     assert!(app.user_scrolled_during_stream);
+    assert_eq!(app.view_stack.top_kind(), Some(ModalKind::Approval));
+}
+
+#[test]
+fn approval_wheel_preserves_sidebar_and_work_surface_ownership() {
+    let mut app = create_test_app();
+    app.view_stack.push(ApprovalView::new(ApprovalRequest::new(
+        "approval-scroll",
+        "exec_shell",
+        "Review command",
+        &serde_json::json!({"command": "git status"}),
+        "approval-scroll-key",
+    )));
+    app.viewport.last_sidebar_area = Some(Rect::new(60, 0, 20, 20));
+    app.work_surface.last_area = Some(Rect::new(0, 0, 30, 12));
+
+    for (column, row) in [(65, 4), (10, 4)] {
+        let events = handle_mouse_event(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert!(events.is_empty());
+        assert_eq!(
+            app.viewport.pending_scroll_delta, 0,
+            "approval wheel leaked from side surface at ({column}, {row})"
+        );
+    }
     assert_eq!(app.view_stack.top_kind(), Some(ModalKind::Approval));
 }
 
