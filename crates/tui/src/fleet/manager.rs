@@ -320,6 +320,15 @@ impl FleetManager {
     }
 
     pub fn schedule_run(&self, run_id: &FleetRunId, max_workers: usize) -> Result<FleetTickReport> {
+        self.schedule_run_excluding(run_id, max_workers, &BTreeSet::new())
+    }
+
+    fn schedule_run_excluding(
+        &self,
+        run_id: &FleetRunId,
+        max_workers: usize,
+        unavailable_workers: &BTreeSet<String>,
+    ) -> Result<FleetTickReport> {
         let max_workers = max_workers.clamp(1, 128);
         let mut report = FleetTickReport::default();
         let state = self.ledger.rebuild_state()?;
@@ -347,7 +356,9 @@ impl FleetManager {
             }
             let Some(worker_id) = worker_ids
                 .iter()
-                .find(|id| !active_workers.contains(*id))
+                .find(|id| {
+                    !active_workers.contains(*id) && !unavailable_workers.contains(id.as_str())
+                })
                 .cloned()
             else {
                 break;
@@ -432,10 +443,18 @@ impl FleetManager {
     ) -> Result<FleetStatusSnapshot> {
         let max_workers = max_workers.clamp(1, 128);
         loop {
-            self.schedule_run(run_id, max_workers)?;
+            // A terminal ledger update can race the foreground host process.
+            // Do not lease new work onto a logical worker until its executor
+            // handle has been observed and forgotten below.
+            let unavailable_workers = executor.worker_ids().into_iter().collect();
+            self.schedule_run_excluding(run_id, max_workers, &unavailable_workers)?;
             self.drive_executor_tick(run_id, executor, codewhale_binary, model)?;
             self.refresh_run_status(run_id)?;
-            if !self.run_has_open_work(run_id)? {
+            // A separate `fleet interrupt` process can make the ledger
+            // terminal while this manager still owns a live host child. Keep
+            // driving until the executor has observed that cancellation and
+            // stopped every tracked process.
+            if !self.run_has_open_work(run_id)? && executor.worker_ids().is_empty() {
                 return self.run_status(run_id);
             }
             tokio::time::sleep(tick_interval).await;
@@ -453,6 +472,27 @@ impl FleetManager {
         report.started += self.start_leased_workers(run_id, executor, codewhale_binary, model)?;
 
         for worker_id in executor.worker_ids() {
+            if let Some(task) = self.cancelled_executor_task_context(&worker_id)? {
+                // Cancellation is ledgered by an out-of-process control
+                // command. Only this executor owns the host process handle,
+                // so it must enforce the terminal state before returning from
+                // the foreground manager loop. Do not ingest output produced
+                // after cancellation; publish one final authoritative event
+                // after the process is actually stopped instead.
+                executor.stop_worker(&worker_id)?;
+                self.append_worker_event(
+                    &task.entry.run_id,
+                    &worker_id,
+                    &task.entry.task_id,
+                    FleetWorkerEventPayload::Cancelled {
+                        cancelled_by: Some("operator".to_string()),
+                    },
+                )?;
+                executor.forget_worker(&worker_id);
+                report.terminals += 1;
+                continue;
+            }
+
             for payload in executor.drain_events(&worker_id) {
                 // The subprocess exit is the task-completion authority. Stream
                 // `done` / `error` lines are useful progress signals, but
@@ -889,6 +929,35 @@ impl FleetManager {
         else {
             return Ok(None);
         };
+        let Some(run) = state.runs.get(&task.entry.run_id.0) else {
+            return Ok(None);
+        };
+        let Some(task_spec) = run
+            .task_specs
+            .iter()
+            .find(|spec| spec.id == task.entry.task_id)
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        Ok(Some(FleetExecutorTaskContext {
+            entry: task.entry.clone(),
+            task_spec,
+            worker_id: worker_id.to_string(),
+        }))
+    }
+
+    fn cancelled_executor_task_context(
+        &self,
+        worker_id: &str,
+    ) -> Result<Option<FleetExecutorTaskContext>> {
+        let state = self.ledger.rebuild_state()?;
+        let Some(task) = latest_task_for_worker(&state, worker_id) else {
+            return Ok(None);
+        };
+        if task.status != FleetTaskLedgerStatus::Cancelled {
+            return Ok(None);
+        }
         let Some(run) = state.runs.get(&task.entry.run_id.0) else {
             return Ok(None);
         };
@@ -2070,6 +2139,98 @@ mod tests {
         );
         let status = manager.run_status(&report.run_id).unwrap();
         assert_eq!(status.cancelled, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn separate_manager_interrupt_stops_live_worker_and_stays_terminal() {
+        let tmp = TempDir::new().unwrap();
+        let manager = FleetManager::open(tmp.path()).unwrap();
+        let controller = FleetManager::open(tmp.path()).unwrap();
+        let path = task_spec_file(&tmp, vec![task("task-a"), task("task-b")]);
+        let pid_path = tmp.path().join("live-worker.pid");
+        let first_worker_marker = tmp.path().join("first-worker-started");
+        let fake = fake_codewhale(
+            &tmp,
+            &format!(
+                r#"#!/bin/sh
+if [ -e '{first_worker_marker}' ]; then
+  printf '{{"type":"content","content":"second task"}}\n'
+  exit 0
+fi
+touch '{first_worker_marker}'
+printf '%s' "$$" > '{}'
+printf '{{"type":"content","content":"running"}}\n'
+exec sleep 30
+"#,
+                pid_path.display(),
+                first_worker_marker = first_worker_marker.display(),
+            ),
+        );
+        let report = manager.create_run_from_task_spec_path(&path, 1).unwrap();
+        let worker_id = report.worker_ids[0].clone();
+        let mut executor = FleetExecutor::new(&manager.workspace);
+        let started = std::time::Instant::now();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        let (status, interrupted) = rt.block_on(async {
+            tokio::join!(
+                async {
+                    manager
+                        .run_to_completion(
+                            &report.run_id,
+                            1,
+                            &mut executor,
+                            &fake.display().to_string(),
+                            None,
+                            Duration::from_millis(10),
+                        )
+                        .await
+                        .unwrap()
+                },
+                async {
+                    for _ in 0..200 {
+                        if pid_path.is_file() {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    assert!(pid_path.is_file(), "fake worker never started");
+                    controller.interrupt_worker(&worker_id).unwrap()
+                }
+            )
+        });
+
+        assert_eq!(interrupted.status, FleetWorkerStatus::Online);
+        assert_eq!(status.cancelled, 1);
+        assert_eq!(status.completed, 1);
+        assert_eq!(status.running, 0);
+        assert!(executor.worker_ids().is_empty());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "cancellation waited for the fake worker's natural exit"
+        );
+
+        let pid = std::fs::read_to_string(&pid_path).unwrap();
+        let still_running = std::process::Command::new("kill")
+            .args(["-0", pid.trim()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        assert!(!still_running, "cancelled Fleet worker is still alive");
+
+        let inspection = controller.inspect_worker(&worker_id).unwrap();
+        assert_eq!(inspection.status, FleetWorkerStatus::Online);
+        assert!(matches!(
+            inspection.latest_event.map(|event| event.payload),
+            Some(FleetWorkerEventPayload::Cancelled { .. })
+        ));
+        assert_eq!(
+            inspection.last_error.as_deref(),
+            Some("cancelled by operator")
+        );
     }
 
     #[test]

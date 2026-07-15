@@ -519,6 +519,28 @@ fn apply_record(state: &mut FleetLedgerState, record: FleetLedgerRecord) {
         }
         FleetLedgerRecord::EventAppended { event } => {
             let latest_event_key = event_key(&event.worker_id, &event.run_id.0, &event.task_id);
+            let task_is_terminal = state
+                .tasks
+                .get(&task_key(&event.run_id.0, &event.task_id))
+                .is_some_and(|task| {
+                    matches!(
+                        task.status,
+                        FleetTaskLedgerStatus::Completed
+                            | FleetTaskLedgerStatus::Failed
+                            | FleetTaskLedgerStatus::Cancelled
+                    )
+                });
+            let regresses_terminal_state = task_is_terminal
+                && matches!(
+                    &event.payload,
+                    FleetWorkerEventPayload::Leased { .. }
+                        | FleetWorkerEventPayload::ModelWait { .. }
+                        | FleetWorkerEventPayload::RunningTool { .. }
+                        | FleetWorkerEventPayload::WorkflowEvent { .. }
+                        | FleetWorkerEventPayload::Heartbeat { .. }
+                        | FleetWorkerEventPayload::Starting
+                        | FleetWorkerEventPayload::Running
+                );
             if state
                 .latest_seq
                 .get(&latest_event_key)
@@ -526,7 +548,9 @@ fn apply_record(state: &mut FleetLedgerState, record: FleetLedgerRecord) {
                 .is_none_or(|seq| event.seq > seq)
             {
                 state.latest_seq.insert(latest_event_key.clone(), event.seq);
-                state.latest_events.insert(latest_event_key, event.clone());
+                if !regresses_terminal_state {
+                    state.latest_events.insert(latest_event_key, event.clone());
+                }
             }
             if let FleetWorkerEventPayload::Artifact(artifact) = &event.payload {
                 state
@@ -545,7 +569,12 @@ fn apply_record(state: &mut FleetLedgerState, record: FleetLedgerRecord) {
                     event.clone(),
                 );
             }
-            // Derive worker status from lifecycle events.
+            // Derive worker status from lifecycle events. A late stream event
+            // must never resurrect a terminal task after an out-of-process
+            // cancellation raced the foreground executor's final drain.
+            if regresses_terminal_state {
+                return;
+            }
             match &event.payload {
                 FleetWorkerEventPayload::Leased { .. }
                 | FleetWorkerEventPayload::Restarted { .. }
@@ -868,7 +897,7 @@ mod tests {
     }
 
     #[test]
-    fn fleet_ledger_terminal_events_preserve_failed_and_cancelled_status() {
+    fn fleet_ledger_terminal_events_ignore_late_progress_regressions() {
         let tmp = TempDir::new().unwrap();
         let ledger = FleetLedger::open(tmp.path()).unwrap();
         ledger.create_run(&sample_run("run-1")).unwrap();
@@ -906,6 +935,21 @@ mod tests {
                 extra: BTreeMap::new(),
             })
             .unwrap();
+        // A live worker can flush progress after an out-of-process operator
+        // command has already made the task terminal. Preserve the raw
+        // sequence for append ordering without projecting the task or worker
+        // back to a running state.
+        ledger
+            .append_event(FleetWorkerEvent {
+                seq: 3,
+                run_id: FleetRunId::from("run-1"),
+                worker_id: "worker-2".to_string(),
+                task_id: "task-cancelled".to_string(),
+                timestamp: "2026-06-12T17:04:01Z".to_string(),
+                payload: FleetWorkerEventPayload::Running,
+                extra: BTreeMap::new(),
+            })
+            .unwrap();
 
         let state = ledger.rebuild_state().unwrap();
         assert_eq!(
@@ -916,6 +960,15 @@ mod tests {
             state.tasks["run-1:task-cancelled"].status,
             FleetTaskLedgerStatus::Cancelled
         );
+        assert_eq!(state.workers["worker-2"], FleetWorkerStatus::Online);
+        assert_eq!(
+            state.latest_seq["worker-2:run-1:task-cancelled"], 3,
+            "raw sequence ownership must still advance past ignored progress"
+        );
+        assert!(matches!(
+            state.latest_events["worker-2:run-1:task-cancelled"].payload,
+            FleetWorkerEventPayload::Cancelled { .. }
+        ));
 
         ledger.compact().unwrap();
         let state = ledger.rebuild_state().unwrap();
@@ -927,6 +980,11 @@ mod tests {
             state.tasks["run-1:task-cancelled"].status,
             FleetTaskLedgerStatus::Cancelled
         );
+        assert_eq!(state.workers["worker-2"], FleetWorkerStatus::Online);
+        assert!(matches!(
+            state.latest_events["worker-2:run-1:task-cancelled"].payload,
+            FleetWorkerEventPayload::Cancelled { .. }
+        ));
     }
 
     #[test]

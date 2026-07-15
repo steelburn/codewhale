@@ -336,6 +336,30 @@ impl FleetExecutor {
         self.streams.keys().cloned().collect()
     }
 
+    /// Stop a tracked worker at the host boundary.
+    ///
+    /// Operator controls run in a separate process from the foreground Fleet
+    /// manager, so they communicate cancellation through the durable ledger.
+    /// The manager calls this method after observing that terminal state; the
+    /// executor is the only owner that can reliably reach the live local/SSH
+    /// adapter handle.
+    pub fn stop_worker(&mut self, worker_id: &str) -> Result<()> {
+        let ssh_key = match self.streams.get(worker_id).map(|stream| &stream.host) {
+            Some(WorkerStreamHost::Local) => None,
+            Some(WorkerStreamHost::Ssh(key)) => Some(key.clone()),
+            None => return Ok(()),
+        };
+        if let Some(key) = ssh_key {
+            let adapter = self.ssh_adapters.get_mut(&key).ok_or_else(|| {
+                anyhow::anyhow!("tracked SSH Fleet worker {worker_id} has no host adapter")
+            })?;
+            adapter.stop_worker(worker_id)?;
+        } else {
+            self.adapter.stop_worker(worker_id)?;
+        }
+        Ok(())
+    }
+
     /// Stop tracking a terminal worker so the scheduler can reuse the same
     /// logical worker id for the next queued task.
     pub fn forget_worker(&mut self, worker_id: &str) {
