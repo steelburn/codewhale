@@ -1849,9 +1849,22 @@ fn explicit_gate_verdict(output: Option<&str>) -> Option<ExplicitGateVerdict> {
     }
 }
 
+fn has_gate_artifact_body(output: Option<&str>) -> bool {
+    let Some(output) = output else {
+        return false;
+    };
+    let mut meaningful_lines = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    meaningful_lines.next();
+    meaningful_lines.next().is_some()
+}
+
 fn gate_outcome_for_completed_role(
     record: &RuntimeTaskRecord,
     require_explicit_verdict: bool,
+    artifact_kind: Option<&str>,
 ) -> GateOutcome {
     match record.status {
         IrWorkflowRunStatus::Succeeded => match explicit_gate_verdict(record.output.as_deref()) {
@@ -1861,6 +1874,19 @@ fn gate_outcome_for_completed_role(
                     .clone()
                     .unwrap_or_else(|| "child returned an explicit rejection verdict".into()),
             },
+            Some(ExplicitGateVerdict::Approve)
+                if require_explicit_verdict
+                    && artifact_kind.is_some()
+                    && !has_gate_artifact_body(record.output.as_deref()) =>
+            {
+                GateOutcome::Fail {
+                    reason: format!(
+                        "task {} approved without the required {} artifact body",
+                        record.agent_id,
+                        artifact_kind.unwrap_or("gate")
+                    ),
+                }
+            }
             Some(ExplicitGateVerdict::Approve) => GateOutcome::Pass,
             None if require_explicit_verdict => GateOutcome::Fail {
                 reason: format!(
@@ -2137,8 +2163,11 @@ impl SubAgentWorkflowDriver {
         let mut next_status = Vec::new();
         if let Ok(mut board) = self.gate_board.lock() {
             for spec in specs {
-                let outcome =
-                    gate_outcome_for_completed_role(record, spec.require_explicit_verdict);
+                let outcome = gate_outcome_for_completed_role(
+                    record,
+                    spec.require_explicit_verdict,
+                    spec.artifact_kind.as_deref(),
+                );
                 let mut state = match board.evaluate(&spec, outcome.clone()) {
                     Ok(state) => state,
                     Err(err) => {
@@ -4910,7 +4939,7 @@ reviewer = "reviewer"
             schema_error: None,
         };
 
-        match gate_outcome_for_completed_role(&record, true) {
+        match gate_outcome_for_completed_role(&record, true, None) {
             GateOutcome::Fail { reason } => {
                 assert!(
                     reason.contains("required first-line gate verdict"),
@@ -4920,16 +4949,44 @@ reviewer = "reviewer"
             outcome => panic!("required malformed verdict must fail closed: {outcome:?}"),
         }
         assert_eq!(
-            gate_outcome_for_completed_role(&record, false),
+            gate_outcome_for_completed_role(&record, false, None),
             GateOutcome::Pass,
             "legacy gates retain pass-on-success behavior"
         );
 
         record.output = None;
         assert!(matches!(
-            gate_outcome_for_completed_role(&record, true),
+            gate_outcome_for_completed_role(&record, true, None),
             GateOutcome::Fail { .. }
         ));
+    }
+
+    #[test]
+    fn required_gate_artifact_rejects_bare_approval() {
+        let mut record = RuntimeTaskRecord {
+            agent_id: "implementer-bare".to_string(),
+            label: Some("implementer".to_string()),
+            role: Some("implementer".to_string()),
+            status: IrWorkflowRunStatus::Succeeded,
+            output: Some("APPROVE".to_string()),
+            schema_error: None,
+        };
+
+        match gate_outcome_for_completed_role(&record, true, Some("verification_plan")) {
+            GateOutcome::Fail { reason } => {
+                assert!(
+                    reason.contains("verification_plan artifact body"),
+                    "{reason}"
+                );
+            }
+            outcome => panic!("bare approval must not promote an empty artifact: {outcome:?}"),
+        }
+
+        record.output = Some("APPROVE\nPLAN\n- verify the typed receipt".to_string());
+        assert_eq!(
+            gate_outcome_for_completed_role(&record, true, Some("verification_plan")),
+            GateOutcome::Pass
+        );
     }
 
     #[tokio::test]
