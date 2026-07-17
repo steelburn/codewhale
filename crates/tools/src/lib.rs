@@ -599,7 +599,11 @@ mod tests {
     #[test]
     fn tool_error_missing_field_constructor() {
         let err = ToolError::missing_field("my_field");
-        assert!(matches!(err, ToolError::MissingField { field } if field == "my_field"));
+        assert!(matches!(err, ToolError::MissingField { ref field } if field == "my_field"));
+        assert_eq!(
+            err.to_string(),
+            "Failed to validate input: missing required field 'my_field'"
+        );
     }
 
     #[test]
