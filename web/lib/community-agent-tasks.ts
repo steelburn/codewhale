@@ -244,47 +244,63 @@ export async function runStale(env: AgentEnv): Promise<Record<string, unknown>> 
     const data = (await res.json()) as { items?: { number: number; title: string; body?: string; updated_at: string; html_url: string }[] };
     const issues = data.items ?? [];
 
+    const results = await Promise.all(
+      issues.slice(0, 10).map(async (issue) => {
+        if (await hasFreshDraft(env.CURATED_KV, "stale", String(issue.number), issue.updated_at)) {
+          return { type: "skipped" as const };
+        }
+
+        const payload = {
+          number: issue.number,
+          title: issue.title,
+          body: (issue.body ?? "").slice(0, 2000),
+          url: issue.html_url,
+          lastUpdated: issue.updated_at,
+        };
+
+        try {
+          const { content, usage } = await agentChat(
+            [{ role: "system", content: STALE_PROMPT }, { role: "user", content: JSON.stringify(payload) }],
+            env.DEEPSEEK_API_KEY!,
+            true,
+            dsEnv(env)
+          );
+          const parsed = JSON.parse(content) as { bodyEn: string; bodyZh: string };
+          const draft: AgentDraft = {
+            id: String(issue.number),
+            type: "stale",
+            targetNumber: issue.number,
+            targetUrl: issue.html_url,
+            bodyEn: parsed.bodyEn,
+            bodyZh: parsed.bodyZh,
+            generatedAt: new Date().toISOString(),
+            posted: false,
+          };
+          await saveDraft(env.CURATED_KV, draft);
+          return { type: "processed" as const, usage };
+        } catch {
+          return { type: "skipped" as const }; // we count errors as skipped per original logic
+        }
+      })
+    );
+
     let processed = 0;
     let skipped = 0;
+    let totalInput = 0;
+    let totalOutput = 0;
 
-    for (const issue of issues.slice(0, 10)) {
-      if (await hasFreshDraft(env.CURATED_KV, "stale", String(issue.number), issue.updated_at)) {
+    for (const res of results) {
+      if (res.type === "skipped") {
         skipped++;
-        continue;
-      }
-
-      const payload = {
-        number: issue.number,
-        title: issue.title,
-        body: (issue.body ?? "").slice(0, 2000),
-        url: issue.html_url,
-        lastUpdated: issue.updated_at,
-      };
-
-      try {
-        const { content, usage } = await agentChat(
-          [{ role: "system", content: STALE_PROMPT }, { role: "user", content: JSON.stringify(payload) }],
-          env.DEEPSEEK_API_KEY!,
-          true,
-          dsEnv(env)
-        );
-        const parsed = JSON.parse(content) as { bodyEn: string; bodyZh: string };
-        const draft: AgentDraft = {
-          id: String(issue.number),
-          type: "stale",
-          targetNumber: issue.number,
-          targetUrl: issue.html_url,
-          bodyEn: parsed.bodyEn,
-          bodyZh: parsed.bodyZh,
-          generatedAt: new Date().toISOString(),
-          posted: false,
-        };
-        await saveDraft(env.CURATED_KV, draft);
-        await logUsage(env.CURATED_KV, usage.input, usage.output);
+      } else if (res.type === "processed") {
         processed++;
-      } catch {
-        skipped++;
+        totalInput += res.usage?.input ?? 0;
+        totalOutput += res.usage?.output ?? 0;
       }
+    }
+
+    if (totalInput > 0 || totalOutput > 0) {
+      await logUsage(env.CURATED_KV, totalInput, totalOutput);
     }
 
     return { ok: true, processed, skipped };
