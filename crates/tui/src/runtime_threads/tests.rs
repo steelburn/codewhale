@@ -4531,6 +4531,99 @@ async fn closed_engine_event_stream_fails_turn_items_and_evicts_engine() -> Resu
 }
 
 #[tokio::test]
+async fn failed_turn_cancels_pending_user_input_and_clears_snapshot() -> Result<()> {
+    let manager = test_manager(test_runtime_dir())?;
+    let thread = manager
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let mut harness = install_mock_engine(&manager, &thread.id).await;
+    let turn = manager
+        .start_turn(
+            &thread.id,
+            StartTurnRequest {
+                prompt: "input required, then the engine stream closes".to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+    assert!(matches!(
+        harness.rx_op.recv().await,
+        Some(Op::SendMessage { .. })
+    ));
+    harness
+        .tx_event
+        .send(EngineEvent::UserInputRequired {
+            id: "input_failed_turn".to_string(),
+            request: crate::tools::user_input::UserInputRequest {
+                questions: vec![crate::tools::user_input::UserInputQuestion {
+                    header: "Continue".to_string(),
+                    id: "continue".to_string(),
+                    question: "Continue?".to_string(),
+                    options: vec![crate::tools::user_input::UserInputOption {
+                        label: "Yes".to_string(),
+                        description: "Continue now".to_string(),
+                    }],
+                    allow_free_text: false,
+                    multi_select: false,
+                }],
+            },
+        })
+        .await?;
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if !manager
+            .get_thread_detail(&thread.id)
+            .await?
+            .pending_user_inputs
+            .is_empty()
+        {
+            break;
+        }
+        if Instant::now() >= deadline {
+            bail!("pending user input did not reach the canonical snapshot");
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+
+    // Fail the turn mid-prompt: closing the event stream settles the turn as
+    // failed through the monitor-failure path.
+    harness.close_event_stream();
+
+    let canceled = tokio::time::timeout(
+        Duration::from_secs(2),
+        harness.recv_user_input_cancellation(),
+    )
+    .await
+    .expect("failure-path user-input cancellation timed out");
+    assert_eq!(canceled.as_deref(), Some("input_failed_turn"));
+
+    let terminal = wait_for_terminal_turn(&manager, &turn.id, Duration::from_secs(2)).await?;
+    assert_eq!(terminal.status, RuntimeTurnStatus::Failed);
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let detail = manager.get_thread_detail(&thread.id).await?;
+        if detail.pending_user_inputs.is_empty()
+            && manager.events_since(&thread.id, None)?.iter().any(|event| {
+                event.event == "user_input.canceled"
+                    && event.turn_id.as_deref() == Some(turn.id.as_str())
+                    && event.payload.get("input_id").and_then(Value::as_str)
+                        == Some("input_failed_turn")
+                    && event.payload.get("terminal").and_then(Value::as_bool) == Some(true)
+            })
+        {
+            break;
+        }
+        if Instant::now() >= deadline {
+            bail!("failed turn left a stale pending user input in the snapshot");
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn compaction_lifecycle_emits_item_events_with_compaction_counts() -> Result<()> {
     let manager = test_manager(test_runtime_dir())?;
     let thread = manager

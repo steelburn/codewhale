@@ -272,11 +272,17 @@ The browser-launch URL contains a random, short-lived, one-time bootstrap
 capability, never the Runtime token. A loopback request exchanges that
 capability for a
 `codewhale_web_session=…; HttpOnly; SameSite=Strict; Path=/` cookie backed by a
-single process-local server session that expires after 12 hours, consumes the
-capability immediately, and redirects to `/`. Reused, expired, malformed, or
+single process-local server session that expires 12 hours after the server
+process starts, consumes the capability immediately, and redirects to `/`.
+Reused, expired, malformed, or
 non-loopback bootstrap attempts fail closed. The Runtime bearer token is not
 placed in rendered HTML, browser storage, logs, URL queries/fragments, or
-browser-launch arguments.
+browser-launch arguments. The one-time bootstrap capability does transit the
+OS browser launcher's argument list for a sub-second window; a same-user
+process scraping the process table in that window could race the browser to
+the exchange, which is why the capability is single-use, loopback-only, and
+expiring — and why a same-user attacker has strictly easier local avenues
+than this race.
 Existing bearer/header/cookie authorization for `/v1/*` is unchanged outside
 web mode. In web mode, cookie-authenticated unsafe requests must also carry the
 exact local web origin, and Fetch Metadata identifying a cross-origin cookie

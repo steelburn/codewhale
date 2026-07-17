@@ -4169,6 +4169,13 @@ impl MockEngineHandle {
             UserInputDecision::Submitted { .. } => None,
         }
     }
+
+    /// Close the engine event stream without moving fields out of the handle,
+    /// so failure-path tests can keep using the receiver helpers afterwards.
+    pub(crate) fn close_event_stream(&mut self) {
+        let (tx_event, _rx_event) = mpsc::channel(1);
+        self.tx_event = tx_event;
+    }
 }
 
 #[cfg(test)]

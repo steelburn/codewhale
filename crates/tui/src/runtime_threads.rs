@@ -2721,6 +2721,41 @@ impl RuntimeThreadManager {
             }
         }
 
+        // A failed turn can no longer answer an outstanding prompt. Mirror the
+        // happy terminal path: clear pending user inputs before publishing the
+        // terminal receipt so fresh snapshots never resurrect stale attention
+        // UI, and notify already-connected clients as well.
+        let engine_for_cancel = {
+            let active = self.active.lock().await;
+            active
+                .engines
+                .get(thread_id)
+                .map(|state| state.engine.clone())
+        };
+        if let Some(engine) = engine_for_cancel {
+            for pending in self.clear_pending_user_inputs_for_turn(thread_id, turn_id) {
+                let _ = engine.cancel_user_input(&pending.id).await;
+                if let Err(err) = self
+                    .emit_event(
+                        thread_id,
+                        Some(turn_id),
+                        None,
+                        "user_input.canceled",
+                        json!({ "id": pending.id, "input_id": pending.id, "terminal": true }),
+                    )
+                    .await
+                {
+                    tracing::error!(
+                        "Failed to emit user-input cancellation after monitor failure: {err}"
+                    );
+                }
+            }
+        } else {
+            // The engine is already gone; still drop the registrations so
+            // snapshots stop advertising prompts nobody can answer.
+            let _ = self.clear_pending_user_inputs_for_turn(thread_id, turn_id);
+        }
+
         if let Some(turn) = terminal_turn
             && let Err(err) = self
                 .emit_event(
