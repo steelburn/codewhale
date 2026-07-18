@@ -4182,6 +4182,14 @@ impl Config {
         }
     }
 
+    /// Mirror a successful native xAI login into the live route config.
+    /// Codewhale-owned OAuth storage supersedes any dormant Grok CLI consent.
+    pub(crate) fn mark_codewhale_owned_xai_oauth(&mut self) {
+        let entry = self.provider_config_for_mut(ApiProvider::Xai);
+        entry.auth_mode = Some("oauth".to_string());
+        entry.external_credentials = None;
+    }
+
     /// Refresh only model-provider route material from a newly loaded disk
     /// snapshot. The receiver is the already-effective interactive Config,
     /// including CLI feature toggles and workspace/project permission overlays;
@@ -4697,6 +4705,12 @@ impl Config {
         source: codewhale_config::ExternalCredentialSource,
         suggested_path: &Path,
     ) -> Result<codewhale_config::ExternalCredentialReadGrant> {
+        if provider != self.api_provider() {
+            anyhow::bail!(
+                "external credential access for {} is dormant until that provider is explicitly selected",
+                provider.display_name()
+            );
+        }
         let kind = provider
             .metadata()
             .map(codewhale_config::provider::Provider::kind)
@@ -4721,6 +4735,31 @@ impl Config {
                     provider.display_name()
                 )
             })
+    }
+
+    /// Whether a structurally valid read-only consent record exists for an
+    /// external credential source. This never stats or reads the selected
+    /// file and never mints the capability required to do so.
+    pub(crate) fn external_credential_read_consent_configured(
+        &self,
+        provider: ApiProvider,
+        source: codewhale_config::ExternalCredentialSource,
+    ) -> bool {
+        let Some(kind) = provider
+            .metadata()
+            .map(codewhale_config::provider::Provider::kind)
+        else {
+            return false;
+        };
+        let Some(consent) = self
+            .provider_config_for(provider)
+            .and_then(|entry| entry.external_credentials.as_ref())
+        else {
+            return false;
+        };
+        consent
+            .validate_read_scope(kind, source, &consent.path)
+            .is_ok()
     }
 
     pub(crate) fn should_skip_secret_store_for_provider(&self, provider: ApiProvider) -> bool {
@@ -8262,6 +8301,7 @@ fn provider_config_is_explicit(entry: &ProviderConfig) -> bool {
         || entry.insecure_skip_tls_verify.is_some()
         || non_empty(entry.kind.as_ref())
         || non_empty(entry.api_key_env.as_ref())
+        || entry.external_credentials.is_some()
 }
 
 /// Save an API key to the appropriate place for the given provider.
@@ -8476,10 +8516,14 @@ pub(crate) fn save_provider_model_for_identity(
     Ok(config_path)
 }
 
-pub fn save_provider_auth_mode_for_at(
-    provider: ApiProvider,
-    auth_mode: &str,
+/// Finalize a successful native xAI login in one config-file mutation.
+///
+/// Native login writes Codewhale-owned OAuth storage first. This update then
+/// selects that auth mode and revokes any previous permission to inspect Grok
+/// CLI storage so later routing cannot silently fall back to another owner.
+pub fn finalize_xai_device_login_for_at(
     config_path: Option<&Path>,
+    live_config: Option<&mut Config>,
 ) -> Result<PathBuf> {
     let config_path = match config_path {
         Some(path) => path.to_path_buf(),
@@ -8487,42 +8531,13 @@ pub fn save_provider_auth_mode_for_at(
             .context("Failed to resolve config path: home directory not found.")?,
     };
     ensure_parent_dir(&config_path)?;
-    let key_inside = provider_config_key(provider).context("provider auth mode key")?;
+    let key_inside = provider_config_key(ApiProvider::Xai).context("xAI auth mode key")?;
     crate::config_persistence::mutate_config_document(&config_path, |doc| {
         crate::config_persistence::set_document_value(
             doc,
             &["providers", key_inside, "auth_mode"],
-            auth_mode,
-        )
-    })
-    .with_context(|| format!("Failed to write config to {}", config_path.display()))?;
-    log_sensitive_event(
-        "credential.auth_mode.set",
-        json!({
-            "backend": "config_file",
-            "provider": provider.as_str(),
-            "auth_mode": auth_mode,
-            "config_path": config_path.display().to_string(),
-        }),
-    );
-    Ok(config_path)
-}
-
-/// Remove provider-scoped external credential consent from the user config.
-/// Native Codewhale login calls this after writing Codewhale-owned storage so
-/// later routing cannot fall back to another CLI implicitly.
-pub fn revoke_external_credential_consent_for_at(
-    provider: ApiProvider,
-    config_path: Option<&Path>,
-) -> Result<PathBuf> {
-    let config_path = match config_path {
-        Some(path) => path.to_path_buf(),
-        None => default_config_path()
-            .context("Failed to resolve config path: home directory not found.")?,
-    };
-    ensure_parent_dir(&config_path)?;
-    let key_inside = provider_config_key(provider).context("external credential provider key")?;
-    crate::config_persistence::mutate_config_document(&config_path, |doc| {
+            "oauth",
+        )?;
         crate::config_persistence::unset_document_value(
             doc,
             &["providers", key_inside, "external_credentials"],
@@ -8530,6 +8545,19 @@ pub fn revoke_external_credential_consent_for_at(
         Ok(())
     })
     .with_context(|| format!("Failed to write config to {}", config_path.display()))?;
+    log_sensitive_event(
+        "credential.auth_mode.set",
+        json!({
+            "backend": "config_file",
+            "provider": ApiProvider::Xai.as_str(),
+            "auth_mode": "oauth",
+            "external_consent": "revoked",
+            "config_path": config_path.display().to_string(),
+        }),
+    );
+    if let Some(config) = live_config {
+        config.mark_codewhale_owned_xai_oauth();
+    }
     Ok(config_path)
 }
 

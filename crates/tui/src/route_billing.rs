@@ -653,6 +653,28 @@ mod tests {
 
     #[test]
     fn xai_oauth_and_api_key_routes_stay_distinct() {
+        let _lock = crate::test_support::lock_test_env();
+        let temp = tempfile::tempdir().expect("xAI owned credential fixture");
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", temp.path());
+        let owned_path = temp.path().join("credentials/xai-auth.json");
+        std::fs::create_dir_all(owned_path.parent().expect("owned credential parent"))
+            .expect("create owned credential directory");
+        let scope = format!(
+            "{}::{}",
+            crate::xai_oauth::XAI_OIDC_ISSUER,
+            crate::xai_oauth::GROK_OIDC_CLIENT_ID
+        );
+        std::fs::write(
+            &owned_path,
+            serde_json::json!({
+                scope: {
+                    "key": crate::test_support::future_test_jwt("billing"),
+                    "auth_mode": "oidc"
+                }
+            })
+            .to_string(),
+        )
+        .expect("write Codewhale-owned xAI credential");
         let oauth = config_with(
             ApiProvider::Xai,
             ProviderConfig {

@@ -278,6 +278,7 @@ fn auth_source_for_provider(config: &Config, provider: ApiProvider) -> Option<Mo
         }
         crate::provider_readiness::CredentialState::MissingKey
         | crate::provider_readiness::CredentialState::MissingLogin
+        | crate::provider_readiness::CredentialState::ExternalConsent
         | crate::provider_readiness::CredentialState::Legacy => return None,
         crate::provider_readiness::CredentialState::Saved => {}
     }

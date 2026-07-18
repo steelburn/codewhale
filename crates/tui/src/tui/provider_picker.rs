@@ -156,6 +156,7 @@ pub enum ProviderAuthStatus {
     NoAuth,
     Optional,
     OAuthReady,
+    OAuthConsented,
     OAuthMissing,
     ImportedTokenUnavailable,
     Local,
@@ -411,6 +412,7 @@ impl ProviderDashboardRow {
         } else {
             has_api_key_for(config, provider)
         };
+        let credential_state = credential_state_for_provider(config, provider);
         let auth_mode = config.auth_mode_for_provider(provider);
         let no_auth = crate::config::auth_mode_disables_api_key(auth_mode.as_deref());
         let api_key_required = crate::config::auth_mode_requires_api_key(auth_mode.as_deref());
@@ -418,15 +420,19 @@ impl ProviderDashboardRow {
         let xai_oauth_ready = provider == ApiProvider::Xai
             && official_endpoint
             && crate::xai_oauth::credentials_valid(config);
-        let auth_status = auth_status_for(
-            provider,
-            has_key,
-            configured,
-            no_auth,
-            api_key_required,
-            official_endpoint,
-            xai_oauth_ready,
-        );
+        let auth_status = if credential_state == CredentialState::ExternalConsent {
+            ProviderAuthStatus::OAuthConsented
+        } else {
+            auth_status_for(
+                provider,
+                has_key,
+                configured,
+                no_auth,
+                api_key_required,
+                official_endpoint,
+                xai_oauth_ready,
+            )
+        };
         let usage_meter = if matches!(auth_status, ProviderAuthStatus::ImportedTokenUnavailable) {
             "usage: Kimi API key required".to_string()
         } else {
@@ -583,7 +589,6 @@ impl ProviderDashboardRow {
             messages.push("catalog snapshot missing; using provider default".to_string());
         }
 
-        let credential_state = credential_state_for_provider(config, provider);
         let route_identity =
             route_identity_for_model(config, provider, &default_route.logical_model);
         let readiness = readiness_for(
@@ -835,6 +840,7 @@ impl ProviderAuthStatus {
             Self::NoAuth => "auth:none",
             Self::Optional => "key:optional",
             Self::OAuthReady => "auth:oauth-ready",
+            Self::OAuthConsented => "auth:oauth-consented-select-to-check",
             Self::OAuthMissing => "auth:oauth-missing",
             Self::ImportedTokenUnavailable => "auth:imported-token-unavailable",
             Self::Local => "local",
@@ -1478,6 +1484,7 @@ impl ProviderPickerView {
         matches!(
             self.rows[self.selected_idx].credential_state,
             CredentialState::Saved
+                | CredentialState::ExternalConsent
                 | CredentialState::ImportedToken
                 | CredentialState::NoAuth
                 | CredentialState::Local
@@ -2059,6 +2066,10 @@ impl ProviderPickerView {
                         "Or set {} / CODEX_ACCESS_TOKEN and re-open {reopen_command}.",
                         self.env_var_for_selected_row(),
                     ),
+                    Style::default().fg(palette::TEXT_MUTED),
+                )),
+                Line::from(Span::styled(
+                    "Read-only access checks the selected external file; no token is stored here.",
                     Style::default().fg(palette::TEXT_MUTED),
                 )),
             ]
@@ -4813,6 +4824,119 @@ mod tests {
             xai_oauth_status(Some(&fallback_key), false),
             Some(ProviderAuthStatus::Configured)
         );
+    }
+
+    #[test]
+    fn inactive_external_consents_are_visible_without_io_and_never_enter_routing_inventory() {
+        let _env = crate::test_support::lock_test_env();
+        let temp = tempfile::tempdir().expect("external consent fixtures");
+        let codex_path = temp.path().join("codex-auth.json");
+        let grok_path = temp.path().join("grok-auth.json");
+        let codex_raw = "codex-external-file-must-not-be-read";
+        let grok_raw = "grok-external-file-must-not-be-read";
+        std::fs::write(&codex_path, codex_raw).expect("write Codex trap");
+        std::fs::write(&grok_path, grok_raw).expect("write Grok trap");
+        let owned_home = temp.path().join("codewhale-owned");
+
+        let _codewhale_home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &owned_home);
+        let _codex_path =
+            crate::test_support::EnvVarGuard::set("OPENAI_CODEX_AUTH_FILE", &codex_path);
+        let _grok_path = crate::test_support::EnvVarGuard::set("GROK_AUTH_PATH", &grok_path);
+        let _codex_access = crate::test_support::EnvVarGuard::remove("OPENAI_CODEX_ACCESS_TOKEN");
+        let _legacy_codex_access = crate::test_support::EnvVarGuard::remove("CODEX_ACCESS_TOKEN");
+        let _xai_key = crate::test_support::EnvVarGuard::remove("XAI_API_KEY");
+        let _cli_key = crate::test_support::EnvVarGuard::remove("CODEWHALE_CLI_API_KEY");
+        let _cli_source = crate::test_support::EnvVarGuard::remove("DEEPSEEK_API_KEY_SOURCE");
+
+        let config = Config {
+            provider: Some(ApiProvider::Deepseek.as_str().to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                openai_codex: crate::config::ProviderConfig {
+                    auth_mode: Some("oauth".to_string()),
+                    external_credentials: Some(
+                        codewhale_config::ExternalCredentialConsentToml::read_only(
+                            codewhale_config::ProviderKind::OpenaiCodex,
+                            codewhale_config::ExternalCredentialSource::CodexCli,
+                            codex_path.clone(),
+                        ),
+                    ),
+                    ..Default::default()
+                },
+                xai: crate::config::ProviderConfig {
+                    auth_mode: Some("oauth".to_string()),
+                    external_credentials: Some(
+                        codewhale_config::ExternalCredentialConsentToml::read_only(
+                            codewhale_config::ProviderKind::Xai,
+                            codewhale_config::ExternalCredentialSource::GrokCli,
+                            grok_path.clone(),
+                        ),
+                    ),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        crate::external_credentials::reset_side_effect_trap();
+        assert!(!has_api_key_for(&config, ApiProvider::OpenaiCodex));
+        assert!(!has_api_key_for(&config, ApiProvider::Xai));
+
+        let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
+        for provider in [ApiProvider::OpenaiCodex, ApiProvider::Xai] {
+            let index = picker
+                .rows
+                .iter()
+                .position(|row| row.provider == provider)
+                .expect("consented provider row");
+            let row = &picker.rows[index];
+            assert_eq!(row.credential_state, CredentialState::ExternalConsent);
+            assert_eq!(row.auth_status, ProviderAuthStatus::OAuthConsented);
+            assert_eq!(
+                row.readiness,
+                ResolvedProviderReadiness::ExternalConsentPendingSelection
+            );
+            assert!(!row.readiness.can_attempt());
+            picker.selected_idx = index;
+            assert!(
+                picker.selected_has_key(),
+                "selecting {provider:?} should activate the consented route before checking it"
+            );
+            assert!(matches!(
+                picker.handle_key(key(KeyCode::Enter)),
+                ViewAction::EmitAndClose(ViewEvent::ProviderPickerApplied {
+                    provider: selected,
+                    ..
+                }) if selected == provider
+            ));
+        }
+
+        let inventory = crate::model_inventory::ModelInventory::from_config(&config);
+        assert!(
+            inventory.candidates.iter().all(|candidate| !matches!(
+                candidate.provider,
+                ApiProvider::OpenaiCodex | ApiProvider::Xai
+            )),
+            "dormant external-only routes must not reach auto-routing inventory"
+        );
+        assert_eq!(
+            crate::route_billing::for_route(&config, ApiProvider::Xai),
+            crate::route_billing::BillingPresentation::Metered
+        );
+        assert_eq!(
+            crate::external_credentials::side_effect_trap_counts(),
+            (0, 0),
+            "picker, readiness, billing, and model inventory must not inspect inactive external files"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&codex_path).expect("Codex trap unchanged"),
+            codex_raw
+        );
+        assert_eq!(
+            std::fs::read_to_string(&grok_path).expect("Grok trap unchanged"),
+            grok_raw
+        );
+        assert!(!owned_home.join("credentials/xai-auth.json").exists());
     }
 
     #[test]

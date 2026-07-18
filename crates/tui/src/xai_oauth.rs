@@ -1097,6 +1097,71 @@ mod tests {
         assert_eq!(fs::read_to_string(&path).unwrap(), raw);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn expired_read_only_external_credentials_never_refresh_rewrite_or_network() {
+        let _guard = crate::test_support::lock_test_env();
+        let server = MockServer::start().await;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("external-grok-auth.json");
+        let scope = format!("{}::{GROK_OIDC_CLIENT_ID}", server.uri());
+        let raw = serde_json::json!({
+            scope: {
+                "key": "expired-external-access",
+                "refresh_token": "must-never-be-submitted",
+                "expires_at": rfc3339_from_unix(now_unix_secs().unwrap_or(0) - 3600),
+                "oidc_issuer": server.uri(),
+                "oidc_client_id": GROK_OIDC_CLIENT_ID,
+                "future_field": {"preserve": true}
+            }
+        })
+        .to_string();
+        fs::write(&path, &raw).unwrap();
+        let owned_home = dir.path().join("codewhale-owned");
+        let _home_guard = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &owned_home);
+        let _path_guard = crate::test_support::EnvVarGuard::set("GROK_AUTH_PATH", &path);
+        let config = Config {
+            provider: Some(ApiProvider::Xai.as_str().to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                xai: crate::config::ProviderConfig {
+                    auth_mode: Some("oauth".to_string()),
+                    external_credentials: Some(
+                        codewhale_config::ExternalCredentialConsentToml::read_only(
+                            codewhale_config::ProviderKind::Xai,
+                            codewhale_config::ExternalCredentialSource::GrokCli,
+                            path.clone(),
+                        ),
+                    ),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        crate::external_credentials::reset_side_effect_trap();
+        let error = tokio::task::block_in_place(|| get_credentials(&config))
+            .expect_err("read-only external credentials must fail instead of refreshing");
+        assert!(
+            error
+                .to_string()
+                .contains("Read-only consent never refreshes")
+        );
+        assert_eq!(
+            crate::external_credentials::side_effect_trap_counts(),
+            (1, 1)
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), raw);
+        assert!(!owned_home.join("credentials/xai-auth.json").exists());
+        assert!(
+            server
+                .received_requests()
+                .await
+                .expect("recorded requests")
+                .is_empty(),
+            "external refresh tokens must never be sent over the network"
+        );
+    }
+
     #[test]
     fn native_login_storage_is_codewhale_owned() {
         let _guard = crate::test_support::lock_test_env();

@@ -6146,9 +6146,7 @@ fn run_logout() -> Result<()> {
 
 async fn run_xai_device_auth(config_path: Option<&Path>) -> Result<()> {
     let _credentials = xai_oauth::device_code_login().await?;
-    config::revoke_external_credential_consent_for_at(config::ApiProvider::Xai, config_path)?;
-    let saved =
-        config::save_provider_auth_mode_for_at(config::ApiProvider::Xai, "oauth", config_path)?;
+    let saved = config::finalize_xai_device_login_for_at(config_path, None)?;
     println!(
         "xAI OAuth is ready; saved [providers.xai] auth_mode = \"oauth\" to {}",
         saved.display()

@@ -96,14 +96,17 @@ impl ExternalCredentialConsentToml {
         }
     }
 
-    /// Validate and mint the read capability consumed by credential adapters.
-    /// No filesystem operation occurs while validating the policy.
-    pub fn read_grant(
+    /// Validate that this record is a current read-only consent for one exact
+    /// provider/source/path tuple without minting an I/O capability.
+    ///
+    /// This is intentionally side-effect free so inventory and picker surfaces
+    /// can acknowledge dormant consent without inspecting the external file.
+    pub fn validate_read_scope(
         &self,
         provider: ProviderKind,
         source: ExternalCredentialSource,
         resolved_path: &Path,
-    ) -> Result<ExternalCredentialReadGrant> {
+    ) -> Result<()> {
         if self.access == ExternalCredentialAccess::Disabled {
             bail!(
                 "external credential access is disabled for {}",
@@ -151,6 +154,18 @@ impl ExternalCredentialConsentToml {
                 resolved_path.display()
             );
         }
+        Ok(())
+    }
+
+    /// Validate and mint the read capability consumed by credential adapters.
+    /// No filesystem operation occurs while validating the policy.
+    pub fn read_grant(
+        &self,
+        provider: ProviderKind,
+        source: ExternalCredentialSource,
+        resolved_path: &Path,
+    ) -> Result<ExternalCredentialReadGrant> {
+        self.validate_read_scope(provider, source, resolved_path)?;
         Ok(ExternalCredentialReadGrant {
             provider,
             source,
