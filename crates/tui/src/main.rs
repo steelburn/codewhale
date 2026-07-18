@@ -3669,8 +3669,14 @@ async fn run_doctor(
         );
     }
     let legacy_state_report = doctor_legacy_state_report(&code_home, &legacy_home);
+    let session_recovery = doctor_session_recovery_report(
+        &code_home,
+        &legacy_home,
+        codewhale_config::codewhale_home_is_explicit(),
+    );
     print_doctor_legacy_state_report(
         &legacy_state_report,
+        &session_recovery,
         (aqua_r, aqua_g, aqua_b),
         (sky_r, sky_g, sky_b),
     );
@@ -4482,6 +4488,8 @@ const DOCTOR_LEGACY_STATE_ITEMS: &[&str] = &[
     "settings.toml",
     "mcp.json",
 ];
+const DOCTOR_SESSION_RECOVERY_HUMAN_SAMPLE_LIMIT: usize = 20;
+const DOCTOR_SESSION_RECOVERY_JSON_SAMPLE_LIMIT: usize = 100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DoctorLegacyStateStatus {
@@ -4510,6 +4518,61 @@ struct DoctorLegacyStateEntry {
     primary_present: bool,
     legacy_present: bool,
     status: DoctorLegacyStateStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DoctorSessionRecoveryStatus {
+    Isolated,
+    NoLegacySessions,
+    MigrationPending,
+    MigrationIncomplete,
+    MigrationComplete,
+    ScanFailed,
+}
+
+impl DoctorSessionRecoveryStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Isolated => "isolated",
+            Self::NoLegacySessions => "no_legacy_sessions",
+            Self::MigrationPending => "migration_pending",
+            Self::MigrationIncomplete => "migration_incomplete",
+            Self::MigrationComplete => "migration_complete",
+            Self::ScanFailed => "scan_failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DoctorRecoverableSessionEntry {
+    name: PathBuf,
+    source_path: PathBuf,
+    destination_path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct DoctorSessionRecoveryReport {
+    status: DoctorSessionRecoveryStatus,
+    primary_sessions_path: PathBuf,
+    legacy_sessions_path: PathBuf,
+    codewhale_home_is_explicit: bool,
+    legacy_session_file_count: usize,
+    already_present_file_count: usize,
+    recoverable_file_count: usize,
+    /// Bounded filename/path sample; the total is `recoverable_file_count`.
+    recoverable: Vec<DoctorRecoverableSessionEntry>,
+    error: Option<String>,
+}
+
+impl DoctorSessionRecoveryReport {
+    fn needs_attention(&self) -> bool {
+        matches!(
+            self.status,
+            DoctorSessionRecoveryStatus::MigrationPending
+                | DoctorSessionRecoveryStatus::MigrationIncomplete
+                | DoctorSessionRecoveryStatus::ScanFailed
+        )
+    }
 }
 
 fn doctor_legacy_state_status(
@@ -4560,15 +4623,129 @@ fn doctor_legacy_state_report(
         .collect()
 }
 
+/// Compare legacy and primary session filenames without opening session files.
+///
+/// This is deliberately separate from `SessionManager::default_location()`:
+/// constructing the manager can trigger the additive legacy migration, while
+/// doctor must remain a read-only diagnostic. Session history is stored as
+/// top-level JSON files; directories (including `checkpoints`) and symlinks are
+/// ignored, so doctor neither traverses checkpoint internals nor follows links.
+fn doctor_session_recovery_report(
+    primary_root: &Path,
+    legacy_root: &Path,
+    codewhale_home_is_explicit: bool,
+) -> DoctorSessionRecoveryReport {
+    let primary_sessions_path = primary_root.join("sessions");
+    let legacy_sessions_path = legacy_root.join("sessions");
+    let mut report = DoctorSessionRecoveryReport {
+        status: DoctorSessionRecoveryStatus::NoLegacySessions,
+        primary_sessions_path,
+        legacy_sessions_path,
+        codewhale_home_is_explicit,
+        legacy_session_file_count: 0,
+        already_present_file_count: 0,
+        recoverable_file_count: 0,
+        recoverable: Vec::new(),
+        error: None,
+    };
+
+    if codewhale_home_is_explicit {
+        report.status = DoctorSessionRecoveryStatus::Isolated;
+        return report;
+    }
+
+    let entries = match std::fs::read_dir(&report.legacy_sessions_path) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return report,
+        Err(err) => {
+            report.status = DoctorSessionRecoveryStatus::ScanFailed;
+            report.error = Some(format!(
+                "could not inspect legacy session filenames at {}: {err}",
+                crate::utils::display_path(&report.legacy_sessions_path)
+            ));
+            return report;
+        }
+    };
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                report.status = DoctorSessionRecoveryStatus::ScanFailed;
+                report.error = Some(format!(
+                    "could not inspect an entry under {}: {err}",
+                    crate::utils::display_path(&report.legacy_sessions_path)
+                ));
+                return report;
+            }
+        };
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(err) => {
+                report.status = DoctorSessionRecoveryStatus::ScanFailed;
+                report.error = Some(format!(
+                    "could not inspect legacy session entry metadata under {}: {err}",
+                    crate::utils::display_path(&report.legacy_sessions_path)
+                ));
+                return report;
+            }
+        };
+        if !file_type.is_file() || entry.path().extension().is_none_or(|ext| ext != "json") {
+            continue;
+        }
+
+        report.legacy_session_file_count += 1;
+        let name = PathBuf::from(entry.file_name());
+        let destination_path = report.primary_sessions_path.join(&name);
+        match std::fs::symlink_metadata(&destination_path) {
+            Ok(_) => report.already_present_file_count += 1,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                report.recoverable_file_count += 1;
+                if report.recoverable.len() < DOCTOR_SESSION_RECOVERY_JSON_SAMPLE_LIMIT {
+                    report.recoverable.push(DoctorRecoverableSessionEntry {
+                        source_path: entry.path(),
+                        destination_path,
+                        name,
+                    });
+                }
+            }
+            Err(err) => {
+                report.status = DoctorSessionRecoveryStatus::ScanFailed;
+                report.error = Some(format!(
+                    "could not inspect destination metadata at {}: {err}",
+                    crate::utils::display_path(&destination_path)
+                ));
+                return report;
+            }
+        }
+    }
+
+    report
+        .recoverable
+        .sort_by(|left, right| left.name.cmp(&right.name));
+    report.status = if report.legacy_session_file_count == 0 {
+        DoctorSessionRecoveryStatus::NoLegacySessions
+    } else if report.recoverable_file_count == 0 {
+        DoctorSessionRecoveryStatus::MigrationComplete
+    } else if report.primary_sessions_path.is_dir() {
+        DoctorSessionRecoveryStatus::MigrationIncomplete
+    } else {
+        DoctorSessionRecoveryStatus::MigrationPending
+    };
+    report
+}
+
 fn legacy_state_needs_attention(entry: &DoctorLegacyStateEntry) -> bool {
-    matches!(
-        entry.status,
-        DoctorLegacyStateStatus::LegacyOnly | DoctorLegacyStateStatus::Both
-    )
+    entry.name != "sessions"
+        && matches!(
+            entry.status,
+            DoctorLegacyStateStatus::LegacyOnly | DoctorLegacyStateStatus::Both
+        )
 }
 
 fn print_doctor_legacy_state_report(
     report: &[DoctorLegacyStateEntry],
+    session_recovery: &DoctorSessionRecoveryReport,
     ok_rgb: (u8, u8, u8),
     warn_rgb: (u8, u8, u8),
 ) {
@@ -4578,48 +4755,187 @@ fn print_doctor_legacy_state_report(
         .iter()
         .filter(|entry| legacy_state_needs_attention(entry))
         .collect();
-    if attention.is_empty() {
+    if attention.is_empty()
+        && !session_recovery.needs_attention()
+        && session_recovery.status != DoctorSessionRecoveryStatus::Isolated
+    {
         println!(
             "  {} legacy state: no known .deepseek entries need migration",
             "✓".truecolor(ok_rgb.0, ok_rgb.1, ok_rgb.2)
         );
-        return;
+    } else if !attention.is_empty() {
+        println!(
+            "  {} legacy state needs review:",
+            "!".truecolor(warn_rgb.0, warn_rgb.1, warn_rgb.2)
+        );
+        for entry in attention {
+            match entry.status {
+                DoctorLegacyStateStatus::LegacyOnly => {
+                    println!(
+                        "    {} {} exists but {} is missing",
+                        "!".truecolor(warn_rgb.0, warn_rgb.1, warn_rgb.2),
+                        crate::utils::display_path(&entry.legacy_path),
+                        crate::utils::display_path(&entry.primary_path),
+                    );
+                }
+                DoctorLegacyStateStatus::Both => {
+                    println!(
+                        "    {} {} exists alongside primary {}; legacy data may still need review",
+                        "!".truecolor(warn_rgb.0, warn_rgb.1, warn_rgb.2),
+                        crate::utils::display_path(&entry.legacy_path),
+                        crate::utils::display_path(&entry.primary_path),
+                    );
+                }
+                DoctorLegacyStateStatus::PrimaryOnly | DoctorLegacyStateStatus::Absent => {}
+            }
+        }
+        println!(
+            "    Start Codewhale once to trigger safe migration where available, then rerun `codewhale doctor`."
+        );
     }
 
-    println!(
-        "  {} legacy state needs review:",
-        "!".truecolor(warn_rgb.0, warn_rgb.1, warn_rgb.2)
-    );
-    for entry in attention {
-        match entry.status {
-            DoctorLegacyStateStatus::LegacyOnly => {
+    print_doctor_session_recovery_report(session_recovery, ok_rgb, warn_rgb);
+}
+
+fn print_doctor_session_recovery_report(
+    report: &DoctorSessionRecoveryReport,
+    ok_rgb: (u8, u8, u8),
+    warn_rgb: (u8, u8, u8),
+) {
+    use colored::Colorize;
+
+    match report.status {
+        DoctorSessionRecoveryStatus::Isolated => {
+            println!(
+                "  {} legacy sessions: ambient ~/.deepseek/sessions was not inspected because CODEWHALE_HOME is set",
+                "·".dimmed()
+            );
+            println!(
+                "    This preserves the explicit home boundary. To inspect the default home, use a separate shell with CODEWHALE_HOME unset and rerun `codewhale doctor`."
+            );
+        }
+        DoctorSessionRecoveryStatus::NoLegacySessions => {
+            println!(
+                "  {} legacy sessions: no top-level session JSON files found",
+                "✓".truecolor(ok_rgb.0, ok_rgb.1, ok_rgb.2)
+            );
+        }
+        DoctorSessionRecoveryStatus::MigrationComplete => {
+            println!(
+                "  {} legacy sessions: all {} filename(s) already exist under {}; legacy originals remain preserved",
+                "✓".truecolor(ok_rgb.0, ok_rgb.1, ok_rgb.2),
+                report.legacy_session_file_count,
+                crate::utils::display_path(&report.primary_sessions_path),
+            );
+        }
+        DoctorSessionRecoveryStatus::MigrationPending
+        | DoctorSessionRecoveryStatus::MigrationIncomplete => {
+            let label = if report.status == DoctorSessionRecoveryStatus::MigrationIncomplete {
+                "migration is incomplete"
+            } else {
+                "migration has not completed"
+            };
+            println!(
+                "  {} legacy sessions: {label}; {} recoverable file(s) are absent from {}",
+                "!".truecolor(warn_rgb.0, warn_rgb.1, warn_rgb.2),
+                report.recoverable_file_count,
+                crate::utils::display_path(&report.primary_sessions_path),
+            );
+            for entry in report
+                .recoverable
+                .iter()
+                .take(DOCTOR_SESSION_RECOVERY_HUMAN_SAMPLE_LIMIT)
+            {
                 println!(
-                    "    {} {} exists but {} is missing",
-                    "!".truecolor(warn_rgb.0, warn_rgb.1, warn_rgb.2),
-                    crate::utils::display_path(&entry.legacy_path),
-                    crate::utils::display_path(&entry.primary_path),
+                    "    {} {} -> {}",
+                    "·".dimmed(),
+                    crate::utils::display_path(&entry.source_path),
+                    crate::utils::display_path(&entry.destination_path),
                 );
             }
-            DoctorLegacyStateStatus::Both => {
+            if report.recoverable_file_count > DOCTOR_SESSION_RECOVERY_HUMAN_SAMPLE_LIMIT {
                 println!(
-                    "    {} {} exists alongside primary {}; legacy data may still need review",
-                    "!".truecolor(warn_rgb.0, warn_rgb.1, warn_rgb.2),
-                    crate::utils::display_path(&entry.legacy_path),
-                    crate::utils::display_path(&entry.primary_path),
+                    "    · {} more filename(s); `codewhale doctor --json` includes a bounded metadata-only sample",
+                    report.recoverable_file_count - DOCTOR_SESSION_RECOVERY_HUMAN_SAMPLE_LIMIT
                 );
             }
-            DoctorLegacyStateStatus::PrimaryOnly | DoctorLegacyStateStatus::Absent => {}
+            println!("    Safe recovery:");
+            println!(
+                "      1. Back up {} and {} (if present).",
+                crate::utils::display_path(&report.legacy_sessions_path),
+                crate::utils::display_path(&report.primary_sessions_path),
+            );
+            println!(
+                "      2. Close other Codewhale processes, then run `codewhale sessions`; migration adds only missing files, never overwrites primary files, and leaves legacy originals in place."
+            );
+            println!(
+                "      3. Rerun `codewhale doctor`. If filenames remain, keep both backups and report only the listed source/destination names."
+            );
+        }
+        DoctorSessionRecoveryStatus::ScanFailed => {
+            println!(
+                "  {} legacy sessions: recovery diagnostic could not complete",
+                "!".truecolor(warn_rgb.0, warn_rgb.1, warn_rgb.2)
+            );
+            if let Some(error) = report.error.as_deref() {
+                println!("    {error}");
+            }
+            println!(
+                "    Keep both session directories unchanged, back them up, fix path permissions or shape, and rerun `codewhale doctor` before attempting migration."
+            );
         }
     }
-    println!(
-        "    Start Codewhale once to trigger safe migration where available, then rerun `codewhale doctor`."
-    );
+    if report.status != DoctorSessionRecoveryStatus::Isolated {
+        println!(
+            "    Doctor inspected filenames and filesystem metadata only; it did not read chat contents, traverse checkpoints, or modify session files."
+        );
+    }
+}
+
+fn doctor_session_recovery_json(report: &DoctorSessionRecoveryReport) -> serde_json::Value {
+    use serde_json::json;
+
+    let recoverable: Vec<_> = report
+        .recoverable
+        .iter()
+        .take(DOCTOR_SESSION_RECOVERY_JSON_SAMPLE_LIMIT)
+        .map(|entry| {
+            json!({
+                "name": entry.name.display().to_string(),
+                "source_path": entry.source_path.display().to_string(),
+                "destination_path": entry.destination_path.display().to_string(),
+            })
+        })
+        .collect();
+
+    json!({
+        "status": report.status.as_str(),
+        "needs_attention": report.needs_attention(),
+        "read_only": true,
+        "chat_contents_read": false,
+        "checkpoint_internals_scanned": false,
+        "codewhale_home_is_explicit": report.codewhale_home_is_explicit,
+        "legacy_sessions_path": report.legacy_sessions_path.display().to_string(),
+        "primary_sessions_path": report.primary_sessions_path.display().to_string(),
+        "legacy_session_file_count": report.legacy_session_file_count,
+        "already_present_file_count": report.already_present_file_count,
+        "recoverable_file_count": report.recoverable_file_count,
+        "recoverable_files": recoverable,
+        "recoverable_files_truncated": report.recoverable_file_count > report.recoverable.len(),
+        "error": report.error,
+        "recovery_command": if report.needs_attention() && report.status != DoctorSessionRecoveryStatus::ScanFailed {
+            Some("codewhale sessions")
+        } else {
+            None
+        },
+    })
 }
 
 fn doctor_legacy_state_json(
     primary_root: &Path,
     legacy_root: &Path,
     report: &[DoctorLegacyStateEntry],
+    session_recovery: &DoctorSessionRecoveryReport,
 ) -> serde_json::Value {
     use serde_json::json;
 
@@ -4648,9 +4964,10 @@ fn doctor_legacy_state_json(
     json!({
         "primary_root": primary_root.display().to_string(),
         "legacy_root": legacy_root.display().to_string(),
-        "needs_attention": legacy_only > 0 || both > 0,
+        "needs_attention": report.iter().any(legacy_state_needs_attention) || session_recovery.needs_attention(),
         "legacy_only_count": legacy_only,
         "dual_present_count": both,
+        "session_recovery": doctor_session_recovery_json(session_recovery),
         "entries": entries,
     })
 }
@@ -5449,13 +5766,23 @@ fn run_doctor_json(
     let tls_status = doctor_tls_status(config);
     let (code_home, legacy_home) = doctor_state_roots();
     let legacy_state_report = doctor_legacy_state_report(&code_home, &legacy_home);
+    let session_recovery = doctor_session_recovery_report(
+        &code_home,
+        &legacy_home,
+        codewhale_config::codewhale_home_is_explicit(),
+    );
 
     let report = json!({
         "version": env!("CARGO_PKG_VERSION"),
         "config_path": config_path.display().to_string(),
         "config_present": config_path.exists(),
         "workspace": workspace.display().to_string(),
-        "legacy_state": doctor_legacy_state_json(&code_home, &legacy_home, &legacy_state_report),
+        "legacy_state": doctor_legacy_state_json(
+            &code_home,
+            &legacy_home,
+            &legacy_state_report,
+            &session_recovery,
+        ),
         "setup": doctor_setup_report_json(config, workspace),
         "api_key": {
             "source": api_key_state,
@@ -10321,6 +10648,7 @@ mod doctor_legacy_state_tests {
         fs::write(legacy_root.join("config.toml"), "api_key = 'old'").expect("legacy config");
 
         let report = doctor_legacy_state_report(&primary_root, &legacy_root);
+        let session_recovery = doctor_session_recovery_report(&primary_root, &legacy_root, false);
 
         assert_eq!(
             entry(&report, "sessions").status,
@@ -10335,7 +10663,8 @@ mod doctor_legacy_state_tests {
             DoctorLegacyStateStatus::Absent
         );
 
-        let json = doctor_legacy_state_json(&primary_root, &legacy_root, &report);
+        let json =
+            doctor_legacy_state_json(&primary_root, &legacy_root, &report, &session_recovery);
         assert_eq!(json["needs_attention"], true);
         assert_eq!(json["legacy_only_count"], 3);
         assert_eq!(json["dual_present_count"], 0);
@@ -10351,6 +10680,7 @@ mod doctor_legacy_state_tests {
         fs::write(legacy_root.join("mcp.json"), "{}").expect("legacy mcp");
 
         let report = doctor_legacy_state_report(&primary_root, &legacy_root);
+        let session_recovery = doctor_session_recovery_report(&primary_root, &legacy_root, false);
 
         assert_eq!(
             entry(&report, "sessions").status,
@@ -10361,7 +10691,8 @@ mod doctor_legacy_state_tests {
             DoctorLegacyStateStatus::Both
         );
 
-        let json = doctor_legacy_state_json(&primary_root, &legacy_root, &report);
+        let json =
+            doctor_legacy_state_json(&primary_root, &legacy_root, &report, &session_recovery);
         assert_eq!(json["needs_attention"], true);
         assert_eq!(json["legacy_only_count"], 0);
         assert_eq!(json["dual_present_count"], 2);
@@ -10376,6 +10707,7 @@ mod doctor_legacy_state_tests {
             .expect("primary settings");
 
         let report = doctor_legacy_state_report(&primary_root, &legacy_root);
+        let session_recovery = doctor_session_recovery_report(&primary_root, &legacy_root, false);
 
         assert_eq!(
             entry(&report, "sessions").status,
@@ -10383,7 +10715,8 @@ mod doctor_legacy_state_tests {
         );
         assert!(!report.iter().any(legacy_state_needs_attention));
 
-        let json = doctor_legacy_state_json(&primary_root, &legacy_root, &report);
+        let json =
+            doctor_legacy_state_json(&primary_root, &legacy_root, &report, &session_recovery);
         assert_eq!(json["needs_attention"], false);
         assert_eq!(json["legacy_only_count"], 0);
         assert_eq!(json["dual_present_count"], 0);
@@ -10395,6 +10728,7 @@ mod doctor_legacy_state_tests {
         let (primary_root, legacy_root) = roots(&tmp);
 
         let report = doctor_legacy_state_report(&primary_root, &legacy_root);
+        let session_recovery = doctor_session_recovery_report(&primary_root, &legacy_root, false);
 
         assert!(
             report
@@ -10403,10 +10737,159 @@ mod doctor_legacy_state_tests {
         );
         assert!(!report.iter().any(legacy_state_needs_attention));
 
-        let json = doctor_legacy_state_json(&primary_root, &legacy_root, &report);
+        let json =
+            doctor_legacy_state_json(&primary_root, &legacy_root, &report, &session_recovery);
         assert_eq!(json["needs_attention"], false);
         assert_eq!(json["legacy_only_count"], 0);
         assert_eq!(json["dual_present_count"], 0);
+    }
+
+    #[test]
+    fn doctor_reports_incomplete_session_migration_without_mutating_files() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (primary_root, legacy_root) = roots(&tmp);
+        let primary_sessions = primary_root.join("sessions");
+        let legacy_sessions = legacy_root.join("sessions");
+        fs::create_dir_all(&primary_sessions).expect("primary sessions");
+        fs::create_dir_all(legacy_sessions.join("checkpoints")).expect("legacy checkpoints");
+        fs::write(primary_sessions.join("already-there.json"), b"primary")
+            .expect("primary session");
+        fs::write(legacy_sessions.join("already-there.json"), b"legacy")
+            .expect("legacy matching session");
+        fs::write(
+            legacy_sessions.join("recover-me.json"),
+            b"not parsed by doctor",
+        )
+        .expect("legacy recoverable session");
+        fs::write(
+            legacy_sessions.join("checkpoints").join("latest.json"),
+            b"checkpoint not inspected",
+        )
+        .expect("legacy checkpoint");
+
+        let legacy_before = fs::read(legacy_sessions.join("recover-me.json"))
+            .expect("read legacy fixture before diagnostic");
+        let report = doctor_session_recovery_report(&primary_root, &legacy_root, false);
+
+        assert_eq!(
+            report.status,
+            DoctorSessionRecoveryStatus::MigrationIncomplete
+        );
+        assert_eq!(report.legacy_session_file_count, 2);
+        assert_eq!(report.already_present_file_count, 1);
+        assert_eq!(report.recoverable_file_count, 1);
+        assert_eq!(report.recoverable.len(), 1);
+        assert_eq!(report.recoverable[0].name, PathBuf::from("recover-me.json"));
+        assert!(
+            !primary_sessions.join("recover-me.json").exists(),
+            "doctor must not copy a recoverable session"
+        );
+        assert_eq!(
+            fs::read(legacy_sessions.join("recover-me.json"))
+                .expect("legacy file remains after diagnostic"),
+            legacy_before,
+            "doctor must not rewrite or delete the legacy source"
+        );
+
+        let json = doctor_session_recovery_json(&report);
+        assert_eq!(json["needs_attention"], true);
+        assert_eq!(json["read_only"], true);
+        assert_eq!(json["chat_contents_read"], false);
+        assert_eq!(json["checkpoint_internals_scanned"], false);
+        assert_eq!(json["recoverable_file_count"], 1);
+        assert_eq!(json["recovery_command"], "codewhale sessions");
+        assert_eq!(json["recoverable_files"][0]["name"], "recover-me.json");
+    }
+
+    #[test]
+    fn doctor_treats_preserved_legacy_sessions_as_complete_by_filename() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (primary_root, legacy_root) = roots(&tmp);
+        let primary_sessions = primary_root.join("sessions");
+        let legacy_sessions = legacy_root.join("sessions");
+        fs::create_dir_all(&primary_sessions).expect("primary sessions");
+        fs::create_dir_all(&legacy_sessions).expect("legacy sessions");
+        fs::write(primary_sessions.join("same-name.json"), b"primary").expect("primary session");
+        fs::write(legacy_sessions.join("same-name.json"), b"legacy").expect("legacy session");
+
+        let report = doctor_session_recovery_report(&primary_root, &legacy_root, false);
+
+        assert_eq!(
+            report.status,
+            DoctorSessionRecoveryStatus::MigrationComplete
+        );
+        assert!(!report.needs_attention());
+        assert_eq!(report.recoverable_file_count, 0);
+        assert!(report.recoverable.is_empty());
+        assert_eq!(report.already_present_file_count, 1);
+    }
+
+    #[test]
+    fn doctor_bounds_recoverable_session_filename_samples() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (primary_root, legacy_root) = roots(&tmp);
+        let legacy_sessions = legacy_root.join("sessions");
+        fs::create_dir_all(&legacy_sessions).expect("legacy sessions");
+        let total = DOCTOR_SESSION_RECOVERY_JSON_SAMPLE_LIMIT + 2;
+        for index in 0..total {
+            fs::write(
+                legacy_sessions.join(format!("session-{index:03}.json")),
+                b"fixture",
+            )
+            .expect("legacy session fixture");
+        }
+
+        let report = doctor_session_recovery_report(&primary_root, &legacy_root, false);
+        let json = doctor_session_recovery_json(&report);
+
+        assert_eq!(report.recoverable_file_count, total);
+        assert_eq!(
+            report.recoverable.len(),
+            DOCTOR_SESSION_RECOVERY_JSON_SAMPLE_LIMIT
+        );
+        assert_eq!(
+            json["recoverable_files"].as_array().map(Vec::len),
+            Some(DOCTOR_SESSION_RECOVERY_JSON_SAMPLE_LIMIT)
+        );
+        assert_eq!(json["recoverable_files_truncated"], true);
+    }
+
+    #[test]
+    fn doctor_session_recovery_fails_closed_on_an_unreadable_path_shape() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (primary_root, legacy_root) = roots(&tmp);
+        fs::create_dir_all(&legacy_root).expect("legacy root");
+        fs::write(legacy_root.join("sessions"), b"not a directory")
+            .expect("invalid legacy sessions path");
+
+        let report = doctor_session_recovery_report(&primary_root, &legacy_root, false);
+
+        assert_eq!(report.status, DoctorSessionRecoveryStatus::ScanFailed);
+        assert!(report.needs_attention());
+        assert!(
+            report
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("could not inspect legacy session filenames"))
+        );
+    }
+
+    #[test]
+    fn explicit_codewhale_home_skips_session_recovery_scan() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (primary_root, legacy_root) = roots(&tmp);
+        fs::create_dir_all(legacy_root.join("sessions")).expect("legacy sessions");
+        fs::write(legacy_root.join("sessions").join("ambient.json"), b"legacy")
+            .expect("legacy session");
+
+        let report = doctor_session_recovery_report(&primary_root, &legacy_root, true);
+
+        assert_eq!(report.status, DoctorSessionRecoveryStatus::Isolated);
+        assert!(report.codewhale_home_is_explicit);
+        assert_eq!(report.legacy_session_file_count, 0);
+        assert_eq!(report.recoverable_file_count, 0);
+        assert!(report.recoverable.is_empty());
+        assert!(!report.needs_attention());
     }
 
     #[test]
@@ -10426,6 +10909,11 @@ mod doctor_legacy_state_tests {
 
         let (primary_root, legacy_root) = doctor_state_roots();
         let report = doctor_legacy_state_report(&primary_root, &legacy_root);
+        let session_recovery = doctor_session_recovery_report(
+            &primary_root,
+            &legacy_root,
+            codewhale_config::codewhale_home_is_explicit(),
+        );
 
         assert_eq!(primary_root, explicit_home);
         assert_eq!(
@@ -10439,6 +10927,11 @@ mod doctor_legacy_state_tests {
             "doctor must not report ambient legacy state when CODEWHALE_HOME is explicit"
         );
         assert!(!report.iter().any(legacy_state_needs_attention));
+        assert_eq!(
+            session_recovery.status,
+            DoctorSessionRecoveryStatus::Isolated
+        );
+        assert!(session_recovery.recoverable.is_empty());
     }
 }
 

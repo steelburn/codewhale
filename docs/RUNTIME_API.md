@@ -166,10 +166,18 @@ codewhale doctor --json
 | `workspace` | string | Default workspace directory |
 | `legacy_state.primary_root` | string | Primary Codewhale state root inspected for known state paths |
 | `legacy_state.legacy_root` | string | Legacy `.deepseek` state root inspected for known state paths |
-| `legacy_state.needs_attention` | bool | Whether known `~/.deepseek` state paths are unmigrated or also present beside `~/.codewhale` |
+| `legacy_state.needs_attention` | bool | Whether known `~/.deepseek` state paths need review or the read-only session recovery diagnostic found missing destination filenames / could not complete |
 | `legacy_state.legacy_only_count` | number | Count of known state paths present only under the legacy root |
 | `legacy_state.dual_present_count` | number | Count of known state paths present under both primary and legacy roots |
 | `legacy_state.entries` | array | Per-path migration status: `{name, primary_present, legacy_present, status}` |
+| `legacy_state.session_recovery.status` | string | `isolated`, `no_legacy_sessions`, `migration_pending`, `migration_incomplete`, `migration_complete`, or `scan_failed` |
+| `legacy_state.session_recovery.read_only` | bool | Always true; doctor never invokes session migration or modifies either session directory |
+| `legacy_state.session_recovery.chat_contents_read` | bool | Always false; comparison is based only on top-level `.json` filenames and filesystem metadata |
+| `legacy_state.session_recovery.checkpoint_internals_scanned` | bool | Always false; `sessions/checkpoints/` and all other directories are skipped |
+| `legacy_state.session_recovery.recoverable_files` | array | Bounded sample of up to 100 missing destination filenames with source and destination paths; no chat payloads |
+| `legacy_state.session_recovery.recoverable_file_count` | number | Total missing destination filename count, including entries beyond the bounded sample |
+| `legacy_state.session_recovery.recoverable_files_truncated` | bool | Whether more than 100 recoverable filenames were found |
+| `legacy_state.session_recovery.recovery_command` | string or null | `codewhale sessions` when additive automatic recovery is available; null for isolated, complete, empty, or failed scans |
 | `api_key.source` | string | `env`, `config`, or `missing` |
 | `base_url` | string | API base URL |
 | `default_text_model` | string | Default model |

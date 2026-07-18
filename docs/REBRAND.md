@@ -202,6 +202,31 @@ If both `~/.codewhale/...` and `~/.deepseek/...` copies exist, the Codewhale
 path wins. Keep the legacy directory until you have confirmed `codewhale
 doctor`, `codewhale sessions`, and your expected skills all show the same state.
 
+### If sessions appear missing after an upgrade
+
+Run `codewhale doctor` before copying or deleting anything. Doctor compares
+top-level session JSON **filenames and filesystem metadata only** between
+`~/.deepseek/sessions/` and `~/.codewhale/sessions/`. It does not read chat
+contents, traverse `checkpoints/`, or modify either directory. The JSON form
+exposes the same result at `legacy_state.session_recovery`.
+
+If doctor lists recoverable filenames:
+
+1. Back up both session directories (if present) and close other Codewhale
+   processes.
+2. Run `codewhale sessions`. This invokes the existing additive migration,
+   which creates only missing destination files, never overwrites a file that
+   already exists under `~/.codewhale/sessions/`, skips checkpoint internals,
+   and leaves every legacy original in place.
+3. Rerun `codewhale doctor`, then confirm the sessions appear with `codewhale
+   sessions`. If any filenames remain listed, keep both backups and report the
+   listed source/destination filenames without sharing chat contents.
+
+An explicit `CODEWHALE_HOME` intentionally isolates that home and disables the
+ambient `~/.deepseek` fallback. Doctor will not inspect the ambient legacy home
+in that mode. To diagnose the default home without changing the isolated one,
+use a separate shell with `CODEWHALE_HOME` unset and rerun `codewhale doctor`.
+
 ## Why the name change
 
 Codewhale is a shorter, terminal-friendlier handle for the same terminal
