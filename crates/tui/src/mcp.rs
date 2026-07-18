@@ -2629,44 +2629,45 @@ pub fn workspace_mcp_config_path(workspace: &Path) -> PathBuf {
 }
 
 pub fn load_config_with_workspace(global_path: &Path, workspace: &Path) -> Result<McpConfig> {
-    let mut merged = load_config(global_path)?;
-    let workspace = checked_workspace_path(workspace)?;
-    let project_path = checked_workspace_mcp_config_path(&workspace)?;
-    if !project_path.exists() || paths_refer_to_same_config(global_path, &project_path) {
-        return Ok(merged);
-    }
-    // Workspace-local MCP can spawn stdio servers, so it is only honored after
-    // the user has trusted this workspace in user-owned config. Do not accept
-    // project-local legacy trust markers here: a repository could carry those
-    // files itself and silently reintroduce the project-scope `mcp_config_path`
-    // risk denied in #417.
-    if !workspace_allows_project_mcp_config(&workspace) {
-        return Ok(merged);
-    }
-
-    let mut project = load_config(&project_path)?;
-    for server in project.servers.values_mut() {
-        if server.command.is_some() && server.url.is_none() {
-            server.cwd = Some(resolve_project_mcp_cwd(&workspace, server.cwd.as_deref())?);
-        }
-    }
-    merged.servers.extend(project.servers);
-
-    merged = merge_plugin_mcp_servers(merged)?;
-
-    Ok(merged)
-}
-
-fn merge_plugin_mcp_servers(config: McpConfig) -> Result<McpConfig> {
-    let plugins = crate::plugins::try_with_registry(|r| {
-        r.list_enabled()
+    let plugins = crate::plugins::try_with_registry(|registry| {
+        registry
+            .list_enabled()
             .into_iter()
             .map(|(name, plugin)| (name.clone(), plugin.clone()))
             .collect::<Vec<_>>()
     })
     .unwrap_or_default();
 
-    merge_plugin_mcp_servers_from_plugins(config, plugins)
+    load_config_with_workspace_from_plugins(global_path, workspace, plugins)
+}
+
+fn load_config_with_workspace_from_plugins(
+    global_path: &Path,
+    workspace: &Path,
+    plugins: impl IntoIterator<Item = (String, crate::plugins::manifest::LoadedPlugin)>,
+) -> Result<McpConfig> {
+    let mut merged = load_config(global_path)?;
+    let workspace = checked_workspace_path(workspace)?;
+    let project_path = checked_workspace_mcp_config_path(&workspace)?;
+    let has_distinct_project_config =
+        project_path.exists() && !paths_refer_to_same_config(global_path, &project_path);
+    // Workspace-local MCP can spawn stdio servers, so it is only honored after
+    // the user has trusted this workspace in user-owned config. Do not accept
+    // project-local legacy trust markers here: a repository could carry those
+    // files itself and silently reintroduce the project-scope `mcp_config_path`
+    // risk denied in #417. User-owned plugin MCP remains independent of this
+    // project trust gate and is merged below on every path.
+    if has_distinct_project_config && workspace_allows_project_mcp_config(&workspace) {
+        let mut project = load_config(&project_path)?;
+        for server in project.servers.values_mut() {
+            if server.command.is_some() && server.url.is_none() {
+                server.cwd = Some(resolve_project_mcp_cwd(&workspace, server.cwd.as_deref())?);
+            }
+        }
+        merged.servers.extend(project.servers);
+    }
+
+    merge_plugin_mcp_servers_from_plugins(merged, plugins)
 }
 
 fn merge_plugin_mcp_servers_from_plugins(

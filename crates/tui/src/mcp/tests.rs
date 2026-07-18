@@ -809,13 +809,70 @@ url = "https://example.invalid/mcp"
     assert!(remote.cwd.is_none());
 }
 
+fn plugin_with_local_mcp(name: &str, base_path: PathBuf) -> crate::plugins::manifest::LoadedPlugin {
+    let manifest = toml::from_str::<crate::plugins::manifest::PluginManifest>(&format!(
+        r#"
+[plugin]
+name = "{name}"
+
+[mcp_servers.local]
+command = "node"
+args = ["server.js"]
+"#,
+    ))
+    .unwrap();
+    crate::plugins::manifest::LoadedPlugin {
+        manifest,
+        base_path,
+        enabled: true,
+    }
+}
+
+#[test]
+fn plugin_mcp_servers_merge_without_project_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let global_path = dir.path().join("global-mcp.json");
+    let workspace = dir.path().join("workspace");
+    let plugin_base = dir.path().join("plugins").join("fixture");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&plugin_base).unwrap();
+    fs::write(
+        &global_path,
+        r#"{"servers": {"global": {"command": "node", "args": ["global.js"]}}}"#,
+    )
+    .unwrap();
+
+    let cfg = load_config_with_workspace_from_plugins(
+        &global_path,
+        &workspace,
+        vec![(
+            "fixture".to_string(),
+            plugin_with_local_mcp("fixture", plugin_base.clone()),
+        )],
+    )
+    .unwrap();
+
+    assert!(cfg.servers.contains_key("global"));
+    let local = cfg
+        .servers
+        .get("fixture-local")
+        .expect("plugin MCP should merge without a project MCP config");
+    assert_eq!(local.command.as_deref(), Some("node"));
+    assert_eq!(
+        local.cwd.as_deref(),
+        Some(plugin_base.canonicalize().unwrap().as_path())
+    );
+}
+
 #[test]
 fn workspace_mcp_config_ignores_project_file_until_workspace_trusted() {
     let dir = tempfile::tempdir().unwrap();
     let global_path = dir.path().join("global-mcp.json");
     let workspace = dir.path().join("workspace");
     let project_dir = workspace.join(".codewhale");
+    let plugin_base = dir.path().join("plugins").join("fixture");
     fs::create_dir_all(&project_dir).unwrap();
+    fs::create_dir_all(&plugin_base).unwrap();
     fs::write(
         &global_path,
         r#"{"servers": {"global": {"command": "node", "args": ["global.js"]}}}"#,
@@ -827,10 +884,22 @@ fn workspace_mcp_config_ignores_project_file_until_workspace_trusted() {
     )
     .unwrap();
 
-    let cfg = load_config_with_workspace(&global_path, &workspace).unwrap();
+    let cfg = load_config_with_workspace_from_plugins(
+        &global_path,
+        &workspace,
+        vec![(
+            "fixture".to_string(),
+            plugin_with_local_mcp("fixture", plugin_base),
+        )],
+    )
+    .unwrap();
 
     assert!(cfg.servers.contains_key("global"));
     assert!(!cfg.servers.contains_key("project"));
+    assert!(
+        cfg.servers.contains_key("fixture-local"),
+        "user plugin MCP should not be gated by project workspace trust"
+    );
 }
 
 #[test]

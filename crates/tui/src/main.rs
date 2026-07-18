@@ -1384,8 +1384,17 @@ async fn run_async_main() -> Result<()> {
     // suspend path, and SIGTERM / SIGHUP from the OS.
     spawn_signal_cleanup_task();
 
-    dotenv().ok();
-    let cli = Cli::parse();
+    // Parse first so help/version/errors still exit without touching plugin
+    // state. Plugin discovery must precede workspace-local dotenv loading:
+    // otherwise an untrusted repository could redirect CODEWHALE_HOME to a
+    // repository-owned plugin manifest containing an stdio MCP server.
+    let (cli, command) = prepare_cli_startup(
+        Cli::parse(),
+        || crate::plugins::init_registry(&[]),
+        || {
+            dotenv().ok();
+        },
+    );
     logging::set_verbose(cli.verbose || logging::env_requests_verbose_logging());
 
     // Install any user prompt overrides from the config directory before an
@@ -1395,7 +1404,7 @@ async fn run_async_main() -> Result<()> {
     crate::prompts::load_prompt_overrides_from_config_home();
 
     // Handle subcommands first
-    if let Some(command) = cli.command.clone() {
+    if let Some(command) = command {
         return match command {
             Commands::Doctor(args) => {
                 let config = load_config_from_cli(&cli)?;
@@ -1671,7 +1680,6 @@ async fn run_async_main() -> Result<()> {
     // for follow-up messages. Use `codewhale exec` for explicit non-interactive
     // one-shot behavior (#2370).
     let config = load_config_from_cli(&cli)?;
-    crate::plugins::init_registry(&[]);
     if let Some(initial_input) = top_level_prompt_initial_input(&cli.prompt) {
         return run_interactive(&cli, &config, None, Some(initial_input)).await;
     }
@@ -1695,6 +1703,17 @@ async fn run_async_main() -> Result<()> {
     // Default: Interactive TUI
     // --yolo starts in YOLO mode (auto-approve; shell enabled)
     run_interactive(&cli, &config, resume_session_id, None).await
+}
+
+fn prepare_cli_startup(
+    cli: Cli,
+    initialize_plugins: impl FnOnce(),
+    load_dotenv: impl FnOnce(),
+) -> (Cli, Option<Commands>) {
+    initialize_plugins();
+    load_dotenv();
+    let command = cli.command.clone();
+    (cli, command)
 }
 
 /// Generate shell completions for the given shell
@@ -11697,6 +11716,54 @@ mod terminal_mode_tests {
         assert!(!last);
         assert_eq!(sessions_resume_command(), "codewhale resume");
         assert!(!sessions_resume_command().contains("--resume"));
+    }
+
+    #[test]
+    fn plugin_registry_initialization_precedes_dotenv_for_all_launch_paths() {
+        use std::cell::Cell;
+
+        #[derive(Clone, Copy)]
+        enum Expected {
+            Plain,
+            Resume,
+            Fork,
+            Exec,
+            Serve,
+        }
+
+        let cases: &[(&[&str], Expected)] = &[
+            (&["codewhale"], Expected::Plain),
+            (&["codewhale", "resume", "--last"], Expected::Resume),
+            (&["codewhale", "fork", "--last"], Expected::Fork),
+            (&["codewhale", "exec", "probe"], Expected::Exec),
+            (&["codewhale", "serve", "--mcp"], Expected::Serve),
+        ];
+
+        for (args, expected) in cases {
+            let phase = Cell::new(0);
+            let (_cli, command) = prepare_cli_startup(
+                parse_cli(args),
+                || {
+                    assert_eq!(phase.get(), 0, "plugin init order for {args:?}");
+                    phase.set(1);
+                },
+                || {
+                    assert_eq!(phase.get(), 1, "dotenv load order for {args:?}");
+                    phase.set(2);
+                },
+            );
+
+            assert_eq!(phase.get(), 2, "startup phases for {args:?}");
+            let correct_variant = matches!(
+                (expected, command.as_ref()),
+                (Expected::Plain, None)
+                    | (Expected::Resume, Some(Commands::Resume { .. }))
+                    | (Expected::Fork, Some(Commands::Fork { .. }))
+                    | (Expected::Exec, Some(Commands::Exec(_)))
+                    | (Expected::Serve, Some(Commands::Serve(_)))
+            );
+            assert!(correct_variant, "unexpected command for {args:?}");
+        }
     }
 
     #[test]

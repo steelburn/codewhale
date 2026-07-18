@@ -7,16 +7,19 @@ use super::registry::PluginRegistry;
 const PLUGIN_MANIFEST: &str = "plugin.toml";
 const OVERRIDES_FILE: &str = "overrides.json";
 
-pub fn default_user_plugins_dir() -> PathBuf {
+pub fn default_user_plugins_dir() -> Option<PathBuf> {
+    // User plugins can start stdio MCP servers. If the trusted home directory
+    // cannot be resolved, fail closed instead of scanning a shared temporary
+    // directory that another local user could populate.
     codewhale_config::codewhale_home()
+        .ok()
         .map(|p| p.join("plugins"))
-        .unwrap_or_else(|_| PathBuf::from("/tmp/codewhale/plugins"))
 }
 
 /// Path of the JSON file that records `/plugin enable|disable` choices so they
 /// survive restarts.
-pub fn default_overrides_path() -> PathBuf {
-    default_user_plugins_dir().join(OVERRIDES_FILE)
+pub fn default_overrides_path() -> Option<PathBuf> {
+    default_user_plugins_dir().map(|path| path.join(OVERRIDES_FILE))
 }
 
 /// Read the persisted enable/disable overrides. Missing or malformed files
@@ -42,9 +45,12 @@ pub fn save_overrides(path: &Path, overrides: &HashMap<String, bool>) -> std::io
 pub fn discover_all(builtin_dirs: &[&str]) -> PluginRegistry {
     let mut registry = PluginRegistry::new();
 
-    let overrides_path = default_overrides_path();
-    let overrides = load_overrides(&overrides_path);
-    registry.set_overrides_store(overrides_path, overrides);
+    let user_dir = default_user_plugins_dir();
+    if let Some(user_dir) = user_dir.as_ref() {
+        let overrides_path = user_dir.join(OVERRIDES_FILE);
+        let overrides = load_overrides(&overrides_path);
+        registry.set_overrides_store(overrides_path, overrides);
+    }
 
     for dir in builtin_dirs {
         let path = PathBuf::from(dir);
@@ -53,8 +59,9 @@ pub fn discover_all(builtin_dirs: &[&str]) -> PluginRegistry {
         }
     }
 
-    let user_dir = default_user_plugins_dir();
-    if user_dir.exists() {
+    if let Some(user_dir) = user_dir
+        && user_dir.exists()
+    {
         discover_from_dir(&user_dir, &mut registry, false);
     }
 
@@ -115,10 +122,10 @@ mod tests {
         let home = tmp.path().join("codewhale-home");
         let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", home.as_os_str());
 
-        assert_eq!(default_user_plugins_dir(), home.join("plugins"));
+        assert_eq!(default_user_plugins_dir(), Some(home.join("plugins")));
         assert_eq!(
             default_overrides_path(),
-            home.join("plugins").join(OVERRIDES_FILE)
+            Some(home.join("plugins").join(OVERRIDES_FILE))
         );
     }
 }
