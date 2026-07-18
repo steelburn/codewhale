@@ -29,6 +29,7 @@ use std::cell::Cell;
 
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::palette;
@@ -379,10 +380,10 @@ fn wrap_plain_line(line: &str, width: usize, style: Style) -> Vec<Line<'static>>
     let mut current_width = 0usize;
     let mut last_break_pos = None;
 
-    for ch in line.chars() {
+    for grapheme in line.graphemes(true) {
         loop {
-            let ch_width = char_display_width(ch, current_width);
-            if current_width + ch_width <= width || current.is_empty() {
+            let grapheme_width = markdown_grapheme_width(grapheme, current_width);
+            if current_width + grapheme_width <= width || current.is_empty() {
                 break;
             }
 
@@ -410,10 +411,10 @@ fn wrap_plain_line(line: &str, width: usize, style: Style) -> Vec<Line<'static>>
             break;
         }
 
-        let ch_width = char_display_width(ch, current_width);
-        current.push(ch);
-        current_width += ch_width;
-        if ch.is_whitespace() {
+        let grapheme_width = markdown_grapheme_width(grapheme, current_width);
+        current.push_str(grapheme);
+        current_width += grapheme_width;
+        if grapheme.chars().all(char::is_whitespace) {
             last_break_pos = Some(current.len());
         }
     }
@@ -434,8 +435,8 @@ fn wrap_plain_line(line: &str, width: usize, style: Style) -> Vec<Line<'static>>
 
 fn plain_display_width(text: &str) -> usize {
     let mut width = 0usize;
-    for ch in text.chars() {
-        width += char_display_width(ch, width);
+    for grapheme in text.graphemes(true) {
+        width += markdown_grapheme_width(grapheme, width);
     }
     width
 }
@@ -646,7 +647,7 @@ fn render_line_with_links_tagged(
             continue;
         }
         // If the word itself is wider than an entire line, hard-break it at
-        // character boundaries so wrapping always makes progress (#1344,
+        // grapheme boundaries so wrapping always makes progress (#1344,
         // #1351). Without this, long URLs / paths / hashes were placed on
         // their own line whole and silently overflowed the right edge of
         // the transcript.
@@ -666,9 +667,9 @@ fn render_line_with_links_tagged(
             // current line so the next word can pack onto it.
             let mut chunk = String::new();
             let mut chunk_w = 0usize;
-            for ch in word.text.chars() {
-                let cw = ch.width().unwrap_or(1);
-                if chunk_w + cw > width && chunk_w > 0 {
+            for grapheme in word.text.graphemes(true) {
+                let grapheme_width = grapheme.width();
+                if chunk_w + grapheme_width > width && chunk_w > 0 {
                     let chunk = std::mem::take(&mut chunk);
                     let mut links = Vec::new();
                     record_inline_link(&mut links, &word, 0, chunk_w);
@@ -681,8 +682,8 @@ fn render_line_with_links_tagged(
                     });
                     chunk_w = 0;
                 }
-                chunk.push(ch);
-                chunk_w += cw;
+                chunk.push_str(grapheme);
+                chunk_w += grapheme_width;
             }
             if !chunk.is_empty() {
                 record_inline_link(&mut current_links, &word, 0, chunk_w);
@@ -1076,7 +1077,7 @@ fn split_table_cells(inner: &str) -> Vec<String> {
 
 /// Word-wrap a single cell's text into one or more visual lines, each
 /// constrained to `col_width` display columns. Whitespace is the preferred
-/// break point; words wider than `col_width` are hard-broken at character
+/// break point; words wider than `col_width` are hard-broken at grapheme
 /// boundaries so wrapping always makes progress (no infinite loop on URLs
 /// or paths). Returns at least one segment.
 fn wrap_cell_text(cell: &str, col_width: usize) -> Vec<String> {
@@ -1091,7 +1092,13 @@ fn wrap_cell_text(cell: &str, col_width: usize) -> Vec<String> {
         let word_w = word.width();
         if current_w == 0 {
             if word_w > col_width {
-                push_word_breaking_chars(word, col_width, &mut current, &mut current_w, &mut lines);
+                push_word_breaking_graphemes(
+                    word,
+                    col_width,
+                    &mut current,
+                    &mut current_w,
+                    &mut lines,
+                );
             } else {
                 current.push_str(word);
                 current_w = word_w;
@@ -1104,7 +1111,13 @@ fn wrap_cell_text(cell: &str, col_width: usize) -> Vec<String> {
             lines.push(std::mem::take(&mut current));
             current_w = 0;
             if word_w > col_width {
-                push_word_breaking_chars(word, col_width, &mut current, &mut current_w, &mut lines);
+                push_word_breaking_graphemes(
+                    word,
+                    col_width,
+                    &mut current,
+                    &mut current_w,
+                    &mut lines,
+                );
             } else {
                 current.push_str(word);
                 current_w = word_w;
@@ -1252,21 +1265,22 @@ fn link_style() -> Style {
         .add_modifier(Modifier::UNDERLINED)
 }
 
-/// Hard-wrap a code line at `width` display columns, preserving all
-/// whitespace (including leading indentation). Unlike [`wrap_text`], this
-/// does not split on word boundaries — code indentation is semantic.
-/// Display-column width of a single character for the purposes of terminal
-/// line-wrap calculations.
+/// Display-column width of one extended grapheme for terminal line-wrap
+/// calculations.
 ///
-/// `UnicodeWidthChar::width` returns `None` for control characters, which
-/// includes `\t`. A tab advances to the next 8-column tab stop, so we model
-/// it as 8 columns here (a safe over-estimate that avoids terminal overflow).
-/// Other control characters are counted as 1 column.
-fn char_display_width(ch: char, col: usize) -> usize {
-    match ch {
-        '\t' => 8 - (col % 8), // advance to next 8-column tab stop
-        _ => ch.width().unwrap_or(1),
+/// A tab advances to the next 8-column tab stop. Single control characters
+/// retain the previous one-column fallback; multi-codepoint emoji and
+/// combining sequences use the same string-level width contract as Ratatui.
+fn markdown_grapheme_width(grapheme: &str, col: usize) -> usize {
+    if grapheme == "\t" {
+        return 8 - (col % 8); // advance to next 8-column tab stop
     }
+    if let Some(ch) = grapheme.chars().next()
+        && ch.len_utf8() == grapheme.len()
+    {
+        return ch.width().unwrap_or(1);
+    }
+    grapheme.width()
 }
 
 /// Hard-wrap a code line at `width` display columns, preserving all
@@ -1280,15 +1294,15 @@ fn wrap_code_line(line: &str, width: usize) -> Vec<String> {
     let mut current = String::new();
     let mut current_width = 0usize;
 
-    for ch in line.chars() {
-        let ch_width = char_display_width(ch, current_width);
-        if current_width + ch_width > width && !current.is_empty() {
+    for grapheme in line.graphemes(true) {
+        let grapheme_width = markdown_grapheme_width(grapheme, current_width);
+        if current_width + grapheme_width > width && !current.is_empty() {
             chunks.push(current);
             current = String::new();
             current_width = 0;
         }
-        current.push(ch);
-        current_width += ch_width;
+        current.push_str(grapheme);
+        current_width += grapheme_width;
     }
     chunks.push(current);
     chunks
@@ -1305,7 +1319,7 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     for word in text.split_whitespace() {
         let word_width = word.width();
         // If this single word is wider than the entire line, hard-break it
-        // at character boundaries so wrapping always makes progress
+        // at grapheme boundaries so wrapping always makes progress
         // (#1344, #1351). Without this, long URLs / paths / hashes overflow
         // the right edge silently.
         if word_width > width {
@@ -1313,7 +1327,7 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
                 lines.push(std::mem::take(&mut current));
                 current_width = 0;
             }
-            push_word_breaking_chars(word, width, &mut current, &mut current_width, &mut lines);
+            push_word_breaking_graphemes(word, width, &mut current, &mut current_width, &mut lines);
             continue;
         }
         let additional = if current.is_empty() {
@@ -1344,26 +1358,26 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
-/// Push characters from `word` into `current`, flushing to `lines` when the
-/// running display width would exceed `width`. Width is computed at the
-/// `unicode-width` char level, matching the rest of the rendering pipeline.
+/// Push graphemes from `word` into `current`, flushing to `lines` when the
+/// running display width would exceed `width`. String-level Unicode width
+/// matches Ratatui for emoji and combining sequences.
 /// Used by `wrap_text` and `wrap_cell_text` so a word longer than the
 /// allotted width never silently overflows the right edge.
-fn push_word_breaking_chars(
+fn push_word_breaking_graphemes(
     word: &str,
     width: usize,
     current: &mut String,
     current_width: &mut usize,
     lines: &mut Vec<String>,
 ) {
-    for ch in word.chars() {
-        let cw = ch.width().unwrap_or(1);
-        if *current_width + cw > width && *current_width > 0 {
+    for grapheme in word.graphemes(true) {
+        let grapheme_width = grapheme.width();
+        if *current_width + grapheme_width > width && *current_width > 0 {
             lines.push(std::mem::take(current));
             *current_width = 0;
         }
-        current.push(ch);
-        *current_width += cw;
+        current.push_str(grapheme);
+        *current_width += grapheme_width;
     }
 }
 
@@ -1591,15 +1605,17 @@ mod tests {
     }
 
     #[test]
-    fn char_display_width_tab_uses_tab_stop() {
+    fn markdown_grapheme_width_uses_tab_stop_and_string_width() {
         // At column 0 a tab fills to column 8.
-        assert_eq!(char_display_width('\t', 0), 8);
+        assert_eq!(markdown_grapheme_width("\t", 0), 8);
         // At column 4 a tab fills to column 8 (4 remaining).
-        assert_eq!(char_display_width('\t', 4), 4);
+        assert_eq!(markdown_grapheme_width("\t", 4), 4);
         // At column 8 a tab fills to the next stop at 16 (8 columns).
-        assert_eq!(char_display_width('\t', 8), 8);
+        assert_eq!(markdown_grapheme_width("\t", 8), 8);
         // Regular ASCII is 1.
-        assert_eq!(char_display_width('a', 0), 1);
+        assert_eq!(markdown_grapheme_width("a", 0), 1);
+        // A fully-qualified keycap is one two-column grapheme.
+        assert_eq!(markdown_grapheme_width("1\u{fe0f}\u{20e3}", 0), 2);
     }
 
     #[test]
@@ -1931,7 +1947,7 @@ mod tests {
     // width was placed alone on a line and silently overflowed the right
     // edge of the transcript. Long URLs / paths / hashes / no-whitespace
     // CJK runs all hit this. The fix hard-breaks overlong words at
-    // character boundaries; these tests pin that across widths 40/60/80/120.
+    // grapheme boundaries; these tests pin that across widths 40/60/80/120.
 
     fn rendered_widths(rendered: &[Line<'static>]) -> Vec<usize> {
         rendered

@@ -40,7 +40,7 @@ use crate::tui::approval::{
 };
 use crate::tui::history::{GenericToolCell, HistoryCell, ToolCell, ToolRun, ToolStatus};
 use crate::tui::scrolling::TranscriptLineMeta;
-use crate::tui::ui_text::{char_display_width, text_display_width};
+use crate::tui::ui_text::{grapheme_display_width, text_display_width};
 use crate::tui::underwater::ShellPhase;
 use ratatui::{
     buffer::Buffer,
@@ -3087,20 +3087,20 @@ fn apply_selection_to_line(
             let mut before = String::new();
             let mut selected = String::new();
             let mut after = String::new();
-            let mut ch_col = current_col;
+            let mut grapheme_col = current_col;
 
-            for ch in span_text.chars() {
-                let ch_width = char_display_width(ch);
-                let ch_start = ch_col;
-                let ch_end = ch_col.saturating_add(ch_width);
-                if ch_end <= col_start {
-                    before.push(ch);
-                } else if ch_start >= col_end {
-                    after.push(ch);
+            for grapheme in span_text.graphemes(true) {
+                let grapheme_width = grapheme_display_width(grapheme);
+                let grapheme_start = grapheme_col;
+                let grapheme_end = grapheme_col.saturating_add(grapheme_width);
+                if grapheme_end <= col_start {
+                    before.push_str(grapheme);
+                } else if grapheme_start >= col_end {
+                    after.push_str(grapheme);
                 } else {
-                    selected.push(ch);
+                    selected.push_str(grapheme);
                 }
-                ch_col = ch_end;
+                grapheme_col = grapheme_end;
             }
 
             if !before.is_empty() {
@@ -5198,6 +5198,21 @@ mod tests {
         assert_eq!(styled[0].style.fg, Some(palette::SELECTION_TEXT));
         assert_eq!(styled[0].style.bg, Some(palette::SELECTION_BG));
         assert_eq!(styled[1].content.as_ref(), " world");
+    }
+
+    #[test]
+    fn selection_keeps_keycap_grapheme_intact() {
+        let line = Line::from(Span::raw("A1\u{fe0f}\u{20e3}B"));
+        let selection_style = Style::default().bg(palette::SELECTION_BG);
+
+        // Selecting the second display column of the two-column keycap must
+        // style the complete grapheme, never only FE0F/U+20E3.
+        let styled = apply_selection_to_line(&line, 2, 3, selection_style);
+        assert_eq!(styled.len(), 3);
+        assert_eq!(styled[0].content.as_ref(), "A");
+        assert_eq!(styled[1].content.as_ref(), "1\u{fe0f}\u{20e3}");
+        assert_eq!(styled[1].style.bg, Some(palette::SELECTION_BG));
+        assert_eq!(styled[2].content.as_ref(), "B");
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! Shared text helpers for TUI selection and clipboard workflows.
 
 use ratatui::text::{Line, Span};
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::tui::history::HistoryCell;
@@ -28,20 +29,21 @@ pub(crate) fn truncate_line_to_width(text: &str, max_width: usize) -> String {
     if max_width == 0 {
         return String::new();
     }
-    if UnicodeWidthStr::width(text) <= max_width {
+    if text_display_width(text) <= max_width {
         return text.to_string();
     }
-    // For very small budgets, take chars until we exceed the *display* width.
+    // For very small budgets, take whole graphemes until the next one would
+    // exceed the display width. Never split an emoji or combining sequence.
     if max_width <= 3 {
         let mut out = String::new();
         let mut width = 0usize;
-        for ch in text.chars() {
-            let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-            if width + ch_width > max_width {
+        for grapheme in text.graphemes(true) {
+            let grapheme_width = grapheme_display_width(grapheme);
+            if width + grapheme_width > max_width {
                 break;
             }
-            out.push(ch);
-            width += ch_width;
+            out.push_str(grapheme);
+            width += grapheme_width;
         }
         return out;
     }
@@ -49,13 +51,13 @@ pub(crate) fn truncate_line_to_width(text: &str, max_width: usize) -> String {
     let mut out = String::new();
     let mut width = 0usize;
     let limit = max_width.saturating_sub(3);
-    for ch in text.chars() {
-        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if width + ch_width > limit {
+    for grapheme in text.graphemes(true) {
+        let grapheme_width = grapheme_display_width(grapheme);
+        if width + grapheme_width > limit {
             break;
         }
-        out.push(ch);
-        width += ch_width;
+        out.push_str(grapheme);
+        width += grapheme_width;
     }
     out.push_str("...");
     out
@@ -81,14 +83,14 @@ pub(crate) fn semantic_truncate(text: &str, max_width: usize) -> String {
     let mut cut_byte = 0usize;
     let mut last_word_end = None;
     let mut in_word = false;
-    for (byte_idx, ch) in text.char_indices() {
-        let ch_width = char_display_width(ch);
-        if width + ch_width > limit {
+    for (byte_idx, grapheme) in text.grapheme_indices(true) {
+        let grapheme_width = grapheme_display_width(grapheme);
+        if width + grapheme_width > limit {
             break;
         }
-        width += ch_width;
-        cut_byte = byte_idx + ch.len_utf8();
-        if ch.is_whitespace() {
+        width += grapheme_width;
+        cut_byte = byte_idx + grapheme.len();
+        if grapheme.chars().all(char::is_whitespace) {
             if in_word {
                 last_word_end = Some(byte_idx);
                 in_word = false;
@@ -262,7 +264,7 @@ where
 }
 
 pub(crate) fn text_display_width(text: &str) -> usize {
-    text.chars().map(char_display_width).sum()
+    text.graphemes(true).map(grapheme_display_width).sum()
 }
 
 pub(super) fn slice_text(text: &str, start: usize, end: usize) -> String {
@@ -272,14 +274,14 @@ pub(super) fn slice_text(text: &str, start: usize, end: usize) -> String {
 
     let mut out = String::new();
     let mut col = 0usize;
-    for ch in text.chars() {
-        let ch_width = char_display_width(ch);
-        let ch_start = col;
-        let ch_end = col.saturating_add(ch_width);
-        if ch_end > start && ch_start < end {
-            out.push(ch);
+    for grapheme in text.graphemes(true) {
+        let grapheme_width = grapheme_display_width(grapheme);
+        let grapheme_start = col;
+        let grapheme_end = col.saturating_add(grapheme_width);
+        if grapheme_end > start && grapheme_start < end {
+            out.push_str(grapheme);
         }
-        col = ch_end;
+        col = grapheme_end;
         if col >= end {
             break;
         }
@@ -298,6 +300,21 @@ pub(super) fn char_display_width(ch: char) -> usize {
         // matches what the terminal actually renders.
         UnicodeWidthChar::width(ch).unwrap_or(1)
     }
+}
+
+/// Measure one extended grapheme using the same string-level Unicode rules as
+/// Ratatui. String width intentionally differs from the sum of codepoint widths
+/// for keycaps, ZWJ emoji, modifiers, and other terminal ligatures.
+pub(super) fn grapheme_display_width(grapheme: &str) -> usize {
+    if grapheme == "\t" {
+        return 4;
+    }
+    if let Some(ch) = grapheme.chars().next()
+        && ch.len_utf8() == grapheme.len()
+    {
+        return char_display_width(ch);
+    }
+    UnicodeWidthStr::width(grapheme)
 }
 
 #[cfg(test)]
@@ -379,8 +396,8 @@ mod tests {
         // combining marks or ZWJ emoji sequences.)
         assert_eq!(text_display_width("e\u{0301}"), 1);
         assert_eq!(text_display_width("cafe\u{0301}"), 4);
-        // ZWJ joiner itself is zero-width; the two emoji are 2 cols each.
-        assert_eq!(text_display_width("\u{1F469}\u{200D}\u{1F4BB}"), 4);
+        // The complete ZWJ emoji is one two-column grapheme, matching Ratatui.
+        assert_eq!(text_display_width("\u{1F469}\u{200D}\u{1F4BB}"), 2);
     }
 
     #[test]
@@ -536,6 +553,62 @@ mod tests {
                 !out.contains('\u{FFFD}'),
                 "width={width}: truncation split a wide glyph"
             );
+        }
+    }
+
+    // --- keycap / grapheme regression guard (#4479) ---------------------------
+    // Fully qualified keycap sequences render as two columns. Codepoint sums
+    // report one; the canonical string/grapheme contract reports two.
+
+    #[test]
+    fn text_display_width_treats_keycap_sequence_as_two_columns() {
+        for keycap in [
+            "1\u{fe0f}\u{20e3}",
+            "9\u{fe0f}\u{20e3}",
+            "#\u{fe0f}\u{20e3}",
+        ] {
+            assert_eq!(text_display_width(keycap), 2);
+            assert_eq!(text_display_width(keycap), UnicodeWidthStr::width(keycap));
+        }
+        // Preserve unicode-width's distinction between fully-qualified emoji
+        // presentation and text/standalone combining-mark forms.
+        assert_eq!(text_display_width("1\u{20e3}"), 1);
+        assert_eq!(text_display_width("\u{20e3}"), 0);
+    }
+
+    #[test]
+    fn slice_text_does_not_split_keycap_sequence() {
+        let row = "step 1\u{fe0f}\u{20e3} done";
+        // The keycap occupies columns [5, 7). Any overlapping selection keeps
+        // the complete grapheme; no isolated FE0F/U+20E3 mark may escape.
+        for (start, end) in [(0, 7), (5, 6), (6, 7)] {
+            let sliced = slice_text(row, start, end);
+            assert!(
+                sliced.contains("1\u{fe0f}\u{20e3}"),
+                "range=({start}, {end}) split keycap: {sliced:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn truncate_line_to_width_always_stays_within_budget_with_keycap() {
+        // Budgets from zero through wide, with and without surrounding text.
+        let cases = [
+            "1\u{fe0f}\u{20e3}",
+            "A 1\u{fe0f}\u{20e3} B",
+            "step 2\u{fe0f}\u{20e3} and 3\u{fe0f}\u{20e3} continue",
+        ];
+        for text in &cases {
+            for budget in 0..=text_display_width(text) + 4 {
+                let out = truncate_line_to_width(text, budget);
+                let width = text_display_width(&out);
+                assert!(
+                    width <= budget,
+                    "budget={budget} text={text:?} -> {out:?} (width={width})"
+                );
+                assert!(!out.ends_with('\u{fe0f}'));
+                assert!(!out.starts_with('\u{20e3}'));
+            }
         }
     }
 }
