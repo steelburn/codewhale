@@ -5501,7 +5501,16 @@ async fn spawn_subagent_from_input(
             .and_then(|member| member.profile.delegation.max_spawn_depth),
     );
     if let Some(workspace) = child_workspace {
-        child_runtime.context.workspace = workspace;
+        child_runtime.context.workspace = workspace.clone();
+        // A worktree child gets a distinct workspace-scoped plugin catalog.
+        // Reusing the parent's registry here would leak workspace plugins (and
+        // their authority receipts) across the exact isolation boundary the
+        // child requested. User-global roots remain available through the
+        // registry's frozen pre-dotenv discovery context.
+        if let Some(parent_plugins) = child_runtime.context.plugin_registry.as_ref() {
+            child_runtime.context.plugin_registry =
+                Some(parent_plugins.rediscover_for_workspace(&workspace));
+        }
     }
     // #4042: merge the parent runtime's inherited deny-list with the caller's
     // explicit `disallowed_tools`. `background_runtime()` already cloned the
@@ -5789,6 +5798,78 @@ fn build_subagent_system_prompt(
     prompt
 }
 
+fn build_subagent_system_prompt_with_skills(
+    agent_type: &SubAgentType,
+    assignment: &SubAgentAssignment,
+    context: &ToolContext,
+) -> String {
+    let mut prompt = build_subagent_system_prompt(agent_type, assignment);
+    let catalog = subagent_skill_catalog(context);
+    if !catalog.is_empty() {
+        prompt.push_str("\n\n");
+        prompt.push_str(&catalog);
+    }
+    prompt
+}
+
+/// Render the same workspace/plugin-qualified Skill authority available to
+/// `load_skill`, without leaking a mutable source or staged filesystem path.
+/// Every fresh and nested child derives this from its inherited ToolContext;
+/// forked children receive it at system precedence as well.
+fn subagent_skill_catalog(context: &ToolContext) -> String {
+    let mode =
+        crate::skills::SkillDiscoveryMode::from_codewhale_only(context.skills_scan_codewhale_only);
+    let registry = context
+        .skills_dir
+        .as_deref()
+        .map_or_else(
+            || {
+                crate::skills::discover_in_workspace_with_mode_and_plugins(
+                    &context.workspace,
+                    mode,
+                    context.plugin_registry.as_deref(),
+                )
+            },
+            |skills_dir| {
+                crate::skills::discover_for_workspace_and_dir_with_mode_and_plugins(
+                    &context.workspace,
+                    skills_dir,
+                    mode,
+                    context.plugin_registry.as_deref(),
+                )
+            },
+        )
+        .into_enabled();
+    if registry.list().is_empty() {
+        return String::new();
+    }
+    let mut output = String::from(
+        "## Skills\n\nUse `load_skill` with an exact name before applying a Skill. Catalog entries are workspace-scoped snapshots; plugin entries are revalidated at use.\n",
+    );
+    for skill in registry.list() {
+        let source = match &skill.source {
+            crate::skills::SkillSource::Native => "native workspace catalog".to_string(),
+            crate::skills::SkillSource::Plugin {
+                plugin_id,
+                plugin_name,
+                authority,
+            } => format!(
+                "reviewed plugin {plugin_name} id={plugin_id} generation={} content={}",
+                authority.state_generation,
+                &authority.content_hash[..authority.content_hash.len().min(12)]
+            ),
+        };
+        use std::fmt::Write as _;
+        let _ = writeln!(
+            output,
+            "- `{}`: {} ({source})",
+            skill.name,
+            skill.description.replace(['\n', '\r'], " ")
+        );
+    }
+    output
+}
+
 fn subagent_request_system_prompt(subagent_system_prompt: &str) -> SystemPrompt {
     // Forking inherits conversation context, not the parent's identity. A
     // child can have a different provider/model/profile, so its own resolved
@@ -5796,10 +5877,28 @@ fn subagent_request_system_prompt(subagent_system_prompt: &str) -> SystemPrompt 
     SystemPrompt::Text(subagent_system_prompt.to_string())
 }
 
+#[cfg(test)]
 fn build_initial_subagent_messages(
     prompt: &str,
     assignment: &SubAgentAssignment,
     agent_type: &SubAgentType,
+    fork_context: Option<&SubAgentForkContext>,
+) -> Vec<Message> {
+    let system_prompt = build_subagent_system_prompt(agent_type, assignment);
+    build_initial_subagent_messages_with_system(
+        prompt,
+        assignment,
+        agent_type,
+        &system_prompt,
+        fork_context,
+    )
+}
+
+fn build_initial_subagent_messages_with_system(
+    prompt: &str,
+    assignment: &SubAgentAssignment,
+    agent_type: &SubAgentType,
+    subagent_system_prompt: &str,
     fork_context: Option<&SubAgentForkContext>,
 ) -> Vec<Message> {
     let mut messages = fork_context
@@ -5820,7 +5919,7 @@ fn build_initial_subagent_messages(
 
         messages.push(system_text_message(format!(
             "<codewhale:subagent_context>\n{}\n</codewhale:subagent_context>",
-            build_subagent_system_prompt(agent_type, assignment)
+            subagent_system_prompt
         )));
     }
 
@@ -6725,14 +6824,20 @@ async fn run_subagent(
     token_budget: Option<u64>,
     mut input_rx: mpsc::UnboundedReceiver<SubAgentInput>,
 ) -> Result<SubAgentResult> {
-    let system_prompt = build_subagent_system_prompt(&agent_type, &assignment);
+    let system_prompt =
+        build_subagent_system_prompt_with_skills(&agent_type, &assignment, &runtime.context);
     let fork_context_enabled = fork_context;
     let fork_context = fork_context_enabled
         .then_some(runtime.fork_context.as_ref())
         .flatten();
     let request_system = subagent_request_system_prompt(&system_prompt);
-    let mut messages =
-        build_initial_subagent_messages(&prompt, &assignment, &agent_type, fork_context);
+    let mut messages = build_initial_subagent_messages_with_system(
+        &prompt,
+        &assignment,
+        &agent_type,
+        &system_prompt,
+        fork_context,
+    );
     let mut transcript_artifact =
         match SubAgentTranscriptArtifactWriter::for_runtime(runtime, &agent_id).await {
             Ok(mut writer) => {

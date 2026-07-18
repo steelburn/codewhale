@@ -11,13 +11,20 @@ use super::{McpServerConfig, McpTransport};
 use crate::child_env;
 
 pub(super) struct StdioTransport {
-    pub(super) child: Child,
+    pub(super) child: Arc<TokioMutex<Child>>,
     pub(super) stdin: ChildStdin,
     pub(super) reader: tokio::io::BufReader<ChildStdout>,
     /// Tail of stderr lines from the spawned MCP server. A background task
     /// drains the child's stderr into this buffer so a mid-run crash leaves
     /// some context behind instead of `Stdio::null` swallowing it.
     pub(super) stderr_tail: Arc<StderrTail>,
+    /// Plugin authority can change in another process while this child is
+    /// idle. The connection-level cancellation token therefore also owns a
+    /// process watcher instead of waiting for a later tool call to drop the
+    /// transport.
+    pub(super) authority_cancel_watch: Option<tokio::task::JoinHandle<()>>,
+    /// Holds reviewed executable/script handles for the process lifetime.
+    pub(super) _reviewed_launch: Option<super::ReviewedStdioLaunch>,
 }
 
 /// How long `StdioTransport::shutdown` waits for the child to exit on SIGTERM
@@ -64,16 +71,65 @@ impl StdioTransport {
         server_name: &str,
         command: &str,
         config: &McpServerConfig,
+        cancel_token: tokio_util::sync::CancellationToken,
     ) -> Result<Self> {
-        let mut cmd = tokio::process::Command::new(command);
+        let reviewed_launch = if let Some(reviewed_plugin) = config.reviewed_plugin.as_ref() {
+            // This is deliberately the last trust check before constructing
+            // and spawning the lazy stdio child. It re-reads only the
+            // Codewhale-owned plugin bundle, never user MCP/provider config or
+            // credential files, and fails closed on any content/capability
+            // drift after pool construction.
+            Some(reviewed_plugin.prepare_stdio_launch(
+                server_name,
+                command,
+                &config.args,
+                config.cwd.as_deref(),
+            )?)
+        } else {
+            None
+        };
+        let mut cmd = reviewed_launch.as_ref().map_or_else(
+            || {
+                let mut command_process = tokio::process::Command::new(command);
+                command_process.args(&config.args);
+                command_process
+            },
+            |launch| {
+                let mut command_process = tokio::process::Command::new(&launch.command);
+                command_process.args(&launch.args);
+                command_process
+            },
+        );
         crate::utils::suppress_tokio_console_window(&mut cmd);
-        cmd.args(&config.args)
-            .stdin(std::process::Stdio::piped())
+        cmd.stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
-        if let Some(cwd) = &config.cwd {
+        let launch_cwd = reviewed_launch
+            .as_ref()
+            .and_then(|launch| launch.cwd.as_ref())
+            .or(config.cwd.as_ref().filter(|_| reviewed_launch.is_none()));
+        if let Some(cwd) = launch_cwd {
             cmd.current_dir(cwd);
+        }
+        #[cfg(unix)]
+        if let Some(cwd_fd) = reviewed_launch
+            .as_ref()
+            .and_then(|launch| launch.cwd_fd.as_ref())
+        {
+            use std::os::fd::AsRawFd as _;
+            let fd = cwd_fd.as_raw_fd();
+            // SAFETY: the closure calls only async-signal-safe `fchdir` on an
+            // inherited directory descriptor before exec.
+            unsafe {
+                cmd.pre_exec(move || {
+                    if libc::fchdir(fd) == 0 {
+                        Ok(())
+                    } else {
+                        Err(std::io::Error::last_os_error())
+                    }
+                });
+            }
         }
 
         // Expand `${NAME}` placeholders so secret env values can be sourced
@@ -83,19 +139,40 @@ impl StdioTransport {
         let expanded_env = super::expanded_mcp_stdio_env(config)
             .with_context(|| format!("MCP server '{server_name}' env expansion failed"))?;
 
-        // MCP stdio servers are user-configured integrations. Use the
-        // wider MCP allowlist so common Node/Python/proxy/CA-bundle
-        // bootstrap variables (NVM_DIR, NODE_OPTIONS, NPM_CONFIG_*,
-        // HTTP(S)_PROXY, …) reach the child. See `sanitized_mcp_env`
-        // and #1244 for context.
-        child_env::apply_to_tokio_command_mcp(&mut cmd, child_env::string_map_env(&expanded_env));
+        // User-configured MCP keeps the compatibility-oriented Node/Python
+        // bootstrap allowlist (#1244). Reviewed plugins receive only the base
+        // secret-scrubbed child environment plus their explicitly reviewed
+        // mappings, so namespaces such as NPM_CONFIG_* are never inherited
+        // ambiently across the consent boundary.
+        if let Some(reviewed_plugin) = config.reviewed_plugin.as_ref() {
+            cmd.env_clear();
+            for (key, value) in child_env::sanitized_plugin_mcp_env_from(
+                reviewed_plugin.host_environment.entries().iter().cloned(),
+                child_env::string_map_env(&expanded_env),
+            ) {
+                cmd.env(key, value);
+            }
+        } else {
+            child_env::apply_to_tokio_command_mcp(
+                &mut cmd,
+                child_env::string_map_env(&expanded_env),
+            );
+        }
 
         let mut child = cmd.spawn().with_context(|| {
-            let env_keys: Vec<&str> = expanded_env.keys().map(String::as_str).collect();
-            format!(
-                "MCP stdio spawn failed (transport=stdio server={server_name} cmd={command:?} args={:?} env_keys={env_keys:?})",
-                config.args,
-            )
+            if config.reviewed_plugin.is_some() {
+                format!(
+                    "MCP stdio spawn failed (transport=stdio server={server_name} reviewed-plugin argv_count={} env_count={})",
+                    config.args.len(),
+                    expanded_env.len(),
+                )
+            } else {
+                let env_keys: Vec<&str> = expanded_env.keys().map(String::as_str).collect();
+                format!(
+                    "MCP stdio spawn failed (transport=stdio server={server_name} cmd={command:?} args={:?} env_keys={env_keys:?})",
+                    config.args,
+                )
+            }
         })?;
 
         let stdin = child.stdin.take().context("Failed to get MCP stdin")?;
@@ -109,19 +186,38 @@ impl StdioTransport {
         let stderr_tail = StderrTail::new();
         {
             let tail = Arc::clone(&stderr_tail);
+            // A reviewed plugin child receives environment-backed values that
+            // are intentionally absent from its manifest. Still drain its
+            // stderr to avoid blocking, but do not retain or surface arbitrary
+            // child output that could echo those credentials into a chat or
+            // persisted transcript.
+            let capture_lines = config.reviewed_plugin.is_none();
             tokio::spawn(async move {
                 let mut lines = tokio::io::BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    tail.push(line).await;
+                    if capture_lines {
+                        tail.push(line).await;
+                    }
                 }
             });
         }
+
+        let child = Arc::new(TokioMutex::new(child));
+        let authority_cancel_watch = config.reviewed_plugin.as_ref().map(|_| {
+            let watched_child = Arc::clone(&child);
+            tokio::spawn(async move {
+                cancel_token.cancelled().await;
+                terminate_child_for_authority_change(&watched_child).await;
+            })
+        });
 
         Ok(Self {
             child,
             stdin,
             reader: tokio::io::BufReader::new(stdout),
             stderr_tail,
+            authority_cancel_watch,
+            _reviewed_launch: reviewed_launch,
         })
     }
 }
@@ -163,6 +259,37 @@ fn send_sigterm(child: &Child) -> bool {
     {
         let _ = child;
         false
+    }
+}
+
+async fn terminate_child_for_authority_change(child: &Arc<TokioMutex<Child>>) {
+    let mut child = child.lock().await;
+    terminate_child(&mut child).await;
+}
+
+async fn terminate_child(child: &mut Child) {
+    // Reap an already-exited child before resolving its PID. Until it is
+    // reaped, the OS cannot recycle that identity; after it is reaped there is
+    // nothing left to signal. This avoids a PID-only watcher ever targeting an
+    // unrelated process after rapid PID reuse.
+    if child.try_wait().is_ok_and(|status| status.is_some()) {
+        return;
+    }
+
+    #[cfg(unix)]
+    send_sigterm(child);
+
+    #[cfg(not(unix))]
+    let _ = child.start_kill();
+
+    match tokio::time::timeout(STDIO_SHUTDOWN_GRACE, child.wait()).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(_)) | Err(_) => {
+            // SIGTERM is advisory. Revocation and explicit shutdown must not
+            // leave the reviewed child alive indefinitely.
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+        }
     }
 }
 
@@ -212,13 +339,11 @@ impl McpTransport for StdioTransport {
         }
     }
 
-    /// Send SIGTERM and wait up to `STDIO_SHUTDOWN_GRACE` for graceful exit
-    /// before letting Drop / `kill_on_drop` fire SIGKILL as the backstop.
+    /// Send SIGTERM and wait up to `STDIO_SHUTDOWN_GRACE` for graceful exit,
+    /// then force termination and reap the child as the backstop.
     async fn shutdown(&mut self) {
-        send_sigterm(&self.child);
-        // Give the child a window to exit cleanly. Discard the result —
-        // either it exits (success) or the timeout fires (Drop will SIGKILL).
-        let _ = tokio::time::timeout(STDIO_SHUTDOWN_GRACE, self.child.wait()).await;
+        let mut child = self.child.lock().await;
+        terminate_child(&mut child).await;
     }
 }
 
@@ -228,7 +353,14 @@ impl McpTransport for StdioTransport {
 /// SIGTERM first; misbehaving ones get SIGKILL'd anyway.
 impl Drop for StdioTransport {
     fn drop(&mut self) {
-        send_sigterm(&self.child);
+        if let Some(watch) = self.authority_cancel_watch.take() {
+            watch.abort();
+        }
+        if let Ok(mut child) = self.child.try_lock()
+            && !child.try_wait().is_ok_and(|status| status.is_some())
+        {
+            send_sigterm(&child);
+        }
     }
 }
 

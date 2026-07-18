@@ -1796,9 +1796,10 @@ configure reasoning effort.
   intentionally not auto-loaded; wire individual scripts into the agent via
   MCP, hooks, or skills.
 - `--plugins` — scaffold `~/.codewhale/plugins/` with a `README.md` and an
-  `example/PLUGIN.md` sample using the same frontmatter shape as
-  `SKILL.md`. Plugins are not loaded automatically either; reference them
-  from a skill, hook, or MCP wrapper when you want them active.
+  `example/plugin.toml` plus a namespaced example Skill. Bundles are discovered
+  read-only, untrusted, and disabled; review them through `/plugin` before
+  enabling. v0.9.1 activates only declared Skills and MCP servers. See
+  [PLUGIN_BUNDLES.md](PLUGIN_BUNDLES.md).
 - `--all` now scaffolds MCP + skills + tools + plugins together.
 - `--clean` — list `~/.codewhale/sessions/checkpoints/latest.json` and
   `offline_queue.json` if they exist. Legacy

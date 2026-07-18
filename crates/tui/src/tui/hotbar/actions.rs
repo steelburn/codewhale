@@ -527,6 +527,16 @@ impl HotbarActionRegistry {
         self.register_source(&SkillHotbarActionSource { skills });
     }
 
+    /// Atomically replace the Skill-derived action source while retaining
+    /// built-ins, configured routes, slash commands, and live MCP actions.
+    /// Plugin lifecycle changes call this from the same cache refresh that
+    /// updates command dispatch, preventing stale revoked bindings.
+    pub(crate) fn replace_skills(&mut self, skills: &[(String, String)]) {
+        self.actions
+            .retain(|_, action| action.category() != HotbarActionCategory::Skill.as_str());
+        self.register_skills(skills);
+    }
+
     /// Replace the MCP-tool hotbar actions with the tools in `snapshot`.
     ///
     /// Called when a live MCP discovery snapshot lands (or is refreshed) so
@@ -2187,6 +2197,36 @@ mod tests {
         assert_eq!(metadata.safety, HotbarSafetyClass::ExistingCommand);
         assert_eq!(metadata.recommendation, HotbarRecommendation::Eligible);
         assert!(registry.metadata_validation_errors(Locale::En).is_empty());
+    }
+
+    #[test]
+    fn replacing_skills_removes_stale_plugin_actions_atomically() {
+        let mut registry = HotbarActionRegistry::with_builtins();
+        registry.register_skills(&[
+            ("native".to_string(), "native Skill".to_string()),
+            (
+                "demo:review".to_string(),
+                "reviewed plugin Skill".to_string(),
+            ),
+        ]);
+        assert!(registry.get("skill.demo:review").is_some());
+        let builtin_count = registry
+            .iter()
+            .filter(|action| action.category() != HotbarActionCategory::Skill.as_str())
+            .count();
+
+        registry.replace_skills(&[("native".to_string(), "refreshed".to_string())]);
+
+        assert!(registry.get("skill.demo:review").is_none());
+        assert!(registry.get("skill.native").is_some());
+        assert_eq!(
+            registry
+                .iter()
+                .filter(|action| action.category() != HotbarActionCategory::Skill.as_str())
+                .count(),
+            builtin_count,
+            "refresh must preserve every non-Skill action source"
+        );
     }
 
     #[test]

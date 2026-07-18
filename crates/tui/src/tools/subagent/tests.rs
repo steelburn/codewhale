@@ -4860,6 +4860,118 @@ fn build_subagent_system_prompt_skips_role_when_blank() {
 }
 
 #[test]
+fn fresh_forked_and_nested_subagents_share_authority_bound_skill_catalogs() {
+    let _env = crate::test_support::lock_test_env();
+    let tmp = tempdir().expect("tempdir");
+    let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", tmp.path().join("home"));
+    let workspace = tmp.path().join("workspace");
+    let native_skill = workspace.join(".agents/skills/native-review");
+    let plugin_root = workspace.join(".codewhale/plugins/demo");
+    std::fs::create_dir_all(&native_skill).expect("native Skill dir");
+    std::fs::create_dir_all(plugin_root.join("skills/review")).expect("plugin Skill dir");
+    std::fs::write(
+        native_skill.join("SKILL.md"),
+        "---\nname: native-review\ndescription: native workspace review\n---\nbody\n",
+    )
+    .expect("native Skill");
+    std::fs::write(
+        plugin_root.join("plugin.toml"),
+        "schema_version = 1\n[plugin]\nname = \"demo\"\nversion = \"1.0.0\"\n[skills]\npath = \"skills\"\n",
+    )
+    .expect("plugin manifest");
+    std::fs::write(
+        plugin_root.join("skills/review/SKILL.md"),
+        "---\nname: review\ndescription: reviewed plugin review\n---\nbody\n",
+    )
+    .expect("plugin Skill");
+    let config = crate::plugins::discovery::DiscoveryConfig {
+        workspace: workspace.clone(),
+        user_plugins_dir: tmp.path().join("user-plugins"),
+        workspace_plugins_dir: workspace.join(".codewhale/plugins"),
+        builtin_plugin_dirs: Vec::new(),
+        state_path: tmp.path().join("plugin-state/state.json"),
+    };
+    let mut plugins = crate::plugins::discovery::discover_with_config(&config);
+    plugins.trust("demo").expect("trust plugin");
+    plugins.enable("demo").expect("enable plugin");
+    let context = ToolContext::new(&workspace).with_plugin_registry(Arc::new(plugins));
+    let assignment = SubAgentAssignment::new("review".to_string(), None);
+    let system =
+        build_subagent_system_prompt_with_skills(&SubAgentType::Review, &assignment, &context);
+
+    assert!(system.contains("`native-review`"), "{system}");
+    assert!(system.contains("`demo:review`"), "{system}");
+    assert!(system.contains("reviewed plugin demo id="), "{system}");
+    assert!(system.contains("generation="), "{system}");
+    assert!(
+        !system.contains(&plugin_root.display().to_string()),
+        "{system}"
+    );
+    assert_eq!(
+        subagent_request_system_prompt(&system),
+        SystemPrompt::Text(system.clone()),
+        "fresh children receive the catalog at system precedence"
+    );
+
+    let fork_context = SubAgentForkContext {
+        messages: vec![Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text {
+                text: "parent".to_string(),
+                cache_control: None,
+            }],
+        }],
+        structured_state_block: None,
+    };
+    let forked = build_initial_subagent_messages_with_system(
+        "review",
+        &assignment,
+        &SubAgentType::Review,
+        &system,
+        Some(&fork_context),
+    );
+    assert!(
+        forked
+            .iter()
+            .filter(|message| message.role == "system")
+            .any(|message| message_text(message).contains("`demo:review`")),
+        "forked children must receive the same resolved catalog"
+    );
+
+    let mut direct_child = runtime_with_depth(1, None);
+    direct_child.context = context.clone();
+    let (nested_runtime, _nested_rx) = runtime_for_nested_agent_tools(
+        &direct_child,
+        "agent_parent",
+        SubAgentForkContext {
+            messages: Vec::new(),
+            structured_state_block: None,
+        },
+    );
+    let nested_system = build_subagent_system_prompt_with_skills(
+        &SubAgentType::Review,
+        &assignment,
+        &nested_runtime.context,
+    );
+    assert!(nested_system.contains("`demo:review`"), "{nested_system}");
+
+    let isolated_workspace = tmp.path().join("isolated-worktree");
+    std::fs::create_dir_all(&isolated_workspace).expect("isolated worktree");
+    let isolated_plugins = context
+        .plugin_registry
+        .as_ref()
+        .expect("plugin registry")
+        .rediscover_for_workspace(&isolated_workspace);
+    let isolated = ToolContext::new(&isolated_workspace).with_plugin_registry(isolated_plugins);
+    let isolated_system =
+        build_subagent_system_prompt_with_skills(&SubAgentType::Review, &assignment, &isolated);
+    assert!(
+        !isolated_system.contains("`demo:review`"),
+        "workspace plugin authority must not leak into another worktree: {isolated_system}"
+    );
+}
+
+#[test]
 fn subagent_done_sentinel_format_is_well_formed() {
     let res = make_snapshot(SubAgentStatus::Completed);
     let sentinel = subagent_done_sentinel("agent_xyz", &res, false);

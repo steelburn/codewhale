@@ -92,6 +92,7 @@ use self::workspace::{collect_workspace_git_metadata, workspace_status};
 pub struct RuntimeApiState {
     config: Arc<parking_lot::RwLock<Config>>,
     workspace: PathBuf,
+    plugin_discovery: Arc<crate::plugins::PluginDiscoveryContext>,
     task_manager: SharedTaskManager,
     runtime_threads: SharedRuntimeThreadManager,
     cors_origins: Vec<String>,
@@ -278,7 +279,13 @@ struct ThreadSummary {
 struct SkillEntry {
     name: String,
     description: String,
-    path: PathBuf,
+    /// Native Skill locator. Reviewed plugin paths are deliberately omitted;
+    /// their bodies are available only through the authority-bound snapshot.
+    path: Option<PathBuf>,
+    source: String,
+    plugin_id: Option<String>,
+    plugin_generation: Option<u64>,
+    plugin_content_hash: Option<String>,
     enabled: bool,
     is_bundled: bool,
 }
@@ -440,6 +447,7 @@ struct StartTurnResponse {
 pub async fn run_http_server(
     config: Config,
     workspace: PathBuf,
+    plugin_discovery: Arc<crate::plugins::PluginDiscoveryContext>,
     options: RuntimeApiOptions,
 ) -> Result<()> {
     if options.port == 0 {
@@ -458,10 +466,11 @@ pub async fn run_http_server(
         config.default_text_model.clone(),
         Some(options.workers),
     );
-    let runtime_threads = Arc::new(RuntimeThreadManager::open(
+    let runtime_threads = Arc::new(RuntimeThreadManager::open_with_plugin_registry(
         config.clone(),
         workspace.clone(),
         RuntimeThreadManagerConfig::from_task_data_dir(task_cfg.data_dir.clone()),
+        plugin_discovery.registry_for_workspace(&workspace),
     )?);
     let task_manager =
         TaskManager::start_with_runtime_manager(task_cfg, config.clone(), runtime_threads.clone())
@@ -500,17 +509,13 @@ pub async fn run_http_server(
     } else {
         (None, None)
     };
-    let skill_state = SkillStateStore::load_default().unwrap_or_else(|err| {
-        tracing::warn!(
-            "Failed to load skills_state.toml ({}); treating all skills as enabled",
-            err
-        );
-        SkillStateStore::default()
-    });
+    let skill_state = SkillStateStore::load_default()
+        .context("load persistent Skill activation state for Runtime API")?;
     let sub_agent_manager = runtime_api_sub_agent_manager(&workspace, options.workers);
     let state = RuntimeApiState {
         config: Arc::new(parking_lot::RwLock::new(config.clone())),
         workspace,
+        plugin_discovery,
         task_manager,
         runtime_threads,
         cors_origins: options.cors_origins.clone(),
@@ -1392,18 +1397,55 @@ async fn list_skills(
         );
         (skills_dir, mode)
     };
-    let (registry, directories) =
-        discover_skills_for_runtime_api(&state.workspace, &skills_dir, mode);
-    let skill_state = state.skill_state.lock().await;
+    let plugin_registry = state
+        .plugin_discovery
+        .registry_for_workspace(&state.workspace);
+    let (registry, directories) = discover_skills_for_runtime_api(
+        &state.workspace,
+        &skills_dir,
+        mode,
+        Some(plugin_registry.as_ref()),
+    );
+    let mut skill_state = state.skill_state.lock().await;
+    skill_state
+        .refresh()
+        .map_err(|error| ApiError::internal(format!("refresh skill state: {error}")))?;
     let skills = registry
         .list()
         .iter()
-        .map(|skill| SkillEntry {
-            name: skill.name.clone(),
-            description: skill.description.clone(),
-            path: skill.path.clone(),
-            enabled: skill_state.is_enabled(&skill.name),
-            is_bundled: skill_entry_is_bundled(skill, &skills_dir),
+        .map(|skill| {
+            let (path, source, plugin_id, plugin_generation, plugin_content_hash) =
+                match &skill.source {
+                    crate::skills::SkillSource::Native => (
+                        Some(skill.path.clone()),
+                        "native".to_string(),
+                        None,
+                        None,
+                        None,
+                    ),
+                    crate::skills::SkillSource::Plugin {
+                        plugin_id,
+                        plugin_name,
+                        authority,
+                    } => (
+                        None,
+                        format!("reviewed-plugin-snapshot:{plugin_name}"),
+                        Some(plugin_id.clone()),
+                        Some(authority.state_generation),
+                        Some(authority.content_hash.clone()),
+                    ),
+                };
+            SkillEntry {
+                name: skill.name.clone(),
+                description: skill.description.clone(),
+                path,
+                source,
+                plugin_id,
+                plugin_generation,
+                plugin_content_hash,
+                enabled: skill_state.is_enabled(&skill.name),
+                is_bundled: skill_entry_is_bundled(skill, &skills_dir),
+            }
         })
         .collect();
     Ok(Json(SkillsResponse {
@@ -1427,8 +1469,15 @@ async fn set_skill_enabled(
         );
         (skills_dir, mode)
     };
-    let (registry, directories) =
-        discover_skills_for_runtime_api(&state.workspace, &skills_dir, mode);
+    let plugin_registry = state
+        .plugin_discovery
+        .registry_for_workspace(&state.workspace);
+    let (registry, directories) = discover_skills_for_runtime_api(
+        &state.workspace,
+        &skills_dir,
+        mode,
+        Some(plugin_registry.as_ref()),
+    );
     let exists = registry.list().iter().any(|skill| skill.name == name);
     if !exists {
         return Err(ApiError::not_found(format!(
@@ -1534,8 +1583,15 @@ async fn list_mcp_servers(
     State(state): State<RuntimeApiState>,
 ) -> Result<Json<McpServersResponse>, ApiError> {
     let mcp_config_path = state.config.read().mcp_config_path();
-    let config = crate::mcp::load_config_with_workspace(&mcp_config_path, &state.workspace)
-        .map_err(|e| ApiError::internal(format!("Failed to load MCP config: {e}")))?;
+    let plugin_registry = state
+        .plugin_discovery
+        .registry_for_workspace(&state.workspace);
+    let config = crate::mcp::load_config_with_workspace_and_plugins(
+        &mcp_config_path,
+        &state.workspace,
+        plugin_registry.as_ref(),
+    )
+    .map_err(|e| ApiError::internal(format!("Failed to load MCP config: {e}")))?;
 
     let mut servers = Vec::new();
     for (name, server_cfg) in config.servers {
@@ -1568,11 +1624,15 @@ async fn list_mcp_tools(
             Some(pool) => Some(Arc::clone(pool)),
             None if query.connect => {
                 let mcp_config_path = state.config.read().mcp_config_path();
-                let new_pool =
-                    McpPool::from_config_path_with_workspace(&mcp_config_path, &state.workspace)
-                        .map_err(|e| {
-                            ApiError::internal(format!("Failed to load MCP config: {e}"))
-                        })?;
+                let plugin_registry = state
+                    .plugin_discovery
+                    .registry_for_workspace(&state.workspace);
+                let new_pool = McpPool::from_config_path_with_workspace_and_plugins(
+                    &mcp_config_path,
+                    &state.workspace,
+                    plugin_registry,
+                )
+                .map_err(|e| ApiError::internal(format!("Failed to load MCP config: {e}")))?;
                 let handle = Arc::new(Mutex::new(new_pool));
                 pool_slot.replace(Arc::clone(&handle));
                 Some(handle)
@@ -2818,9 +2878,11 @@ fn discover_skills_for_runtime_api(
     workspace: &FsPath,
     skills_dir: &FsPath,
     mode: crate::skills::SkillDiscoveryMode,
+    plugins: Option<&crate::plugins::PluginRegistry>,
 ) -> (crate::skills::SkillRegistry, Vec<PathBuf>) {
     let directories = skills_search_directories(workspace, skills_dir, mode);
-    let registry = crate::skills::discover_from_directories(directories.clone());
+    let registry =
+        crate::skills::discover_from_directories_with_plugins(directories.clone(), plugins);
     (registry, directories)
 }
 

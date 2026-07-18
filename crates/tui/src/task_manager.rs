@@ -728,11 +728,16 @@ struct QueueFile {
 
 impl TaskManager {
     /// Start the manager with the default DeepSeek executor.
-    pub async fn start(cfg: TaskManagerConfig, api_config: Config) -> Result<SharedTaskManager> {
-        let runtime_threads = Arc::new(RuntimeThreadManager::open(
+    pub async fn start(
+        cfg: TaskManagerConfig,
+        api_config: Config,
+        plugin_registry: Arc<crate::plugins::PluginRegistry>,
+    ) -> Result<SharedTaskManager> {
+        let runtime_threads = Arc::new(RuntimeThreadManager::open_with_plugin_registry(
             api_config.clone(),
             cfg.default_workspace.clone(),
             RuntimeThreadManagerConfig::from_task_data_dir(cfg.data_dir.clone()),
+            plugin_registry,
         )?);
         Self::start_with_runtime_manager(cfg, api_config, runtime_threads).await
     }

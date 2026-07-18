@@ -191,7 +191,11 @@ fn mcp_inventory(app: &App, project_mcp_path: &Path) -> McpInventoryRow {
         return mcp_snapshot_inventory(snapshot, &app.mcp_config_path, project_mcp_path);
     }
 
-    match crate::mcp::load_config_with_workspace(&app.mcp_config_path, &app.workspace) {
+    match crate::mcp::load_config_with_workspace_and_plugins(
+        &app.mcp_config_path,
+        &app.workspace,
+        app.plugin_registry.as_ref(),
+    ) {
         Ok(cfg) => mcp_config_inventory(&app.mcp_config_path, project_mcp_path, &cfg),
         Err(_) => McpInventoryRow {
             status: InventoryStatus::NeedsConfig,
@@ -487,18 +491,12 @@ fn plugins_inventory(app: &App, config: &Config, codewhale_home: &Path) -> Inven
     let plugins_dir = plugins_dir_for(app, config, codewhale_home);
     let path = display_path(&plugins_dir);
 
-    // Manifest-based plugins (plugin.toml) — prefer live registry when init'd.
-    let (manifest_total, manifest_enabled) = if let Some(counts) =
-        crate::plugins::try_with_registry(|registry| {
-            let list = registry.list();
-            let total = list.len();
-            let enabled = list.iter().filter(|(_, p)| p.enabled).count();
-            (total, enabled)
-        }) {
-        counts
-    } else {
-        count_manifest_plugins(&plugins_dir)
-    };
+    // Manifest-based plugins (plugin.toml) are owned by this App's immutable,
+    // workspace-scoped registry snapshot. Never consult process-global state:
+    // concurrent sessions may be rooted in different workspaces.
+    let list = app.plugin_registry.list();
+    let manifest_total = list.len();
+    let manifest_active = list.iter().filter(|plugin| plugin.active()).count();
 
     // Script plugins under [tools].plugin_dir (distinct from slash commands;
     // Hotbar Plugin source remains deferred/exploratory).
@@ -539,11 +537,11 @@ fn plugins_inventory(app: &App, config: &Config, codewhale_home: &Path) -> Inven
         };
     }
 
-    let disabled = manifest_total.saturating_sub(manifest_enabled);
+    let inactive = manifest_total.saturating_sub(manifest_active);
     InventoryRow {
         status: InventoryStatus::Healthy,
         detail: format!(
-            "{manifest_total} manifest plugins ({manifest_enabled} enabled, {disabled} off), {script_count} script tools; path {path}; /plugin inspects metadata only — never auto-run"
+            "{manifest_total} manifest plugin bundles ({manifest_active} trusted+active, {inactive} inactive), {script_count} legacy script tools; path {path}; setup is read-only — use /plugin to review trust and enablement"
         ),
     }
 }
@@ -603,22 +601,6 @@ fn count_skill_dirs(dir: &Path) -> usize {
                 .count()
         })
         .unwrap_or(0)
-}
-
-fn count_manifest_plugins(dir: &Path) -> (usize, usize) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return (0, 0);
-    };
-    let mut total = 0usize;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() && path.join("plugin.toml").is_file() {
-            total += 1;
-        }
-    }
-    // Without overrides store, treat discovered manifests as enabled by default
-    // (matches discovery: enabled = !builtin for user plugins).
-    (total, total)
 }
 
 #[cfg(test)]
@@ -772,11 +754,23 @@ mod tests {
         std::fs::create_dir_all(plugins_dir.join("demo")).expect("plugin");
         std::fs::write(
             plugins_dir.join("demo").join("plugin.toml"),
-            "[plugin]\nname = \"demo\"\ndescription = \"hides sk-plugin-secret\"\n",
+            "schema_version = 1\n[plugin]\nname = \"demo\"\nversion = \"1.0.0\"\ndescription = \"hides sk-plugin-secret\"\n",
         )
         .expect("manifest");
 
         let mut app = test_app(tmp.path(), None, mcp_path, skills_dir);
+        let discovery_config = crate::plugins::discovery::DiscoveryConfig {
+            workspace: tmp.path().to_path_buf(),
+            user_plugins_dir: plugins_dir,
+            workspace_plugins_dir: tmp.path().join("workspace-plugins-unused"),
+            builtin_plugin_dirs: Vec::new(),
+            state_path: home.join("plugins/state.json"),
+        };
+        let discovery = crate::plugins::PluginDiscoveryContext::from_config_and_environment(
+            &discovery_config,
+            crate::plugins::HostEnvironment::default(),
+        );
+        app.plugin_registry = discovery.registry_for_workspace(tmp.path());
         // Simulate the same skill registration Hotbar uses at startup.
         app.cached_skills = vec![("alpha".into(), "alpha skill".into())];
         app.hotbar_actions = HotbarActionRegistry::with_builtins();

@@ -1477,6 +1477,7 @@ struct RecoveredTurnReceipt {
 pub struct RuntimeThreadManager {
     config: Arc<parking_lot::RwLock<Config>>,
     workspace: PathBuf,
+    plugin_registry: Option<Arc<crate::plugins::PluginRegistry>>,
     store: RuntimeThreadStore,
     engine_load: Arc<Mutex<()>>,
     active: Arc<Mutex<ActiveThreads>>,
@@ -1778,16 +1779,36 @@ impl RuntimeThreadManager {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn open(
         config: Config,
         workspace: PathBuf,
         manager_cfg: RuntimeThreadManagerConfig,
+    ) -> Result<Self> {
+        Self::open_inner(config, workspace, manager_cfg, None)
+    }
+
+    pub fn open_with_plugin_registry(
+        config: Config,
+        workspace: PathBuf,
+        manager_cfg: RuntimeThreadManagerConfig,
+        plugin_registry: Arc<crate::plugins::PluginRegistry>,
+    ) -> Result<Self> {
+        Self::open_inner(config, workspace, manager_cfg, Some(plugin_registry))
+    }
+
+    fn open_inner(
+        config: Config,
+        workspace: PathBuf,
+        manager_cfg: RuntimeThreadManagerConfig,
+        plugin_registry: Option<Arc<crate::plugins::PluginRegistry>>,
     ) -> Result<Self> {
         let store = RuntimeThreadStore::open(manager_cfg.data_dir.clone())?;
         let (event_tx, _event_rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let manager = Self {
             config: Arc::new(parking_lot::RwLock::new(config)),
             workspace,
+            plugin_registry,
             store,
             engine_load: Arc::new(Mutex::new(())),
             active: Arc::new(Mutex::new(ActiveThreads::default())),
@@ -4917,6 +4938,10 @@ impl RuntimeThreadManager {
                 model: route_model.clone(),
                 active_route_limits: route_limits,
                 workspace: thread.workspace.clone(),
+                plugin_registry: self
+                    .plugin_registry
+                    .as_ref()
+                    .map(|registry| registry.rediscover_for_workspace(&thread.workspace)),
                 allow_shell: thread.allow_shell,
                 trust_mode: thread.trust_mode,
                 notes_path: cfg.notes_path(),

@@ -515,6 +515,11 @@ specified and tested.
 - `GET /v1/apps/mcp/servers`
 - `GET /v1/apps/mcp/tools?server=<optional>`
 
+Skill activation toggles are persisted under a cross-process transaction lock.
+Each mutation reloads and merges the latest exact-name state before an atomic
+write, and `GET /v1/skills` refreshes that shared state so another Codewhale
+process's successful toggle is visible without restarting the Runtime API.
+
 **Usage** (token/cost aggregation across threads)
 - `GET /v1/usage?since=<rfc3339>&until=<rfc3339>&group_by=<day|model|provider|thread>`
 

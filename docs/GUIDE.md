@@ -286,6 +286,7 @@ Common commands for first-time users:
 | `/review` | Ask for a structured review workflow |
 | `/memory` | Inspect or manage memory when enabled |
 | `/mcp` | Configure or inspect MCP server integration |
+| `/plugin` | Review and manage disabled-by-default local plugin bundles |
 
 Toolbox commands stay searchable when you type them directly: `/models`
 fetches live endpoint IDs, `/modeldb` opens the bundled model reference, and
@@ -327,6 +328,8 @@ source of truth while you are inside a session.
 
 Next: [CONFIGURATION.md](CONFIGURATION.md) covers runtime settings and
 [MCP.md](MCP.md) covers Model Context Protocol integration.
+[PLUGIN_BUNDLES.md](PLUGIN_BUNDLES.md) covers the disabled-by-default bundle
+inventory, capability review, and namespaced Skill/MCP activation boundary.
 
 ## 7. Working with Tools
 

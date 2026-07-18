@@ -123,6 +123,65 @@ where
     env
 }
 
+/// Build the environment for a reviewed plugin-contributed MCP child.
+///
+/// Unlike user-authored MCP configuration, a plugin must name every extra
+/// environment source during trust review. Start from the ordinary
+/// secret-scrubbed child environment, remove ambient proxy variables whose
+/// URLs may themselves contain credentials, then apply only reviewed
+/// overrides. `NO_PROXY` remains safe routing metadata.
+#[cfg(test)]
+pub fn sanitized_plugin_mcp_env<I, K, V>(overrides: I) -> Vec<(OsString, OsString)>
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: AsRef<OsStr>,
+    V: AsRef<OsStr>,
+{
+    sanitized_plugin_mcp_env_from(std::env::vars_os(), overrides)
+}
+
+/// Build a reviewed plugin child environment from an immutable host snapshot.
+///
+/// This is separate from [`sanitized_plugin_mcp_env`] so a repository-local
+/// dotenv file loaded after startup cannot add or replace inherited values.
+pub fn sanitized_plugin_mcp_env_from<B, BK, BV, I, K, V>(
+    base_environment: B,
+    overrides: I,
+) -> Vec<(OsString, OsString)>
+where
+    B: IntoIterator<Item = (BK, BV)>,
+    BK: AsRef<OsStr>,
+    BV: AsRef<OsStr>,
+    I: IntoIterator<Item = (K, V)>,
+    K: AsRef<OsStr>,
+    V: AsRef<OsStr>,
+{
+    let mut env = Vec::new();
+    for (key, value) in base_environment {
+        if is_allowed_parent_env_key(key.as_ref()) {
+            upsert_env(
+                &mut env,
+                key.as_ref().to_os_string(),
+                value.as_ref().to_os_string(),
+            );
+        }
+    }
+    env.retain(|(key, _)| {
+        !matches!(
+            normalize_key(key).as_str(),
+            "HTTP_PROXY" | "HTTPS_PROXY" | "ALL_PROXY" | "FTP_PROXY"
+        )
+    });
+    for (key, value) in overrides {
+        upsert_env(
+            &mut env,
+            key.as_ref().to_os_string(),
+            value.as_ref().to_os_string(),
+        );
+    }
+    env
+}
+
 pub fn apply_to_tokio_command_mcp<I, K, V>(cmd: &mut tokio::process::Command, overrides: I)
 where
     I: IntoIterator<Item = (K, V)>,
@@ -946,6 +1005,37 @@ mod tests {
             env.iter().all(|(key, _)| key != "DEEPSEEK_MCP_TEST_SECRET"),
             "MCP env should not pass arbitrary parent vars"
         );
+    }
+
+    #[test]
+    fn reviewed_plugin_mcp_env_requires_explicit_proxy_provenance() {
+        let _guard = env_lock().lock().expect("env lock");
+        let previous = std::env::var_os("HTTP_PROXY");
+        unsafe {
+            let synthetic_proxy = format!(
+                "{}://{}:{}@{}",
+                "http", "fixture-user", "fixture-password", "127.0.0.1:9"
+            );
+            std::env::set_var("HTTP_PROXY", synthetic_proxy);
+        }
+
+        let ambient = sanitized_plugin_mcp_env(std::iter::empty::<(OsString, OsString)>());
+        let explicit = sanitized_plugin_mcp_env([("HTTP_PROXY", "http://proxy.invalid")]);
+
+        match previous {
+            Some(value) => unsafe { std::env::set_var("HTTP_PROXY", value) },
+            None => unsafe { std::env::remove_var("HTTP_PROXY") },
+        }
+
+        assert!(
+            ambient
+                .iter()
+                .all(|(key, _)| normalize_key(key) != "HTTP_PROXY"),
+            "reviewed plugins must not inherit a credential-capable proxy URL"
+        );
+        assert!(explicit.iter().any(|(key, value)| {
+            normalize_key(key) == "HTTP_PROXY" && value == "http://proxy.invalid"
+        }));
     }
 
     #[test]

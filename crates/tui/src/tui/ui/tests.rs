@@ -4131,13 +4131,64 @@ fn file_mentions_add_local_text_context_to_model_payload() {
     app.workspace = tmpdir.path().to_path_buf();
     let message = QueuedMessage::new("Summarize @guide.md".to_string(), None);
 
-    let content = queued_message_content_for_app(&app, &message, None);
+    let content = queued_message_content_for_app(&app, &message, None)
+        .expect("native queued message should remain dispatchable");
 
     assert!(content.starts_with("Summarize @guide.md"));
     assert!(content.contains("Local context from @mentions:"));
     assert!(content.contains("<file mention=\"@guide.md\""));
     assert!(content.contains("# Guide\nUse the fast path."));
     assert_eq!(message.display, "Summarize @guide.md");
+}
+
+#[test]
+fn persisted_queued_plugin_skill_is_denied_after_cross_process_revocation() {
+    let tmpdir = TempDir::new().expect("tempdir");
+    let workspace = tmpdir.path().join("workspace");
+    let plugins_root = tmpdir.path().join("plugins");
+    let plugin = plugins_root.join("queued-skill");
+    std::fs::create_dir_all(plugin.join("skills/queued")).unwrap();
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::write(
+        plugin.join("plugin.toml"),
+        "schema_version = 1\n[plugin]\nname = \"queued-skill\"\nversion = \"1.0.0\"\n[skills]\npath = \"skills\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        plugin.join("skills/queued/SKILL.md"),
+        "---\nname: queued\ndescription: Queue provenance test\n---\nDo the queued work.\n",
+    )
+    .unwrap();
+    let discovery = crate::plugins::discovery::DiscoveryConfig {
+        workspace: workspace.clone(),
+        user_plugins_dir: plugins_root,
+        workspace_plugins_dir: tmpdir.path().join("workspace-plugins-unused"),
+        builtin_plugin_dirs: Vec::new(),
+        state_path: tmpdir.path().join("plugin-state/state.json"),
+    };
+    let mut registry = crate::plugins::discovery::discover_with_config(&discovery);
+    registry.trust("queued-skill").unwrap();
+    registry.enable("queued-skill").unwrap();
+    let authority = registry.authority_for("queued-skill").unwrap();
+
+    let queued = QueuedMessage::new(
+        "finish it".to_string(),
+        Some("Do the queued work.".to_string()),
+    )
+    .with_skill_provenance(Some(authority));
+    let serialized = serde_json::to_string(&queued_ui_to_session(&queued)).unwrap();
+    let persisted: QueuedSessionMessage = serde_json::from_str(&serialized).unwrap();
+    let restored = queued_session_to_ui(persisted);
+    let mut app = create_test_app();
+    app.workspace = workspace;
+    assert!(queued_message_content_for_app(&app, &restored, None).is_ok());
+
+    let mut external = crate::plugins::discovery::discover_with_config(&discovery);
+    external.revoke_trust("queued-skill").unwrap();
+    let error = queued_message_content_for_app(&app, &restored, None)
+        .expect_err("persisted queued Skill must be denied after external revocation")
+        .to_string();
+    assert!(error.contains("disabled, revoked, or no longer matches"));
 }
 
 #[test]

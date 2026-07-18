@@ -178,9 +178,13 @@ in several community provider and bridge contributions with release credit.
 - **[noaft](https://github.com/noaft)** — OpenModel provider support across
   config, CLI, TUI provider picker, docs, and registry checks (#3585,
   harvested)
-- **[pkeging](https://github.com/pkeging)** — WeCom Bridge deployment and
-  security documentation, including the approval-timeout configuration surface
-  (#3640, harvested)
+- **[pkeging](https://github.com/pkeging)** — original plugin manifest,
+  discovery, CLI, and MCP foundation (#3708, #3709, #3710, merged), plus WeCom
+  Bridge deployment and security documentation, including the approval-timeout
+  configuration surface (#3640, harvested)
+- **[codepgq](https://github.com/codepgq)** — cross-client plugin-workflow
+  migration request that shaped the explicit compatibility and trust boundary
+  (#1172)
 - **[Wenshan Deng / findshan](https://github.com/findshan)** — original offline
   token/cache/cost scorecard and regression gate (#3388), extended with
   provider-aware provenance in #4335

@@ -621,6 +621,7 @@ struct TestServerOverrides {
     config_profile: Option<String>,
     web: Option<web::RuntimeWebState>,
     compat_stream_test_hook: Option<mpsc::UnboundedSender<CompatStreamTestPoint>>,
+    plugin_discovery: Option<Arc<crate::plugins::PluginDiscoveryContext>>,
 }
 
 async fn spawn_test_server_with_root_token_mobile_workspace_and_subagents(
@@ -716,6 +717,9 @@ async fn spawn_test_server_with_root_token_mobile_workspace_and_overrides(
     let state = RuntimeApiState {
         config: Arc::new(parking_lot::RwLock::new(config)),
         workspace,
+        plugin_discovery: overrides
+            .plugin_discovery
+            .unwrap_or_else(crate::plugins::PluginDiscoveryContext::capture_pre_dotenv),
         task_manager: manager,
         runtime_threads: runtime_threads.clone(),
         cors_origins: Vec::new(),
@@ -727,7 +731,7 @@ async fn spawn_test_server_with_root_token_mobile_workspace_and_overrides(
         sub_agent_manager,
         runtime_token,
         skill_state: Arc::new(Mutex::new(
-            SkillStateStore::load_from(root.join("skills_state.toml")).unwrap_or_default(),
+            SkillStateStore::load_from(root.join("skills_state.toml")).unwrap(),
         )),
         auth_required,
         bind_host: "127.0.0.1".to_string(),
@@ -4998,6 +5002,104 @@ async fn skills_endpoint_includes_enabled_field() -> Result<()> {
 }
 
 #[tokio::test]
+async fn skills_endpoint_exposes_safe_plugin_provenance_and_shared_toggle() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let root = tmp.path().join("runtime");
+    let workspace = tmp.path().join("workspace");
+    let plugin_root = tmp.path().join("plugins/demo");
+    fs::create_dir_all(plugin_root.join("skills/review"))?;
+    fs::write(
+        plugin_root.join("plugin.toml"),
+        "schema_version = 1\n[plugin]\nname = \"demo\"\nversion = \"1.0.0\"\n[skills]\npath = \"skills\"\n",
+    )?;
+    fs::write(
+        plugin_root.join("skills/review/SKILL.md"),
+        "---\nname: review\ndescription: reviewed plugin Skill\n---\nbody\n",
+    )?;
+    let plugin_config = crate::plugins::discovery::DiscoveryConfig {
+        workspace: workspace.clone(),
+        user_plugins_dir: tmp.path().join("plugins"),
+        workspace_plugins_dir: workspace.join(".codewhale/plugins"),
+        builtin_plugin_dirs: Vec::new(),
+        state_path: tmp.path().join("plugin-state/state.json"),
+    };
+    let discovery = crate::plugins::PluginDiscoveryContext::from_config_and_environment(
+        &plugin_config,
+        crate::plugins::HostEnvironment::default(),
+    );
+    let mut plugins = discovery.registry_for_workspace(&workspace);
+    Arc::make_mut(&mut plugins)
+        .trust("demo")
+        .map_err(anyhow::Error::msg)?;
+    Arc::make_mut(&mut plugins)
+        .enable("demo")
+        .map_err(anyhow::Error::msg)?;
+
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_root_token_mobile_workspace_and_overrides(
+            root.clone(),
+            root.join("sessions"),
+            None,
+            false,
+            workspace,
+            TestServerOverrides {
+                plugin_discovery: Some(discovery),
+                ..TestServerOverrides::default()
+            },
+        )
+        .await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+    let list = client
+        .get(format!("http://{addr}/v1/skills"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<serde_json::Value>()
+        .await?;
+    let plugin_skill = list["skills"]
+        .as_array()
+        .and_then(|skills| skills.iter().find(|skill| skill["name"] == "demo:review"))
+        .context("plugin Skill in runtime API catalog")?;
+    assert_eq!(plugin_skill["enabled"], true);
+    assert_eq!(plugin_skill["path"], serde_json::Value::Null);
+    assert_eq!(plugin_skill["source"], "reviewed-plugin-snapshot:demo");
+    assert!(plugin_skill["plugin_id"].as_str().is_some());
+    assert!(plugin_skill["plugin_generation"].as_u64().is_some());
+    assert!(plugin_skill["plugin_content_hash"].as_str().is_some());
+    assert!(
+        !plugin_skill
+            .to_string()
+            .contains(&plugin_root.display().to_string()),
+        "runtime API must not expose mutable or staged plugin paths"
+    );
+
+    client
+        .post(format!("http://{addr}/v1/skills/demo:review"))
+        .json(&json!({ "enabled": false }))
+        .send()
+        .await?
+        .error_for_status()?;
+    let after = client
+        .get(format!("http://{addr}/v1/skills"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<serde_json::Value>()
+        .await?;
+    let plugin_skill = after["skills"]
+        .as_array()
+        .and_then(|skills| skills.iter().find(|skill| skill["name"] == "demo:review"))
+        .context("plugin Skill after toggle")?;
+    assert_eq!(plugin_skill["enabled"], false);
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn skill_toggle_endpoint_404s_for_unknown_skill() -> Result<()> {
     let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
         return Ok(());
@@ -5141,6 +5243,7 @@ fn skill_entry_is_bundled_requires_configured_bundle_path() {
         localized_descriptions: std::collections::HashMap::new(),
         body: String::new(),
         path: bundled_skill_path,
+        source: crate::skills::SkillSource::Native,
     };
     let override_skill = crate::skills::Skill {
         name: "delegate".to_string(),
@@ -5148,6 +5251,7 @@ fn skill_entry_is_bundled_requires_configured_bundle_path() {
         localized_descriptions: std::collections::HashMap::new(),
         body: String::new(),
         path: override_skill_path,
+        source: crate::skills::SkillSource::Native,
     };
 
     assert!(skill_entry_is_bundled(&bundled_skill, &bundled_skills_dir));

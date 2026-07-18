@@ -65,6 +65,8 @@ pub struct QueuedSessionMessage {
     pub display: String,
     #[serde(default)]
     pub skill_instruction: Option<String>,
+    #[serde(default)]
+    pub skill_provenance: Option<crate::plugins::types::PluginAuthority>,
 }
 
 /// Persisted queue state for recovery after restart/crash.
@@ -1941,10 +1943,12 @@ mod tests {
             messages: vec![QueuedSessionMessage {
                 display: "queued message".to_string(),
                 skill_instruction: Some("Use skill".to_string()),
+                skill_provenance: None,
             }],
             draft: Some(QueuedSessionMessage {
                 display: "draft message".to_string(),
                 skill_instruction: None,
+                skill_provenance: None,
             }),
             ..OfflineQueueState::default()
         };
@@ -1985,6 +1989,7 @@ mod tests {
             messages: vec![QueuedSessionMessage {
                 display: "first parked".to_string(),
                 skill_instruction: None,
+                skill_provenance: None,
             }],
             ..OfflineQueueState::default()
         };

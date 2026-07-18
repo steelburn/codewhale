@@ -1,17 +1,28 @@
-//! Cucumber E2E acceptance tests for plugin discovery and listing.
+//! Plugin acceptance at both compatibility and v0.9.1 bundle boundaries.
 //!
 //! Tests the plugin frontmatter scanner end-to-end from the binary level:
 //! - Scripts with valid `# name:` frontmatter are discovered
 //! - Approval levels (auto, suggest, required) are parsed correctly
 //! - Hidden files and README.md are ignored
 //! - Empty and missing directories are handled gracefully
-//! - The binary still loads after the plugin module migration
+//! - The distributed binary still loads after the plugin module migration
+//! - A sealed real PTY exercises plugin.toml review/trust/enable/revoke,
+//!   reviewed Skill dispatch, and hermetic reviewed stdio MCP execution
 
 use std::path::PathBuf;
 use std::process::Command;
 
 use cucumber::{World as _, given, then, when, writer::Stats as _};
 use tempfile::TempDir;
+
+#[cfg(all(unix, feature = "long-running-tests"))]
+#[path = "support/qa_harness/mod.rs"]
+mod qa_harness;
+
+#[cfg(all(unix, feature = "long-running-tests"))]
+use qa_harness::harness::{Harness, make_sealed_workspace};
+#[cfg(all(unix, feature = "long-running-tests"))]
+use qa_harness::keys;
 
 const FEATURE_NAME: &str = "Plugin discovery and listing";
 const FEATURE_PATH: &str = concat!(
@@ -370,6 +381,409 @@ async fn plugin_module_does_not_break_binary_load() {
         version.contains("codewhale"),
         "version output should mention codewhale, got: {version}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Real plugin.toml binary/TUI acceptance
+// ---------------------------------------------------------------------------
+
+#[cfg(all(unix, feature = "long-running-tests"))]
+const BINARY_ACCEPTANCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+#[cfg(all(unix, feature = "long-running-tests"))]
+fn write_reviewed_bundle_fixture(workspace: &std::path::Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let bundle = workspace.join(".codewhale/plugins/demo");
+    std::fs::create_dir_all(bundle.join("skills/review")).expect("plugin fixture directories");
+    std::fs::write(
+        bundle.join("plugin.toml"),
+        r#"schema_version = 1
+[plugin]
+name = "demo"
+version = "1.0.0"
+description = "Hermetic binary acceptance fixture"
+
+[skills]
+path = "skills"
+
+[mcp_servers.local]
+command = "./server.py"
+connect_timeout = 5
+execute_timeout = 30
+read_timeout = 30
+
+[mcp_servers.local.env]
+ACCEPTANCE_LOG = "${PLUGIN_ACCEPTANCE_LOG}"
+"#,
+    )
+    .expect("plugin manifest");
+    std::fs::write(
+        bundle.join("skills/review/SKILL.md"),
+        "---\nname: review\ndescription: reviewed binary acceptance Skill\n---\n\nUse the reviewed fixture.\n",
+    )
+    .expect("plugin Skill");
+    let server = bundle.join("server.py");
+    std::fs::write(
+        &server,
+        r#"#!/usr/bin/env python3
+import json
+import os
+import signal
+import sys
+import time
+
+log_path = os.environ["ACCEPTANCE_LOG"]
+
+def record(event):
+    with open(log_path, "a", encoding="utf-8") as handle:
+        handle.write(event + "\n")
+        handle.flush()
+
+def stop(signum, _frame):
+    record("signal:" + str(signum))
+    raise SystemExit(0)
+
+signal.signal(signal.SIGTERM, stop)
+signal.signal(signal.SIGINT, stop)
+record("started")
+record("api-key-present:" + str("DEEPSEEK_API_KEY" in os.environ).lower())
+
+for raw in sys.stdin:
+    message = json.loads(raw)
+    method = message.get("method")
+    request_id = message.get("id")
+    if method == "initialize":
+        result = {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "plugin-acceptance", "version": "1.0.0"},
+        }
+    elif method == "tools/list":
+        record("tools:list")
+        result = {"tools": [{
+            "name": "echo",
+            "description": "Hermetic plugin echo",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string"},
+                    "hang": {"type": "boolean"},
+                },
+            },
+        }]}
+    elif method == "tools/call":
+        args = message.get("params", {}).get("arguments", {})
+        if args.get("hang"):
+            record("call:hang")
+            while True:
+                time.sleep(0.05)
+        record("call:echo")
+        result = {"content": [{
+            "type": "text",
+            "text": "plugin-echo:" + str(args.get("text", "")),
+        }]}
+    else:
+        if request_id is None:
+            continue
+        result = {}
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result}) + "\n")
+    sys.stdout.flush()
+"#,
+    )
+    .expect("stdio MCP fixture");
+    std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o755))
+        .expect("executable MCP fixture");
+    bundle
+}
+
+#[cfg(all(unix, feature = "long-running-tests"))]
+fn sse_line(value: serde_json::Value) -> String {
+    format!(
+        "data: {}\n\n",
+        serde_json::to_string(&value).expect("SSE JSON")
+    )
+}
+
+#[cfg(all(unix, feature = "long-running-tests"))]
+fn text_sse(text: &str) -> String {
+    [
+        sse_line(serde_json::json!({
+            "id": "chatcmpl-plugin-acceptance",
+            "object": "chat.completion.chunk",
+            "model": "deepseek-v4-pro",
+            "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": null}]
+        })),
+        sse_line(serde_json::json!({
+            "id": "chatcmpl-plugin-acceptance",
+            "object": "chat.completion.chunk",
+            "model": "deepseek-v4-pro",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 8, "completion_tokens": 4, "total_tokens": 12}
+        })),
+        "data: [DONE]\n\n".to_string(),
+    ]
+    .join("")
+}
+
+#[cfg(all(unix, feature = "long-running-tests"))]
+fn tool_call_sse(hang: bool) -> String {
+    let call_id = if hang {
+        "call_plugin_hang"
+    } else {
+        "call_plugin_echo"
+    };
+    let arguments = serde_json::to_string(&serde_json::json!({
+        "text": "acceptance",
+        "hang": hang,
+    }))
+    .expect("tool args");
+    [
+        sse_line(serde_json::json!({
+            "id": "chatcmpl-plugin-tool",
+            "object": "chat.completion.chunk",
+            "model": "deepseek-v4-pro",
+            "choices": [{
+                "index": 0,
+                "delta": {"tool_calls": [{
+                    "index": 0,
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": "mcp_plugin-4-demo-local_echo",
+                        "arguments": arguments
+                    }
+                }]},
+                "finish_reason": null
+            }]
+        })),
+        sse_line(serde_json::json!({
+            "id": "chatcmpl-plugin-tool",
+            "object": "chat.completion.chunk",
+            "model": "deepseek-v4-pro",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16}
+        })),
+        "data: [DONE]\n\n".to_string(),
+    ]
+    .join("")
+}
+
+#[cfg(all(unix, feature = "long-running-tests"))]
+fn spawn_hermetic_model_server() -> (
+    String,
+    std::sync::mpsc::Sender<()>,
+    std::thread::JoinHandle<()>,
+) {
+    use tiny_http::{Header, Method, Response, Server};
+
+    let server = Server::http("127.0.0.1:0").expect("loopback model server");
+    let base_url = format!(
+        "http://{}/v1",
+        server.server_addr().to_ip().expect("loopback address")
+    );
+    let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        loop {
+            let request = match server.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(Some(request)) => request,
+                Ok(None) => {
+                    if shutdown_rx.try_recv().is_ok() {
+                        break;
+                    }
+                    continue;
+                }
+                Err(_) => break,
+            };
+            let mut request = request;
+            let url = request.url().to_string();
+            if request.method() == &Method::Get && url.ends_with("/models") {
+                let response = Response::from_string(
+                    r#"{"object":"list","data":[{"id":"deepseek-v4-pro","object":"model"}]}"#,
+                )
+                .with_header(
+                    Header::from_bytes("content-type", "application/json").expect("JSON header"),
+                );
+                let _ = request.respond(response);
+                continue;
+            }
+            let mut body = String::new();
+            let _ = request.as_reader().read_to_string(&mut body);
+            let current_user = serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|request| request.get("messages")?.as_array().cloned())
+                .and_then(|messages| {
+                    messages.into_iter().rev().find_map(|message| {
+                        (message.get("role")?.as_str()? == "user")
+                            .then(|| message.get("content")?.as_str().map(str::to_owned))?
+                    })
+                })
+                .unwrap_or_default();
+            let stream = if current_user.contains("hang plugin call") {
+                tool_call_sse(true)
+            } else if body.contains("plugin-echo:acceptance") {
+                text_sse("binary plugin call complete")
+            } else if body.contains("call plugin echo") {
+                tool_call_sse(false)
+            } else {
+                text_sse("binary fixture acknowledged")
+            };
+            let response = Response::from_string(stream).with_header(
+                Header::from_bytes("content-type", "text/event-stream").expect("SSE header"),
+            );
+            let _ = request.respond(response);
+        }
+    });
+    (base_url, shutdown_tx, handle)
+}
+
+#[cfg(all(unix, feature = "long-running-tests"))]
+fn submit_tui_command(tui: &mut Harness, text: &str) {
+    tui.send(keys::key::text(text)).expect("type TUI command");
+    tui.wait_for_text(text, std::time::Duration::from_secs(3))
+        .expect("typed command visible");
+    std::thread::sleep(std::time::Duration::from_millis(180));
+    tui.pump();
+    tui.send(keys::key::enter()).expect("submit TUI command");
+}
+
+#[cfg(all(unix, feature = "long-running-tests"))]
+fn visible_review_confirmation(tui: &mut Harness) -> Option<String> {
+    tui.pump();
+    review_confirmation_in_text(&tui.frame().text())
+}
+
+#[cfg(all(unix, feature = "long-running-tests"))]
+fn review_confirmation_in_text(text: &str) -> Option<String> {
+    text.lines().map(str::trim).find_map(|line| {
+        let token = line.strip_prefix("/plugin trust demo ")?;
+        (token.contains('.')
+            && token.len() >= 17
+            && token.chars().all(|ch| ch.is_ascii_hexdigit() || ch == '.'))
+        .then(|| line.to_string())
+    })
+}
+
+#[cfg(all(unix, feature = "long-running-tests"))]
+fn wait_for_log(tui: &mut Harness, path: &std::path::Path, needle: &str) {
+    let deadline = std::time::Instant::now() + BINARY_ACCEPTANCE_TIMEOUT;
+    loop {
+        tui.pump();
+        if std::fs::read_to_string(path).is_ok_and(|body| body.contains(needle)) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "plugin MCP log did not contain {needle:?}\n{}",
+            tui.debug_dump()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(40));
+    }
+}
+
+/// Exercise the distributed binary through a real PTY and a sealed home. The
+/// only socket is a test-owned loopback model endpoint; plugin execution is
+/// stdio-only and receives no real credentials or ambient secret environment.
+#[cfg(all(unix, feature = "long-running-tests"))]
+#[tokio::test(flavor = "current_thread")]
+async fn plugin_toml_binary_lifecycle_skill_and_stdio_mcp_acceptance() {
+    static ACCEPTANCE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _serial = ACCEPTANCE_LOCK
+        .lock()
+        .unwrap_or_else(|lock| lock.into_inner());
+    let workspace = make_sealed_workspace().expect("sealed workspace");
+    let bundle = write_reviewed_bundle_fixture(workspace.workspace());
+    let mcp_log = workspace.home().join(".codewhale/plugin-acceptance.log");
+    let (base_url, shutdown_tx, model_thread) = spawn_hermetic_model_server();
+    let mut tui = Harness::builder(Harness::cargo_bin("codewhale-tui"))
+        .cwd(workspace.workspace())
+        .clear_env()
+        .seal_home(workspace.home())
+        .env("DEEPSEEK_API_KEY", "sealed-plugin-acceptance-key")
+        .env("DEEPSEEK_BASE_URL", &base_url)
+        .env("DEEPSEEK_MODEL", "deepseek-v4-pro")
+        .env("PLUGIN_ACCEPTANCE_LOG", mcp_log.to_string_lossy())
+        .env("NO_ANIMATIONS", "1")
+        .env("RUST_LOG", "warn")
+        .args([
+            "--workspace",
+            workspace.workspace().to_str().expect("workspace UTF-8"),
+            "--no-project-config",
+            "--skip-onboarding",
+            "--fresh",
+        ])
+        .size(52, 200)
+        .spawn()
+        .expect("start distributed TUI binary");
+    tui.wait_for_text("Write a task", BINARY_ACCEPTANCE_TIMEOUT)
+        .expect("TUI composer");
+
+    submit_tui_command(&mut tui, "/plugin show demo");
+    tui.wait_for_text("Qualified skills: [demo:review]", BINARY_ACCEPTANCE_TIMEOUT)
+        .expect("show reviewed Skill inventory");
+    assert!(
+        !workspace
+            .home()
+            .join(".codewhale/plugins/state.json")
+            .exists(),
+        "show must remain read-only"
+    );
+
+    submit_tui_command(&mut tui, "/plugin trust demo");
+    tui.wait_for(
+        |frame| review_confirmation_in_text(&frame.text()).is_some(),
+        BINARY_ACCEPTANCE_TIMEOUT,
+    )
+    .expect("review confirmation");
+    let confirmation = visible_review_confirmation(&mut tui)
+        .unwrap_or_else(|| panic!("review confirmation not visible\n{}", tui.debug_dump()));
+    submit_tui_command(&mut tui, &confirmation);
+    tui.wait_for_text("Plugin bundle 'demo': trusted.", BINARY_ACCEPTANCE_TIMEOUT)
+        .expect("trust receipt");
+
+    submit_tui_command(&mut tui, "/plugin enable demo");
+    tui.wait_for_text("Plugin bundle 'demo': enabled.", BINARY_ACCEPTANCE_TIMEOUT)
+        .expect("bundle enabled");
+    submit_tui_command(&mut tui, "$demo:review");
+    tui.wait_for_text("Activated skill: demo:review", BINARY_ACCEPTANCE_TIMEOUT)
+        .expect("reviewed Skill dispatch");
+
+    submit_tui_command(&mut tui, "call plugin echo");
+    tui.wait_for_text("Do you want to proceed?", BINARY_ACCEPTANCE_TIMEOUT)
+        .expect("MCP approval prompt");
+    tui.send(keys::key::ch('2'))
+        .expect("approve this reviewed MCP kind for the sealed session");
+    wait_for_log(&mut tui, &mcp_log, "started");
+    wait_for_log(&mut tui, &mcp_log, "api-key-present:false");
+    wait_for_log(&mut tui, &mcp_log, "tools:list");
+    wait_for_log(&mut tui, &mcp_log, "call:echo");
+    tui.wait_for_text("binary plugin call complete", BINARY_ACCEPTANCE_TIMEOUT)
+        .expect("plugin tool result returned to model");
+
+    submit_tui_command(&mut tui, "hang plugin call");
+    wait_for_log(&mut tui, &mcp_log, "call:hang");
+    tui.send([0x03]).expect("interrupt hanging plugin turn");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    tui.pump();
+    tui.send([0x15])
+        .expect("clear the interrupted prompt restored into the composer");
+    submit_tui_command(&mut tui, "/plugin revoke demo");
+    tui.wait_for_text(
+        "Plugin bundle 'demo': trust-revoked.",
+        BINARY_ACCEPTANCE_TIMEOUT,
+    )
+    .expect("bundle trust revoked");
+    wait_for_log(&mut tui, &mcp_log, "signal:");
+
+    let state = std::fs::read_to_string(workspace.home().join(".codewhale/plugins/state.json"))
+        .expect("durable plugin state");
+    assert!(state.contains("\"enabled\": true"));
+    assert!(state.contains("\"trust\": null"));
+    assert!(bundle.join("server.py").exists(), "source bundle preserved");
+
+    let _ = tui.shutdown();
+    let _ = shutdown_tx.send(());
+    let _ = model_thread.join();
 }
 
 // ---------------------------------------------------------------------------

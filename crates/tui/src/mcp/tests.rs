@@ -79,6 +79,118 @@ fn test_mcp_config_defaults() {
 }
 
 #[test]
+fn reviewed_remote_endpoint_identity_normalizes_case_idna_and_default_ports() {
+    let canonical = reviewed_remote_endpoint_identity("https://example.com/mcp").unwrap();
+    assert_eq!(
+        reviewed_remote_endpoint_identity("https://EXAMPLE.COM:443/mcp").unwrap(),
+        canonical
+    );
+    assert_eq!(
+        reviewed_remote_endpoint_identity("https://BÜCHER.example:443/mcp").unwrap(),
+        reviewed_remote_endpoint_identity("https://xn--bcher-kva.example/mcp").unwrap()
+    );
+    assert_ne!(
+        reviewed_remote_endpoint_identity("https://example.com:444/mcp").unwrap(),
+        canonical
+    );
+    assert!(reviewed_remote_endpoint_identity("http://localhost:8080/mcp").is_ok());
+    assert!(reviewed_remote_endpoint_identity("http://127.0.0.1/mcp").is_ok());
+    assert!(reviewed_remote_endpoint_identity("http://[::1]/mcp").is_ok());
+}
+
+#[test]
+fn reviewed_remote_endpoint_identity_rejects_ambiguous_or_secret_bearing_urls() {
+    for endpoint in [
+        "http://example.com/mcp",
+        "ftp://example.com/mcp",
+        "https://user@example.com/mcp",
+        "https://user:secret@example.com/mcp",
+        "https://example.com/mcp?token=secret",
+        "https://example.com/mcp#fragment",
+    ] {
+        let error = reviewed_remote_endpoint_identity(endpoint)
+            .expect_err("unsafe reviewed endpoint must fail closed")
+            .to_string();
+        assert!(
+            !error.contains("secret"),
+            "endpoint error leaked URL material"
+        );
+    }
+}
+
+#[test]
+fn reviewed_plugin_redirects_are_exact_normalized_origin_only() {
+    let approved = reviewed_remote_endpoint_identity("https://BÜCHER.example:443/mcp")
+        .unwrap()
+        .1;
+    let accepted = [
+        "https://xn--bcher-kva.example/next",
+        "https://BÜCHER.example:443/next?cursor=opaque",
+    ];
+    for endpoint in accepted {
+        assert!(reviewed_redirect_matches_origin(
+            &reqwest::Url::parse(endpoint).unwrap(),
+            &approved
+        ));
+    }
+
+    let rejected = [
+        "http://xn--bcher-kva.example/next",
+        "https://user@xn--bcher-kva.example/next",
+        "https://xn--bcher-kva.example:444/next",
+        "https://other.example/next",
+    ];
+    for endpoint in rejected {
+        assert!(!reviewed_redirect_matches_origin(
+            &reqwest::Url::parse(endpoint).unwrap(),
+            &approved
+        ));
+    }
+}
+
+#[test]
+fn reviewed_plugin_remote_proxy_policy_never_reads_ambient_environment() {
+    let reads = std::cell::Cell::new(0_u32);
+    let builder = configure_mcp_proxy(crate::tls::reqwest_client_builder(), true, |_| {
+        reads.set(reads.get() + 1);
+        Ok("http://127.0.0.1:9999".to_string())
+    });
+
+    assert_eq!(
+        reads.get(),
+        0,
+        "reviewed remotes must not read proxy values"
+    );
+    builder
+        .build()
+        .expect("explicit no-proxy client must remain buildable");
+}
+
+#[test]
+fn user_authored_mcp_proxy_policy_keeps_environment_support() {
+    let requested = std::cell::RefCell::new(Vec::new());
+    let builder = configure_mcp_proxy(crate::tls::reqwest_client_builder(), false, |name| {
+        requested.borrow_mut().push(name.to_string());
+        match name {
+            "HTTPS_PROXY" => Ok("http://127.0.0.1:8080".to_string()),
+            _ => Err(std::env::VarError::NotPresent),
+        }
+    });
+
+    assert_eq!(
+        requested.into_inner(),
+        vec![
+            "HTTPS_PROXY".to_string(),
+            "NO_PROXY".to_string(),
+            "no_proxy".to_string(),
+        ]
+    );
+    builder
+        .build()
+        .expect("user-authored proxy client must remain buildable");
+}
+
+#[test]
 fn test_mcp_config_parse() {
     let json = r#"{
         "timeouts": {
@@ -107,7 +219,7 @@ fn test_mcp_config_parse() {
 }
 
 #[test]
-fn mcp_pool_parse_prefixed_name_preserves_registered_underscored_server() {
+fn mcp_pool_parse_prefixed_name_rejects_ambiguous_configured_server_prefixes() {
     let config: McpConfig = serde_json::from_str(
         r#"{
             "servers": {
@@ -119,12 +231,10 @@ fn mcp_pool_parse_prefixed_name_preserves_registered_underscored_server() {
     .unwrap();
     let pool = McpPool::new(config);
 
-    let (server, tool) = pool
+    let error = pool
         .parse_prefixed_name("mcp_my_db_execute_sql")
-        .expect("registered underscored server should parse");
-
-    assert_eq!(server, "my_db");
-    assert_eq!(tool, "execute_sql");
+        .expect_err("configured server-prefix collisions must fail closed");
+    assert!(error.to_string().contains("Unknown MCP tool name"));
 }
 
 #[test]
@@ -212,6 +322,7 @@ fn mcp_server_config_omits_headers_when_empty() {
         scopes: Vec::new(),
         oauth: None,
         oauth_resource: None,
+        reviewed_plugin: None,
     };
     let serialized = serde_json::to_string(&cfg).unwrap();
     assert!(
@@ -264,6 +375,47 @@ fn expand_env_placeholders_reports_missing_variable_without_secret_value() {
     // value (which in practice carries the secret).
     assert!(err.contains("MCP_TEST_MISSING_SECRET"));
     assert!(!err.contains("Bearer "));
+}
+
+#[test]
+fn reviewed_plugin_environment_uses_only_the_pre_dotenv_snapshot() {
+    let _lock = crate::test_support::lock_test_env();
+    let dir = tempfile::tempdir().unwrap();
+    let plugin_base = dir.path().join("plugins/env-snapshot");
+    fs::create_dir_all(&plugin_base).unwrap();
+    fs::write(
+        plugin_base.join("plugin.toml"),
+        "schema_version = 1\n[plugin]\nname = \"env-snapshot\"\nversion = \"1.0.0\"\n",
+    )
+    .unwrap();
+    let (_, authority) = active_plugin_fixture(&plugin_base);
+    let snapshot = crate::plugins::HostEnvironment::from_entries([(
+        OsString::from("PLUGIN_SNAPSHOT_TOKEN"),
+        OsString::from("captured-before-dotenv"),
+    )]);
+    let mut server = test_server_config();
+    server
+        .env
+        .insert("TOKEN".to_string(), "${PLUGIN_SNAPSHOT_TOKEN}".to_string());
+    server.reviewed_plugin =
+        Some(ReviewedPluginMcpSource::from_authority(authority, None, Arc::new(snapshot)).unwrap());
+    let _late_dotenv = crate::test_support::EnvVarGuard::set(
+        "PLUGIN_SNAPSHOT_TOKEN",
+        "workspace-dotenv-must-not-win",
+    );
+
+    let expanded = expanded_mcp_stdio_env(&server).unwrap();
+    assert_eq!(expanded["TOKEN"], "captured-before-dotenv");
+
+    server.reviewed_plugin.as_mut().unwrap().host_environment =
+        Arc::new(crate::plugins::HostEnvironment::from_entries([]));
+    let error = expanded_mcp_stdio_env(&server)
+        .expect_err("a value present only after dotenv must fail closed");
+    assert!(
+        format!("{error:#}").contains("PLUGIN_SNAPSHOT_TOKEN"),
+        "unexpected missing-snapshot error: {error:#}"
+    );
+    assert!(!format!("{error:#}").contains("workspace-dotenv-must-not-win"));
 }
 
 fn write_path_only_test_command(dir: &Path) -> String {
@@ -786,12 +938,16 @@ fn workspace_manager_snapshot_counts_global_and_project_servers() {
 fn plugin_mcp_servers_are_qualified_and_resolve_relative_cwd() {
     let dir = tempfile::tempdir().unwrap();
     let plugin_base = dir.path().join("plugins").join("fleet");
-    fs::create_dir_all(&plugin_base).unwrap();
+    fs::create_dir_all(plugin_base.join("servers/local")).unwrap();
+    fs::write(plugin_base.join("servers/local/server.js"), "// server\n").unwrap();
 
-    let manifest = toml::from_str::<crate::plugins::manifest::PluginManifest>(
+    fs::write(
+        plugin_base.join("plugin.toml"),
         r#"
+schema_version = 1
 [plugin]
 name = "fleet"
+version = "1.0.0"
 
 [mcp_servers.local]
 command = "node"
@@ -800,55 +956,183 @@ cwd = "servers/local"
 
 [mcp_servers.remote]
 url = "https://example.invalid/mcp"
+
+[capabilities]
+network_hosts = ["example.invalid"]
 "#,
     )
     .unwrap();
-    let plugin = crate::plugins::manifest::LoadedPlugin {
-        manifest,
-        base_path: plugin_base.clone(),
-        enabled: true,
-    };
+    let (plugin, authority) = active_plugin_fixture(&plugin_base);
+    let plugin_for_collision = plugin.clone();
+    let authority_for_collision = authority.clone();
     let mut config = McpConfig::default();
     config.servers.insert(
         "global".to_string(),
         serde_json::from_str(r#"{"command":"node","args":["global.js"]}"#).unwrap(),
     );
 
-    let cfg =
-        merge_plugin_mcp_servers_from_plugins(config, vec![("fleet".to_string(), plugin)]).unwrap();
+    let cfg = merge_plugin_mcp_servers_from_plugins(
+        config,
+        vec![("fleet".to_string(), plugin, authority)],
+    )
+    .unwrap();
 
     assert!(cfg.servers.contains_key("global"));
 
-    let local = cfg.servers.get("fleet-local").unwrap();
+    let local = cfg.servers.get("plugin-5-fleet-local").unwrap();
     assert_eq!(local.command.as_deref(), Some("node"));
-    assert_eq!(local.args, vec!["server.js"]);
+    let staged_root = plugin_for_collision.staged_root.as_deref().unwrap();
+    assert_eq!(
+        local.args,
+        vec![
+            staged_root
+                .join("servers/local/server.js")
+                .display()
+                .to_string()
+        ]
+    );
     assert_eq!(
         local.cwd.as_deref(),
-        Some(plugin_base.join("servers/local").as_path())
+        Some(staged_root.join("servers/local").as_path())
     );
 
-    let remote = cfg.servers.get("fleet-remote").unwrap();
+    let remote = cfg.servers.get("plugin-5-fleet-remote").unwrap();
     assert_eq!(remote.url.as_deref(), Some("https://example.invalid/mcp"));
     assert!(remote.cwd.is_none());
+
+    let mut explicit = McpConfig::default();
+    explicit.servers.insert(
+        "plugin-5-fleet-local".to_string(),
+        serde_json::from_str(r#"{"command":"node","args":["explicit.js"]}"#).unwrap(),
+    );
+    let collision_safe = merge_plugin_mcp_servers_from_plugins(
+        explicit,
+        vec![(
+            "fleet".to_string(),
+            plugin_for_collision,
+            authority_for_collision,
+        )],
+    )
+    .unwrap();
+    assert_eq!(
+        collision_safe.servers["plugin-5-fleet-local"].args,
+        vec!["explicit.js"],
+        "explicit MCP config must outrank a colliding plugin server"
+    );
 }
 
-fn plugin_with_local_mcp(name: &str, base_path: PathBuf) -> crate::plugins::manifest::LoadedPlugin {
-    let manifest = toml::from_str::<crate::plugins::manifest::PluginManifest>(&format!(
+#[test]
+fn plugin_server_ids_are_unambiguous_across_hyphenated_plugin_and_server_names() {
+    let left = qualified_plugin_server_name("foo-bar", "baz");
+    let right = qualified_plugin_server_name("foo", "bar-baz");
+
+    assert_eq!(left, "plugin-7-foo-bar-baz");
+    assert_eq!(right, "plugin-3-foo-bar-baz");
+    assert_ne!(left, right);
+}
+
+#[test]
+fn plugin_mcp_adapter_denies_disabled_and_untrusted_bundles() {
+    let dir = tempfile::tempdir().unwrap();
+    let plugin_base = dir.path().join("plugin");
+    fs::create_dir_all(&plugin_base).unwrap();
+    fs::write(
+        plugin_base.join("plugin.toml"),
         r#"
+schema_version = 1
+[plugin]
+name = "denied"
+version = "1.0.0"
+
+[mcp_servers.local]
+command = "node"
+"#,
+    )
+    .unwrap();
+    let (mut disabled, authority) = active_plugin_fixture(&plugin_base);
+    disabled.enabled = false;
+    let mut untrusted = disabled.clone();
+    untrusted.enabled = true;
+    untrusted.trust_status = crate::plugins::types::PluginTrustStatus::NeverReviewed;
+
+    for plugin in [disabled, untrusted] {
+        let config = merge_plugin_mcp_servers_from_plugins(
+            McpConfig::default(),
+            vec![("denied".to_string(), plugin, authority.clone())],
+        )
+        .unwrap();
+        assert!(
+            config.servers.is_empty(),
+            "headless MCP adapter admitted an inactive bundle"
+        );
+    }
+}
+
+#[test]
+fn plugin_mcp_adapter_denies_content_changed_after_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let plugin_base = dir.path().join("plugin");
+    fs::create_dir_all(&plugin_base).unwrap();
+    let manifest_path = plugin_base.join("plugin.toml");
+    fs::write(
+        &manifest_path,
+        r#"
+schema_version = 1
+[plugin]
+name = "changed"
+version = "1.0.0"
+
+[mcp_servers.local]
+command = "node"
+"#,
+    )
+    .unwrap();
+    let (plugin, authority) = active_plugin_fixture(&plugin_base);
+    fs::write(plugin_base.join("late-change.txt"), "changed after review").unwrap();
+
+    let config = merge_plugin_mcp_servers_from_plugins(
+        McpConfig::default(),
+        vec![("changed".to_string(), plugin, authority)],
+    )
+    .unwrap();
+    assert!(config.servers.is_empty());
+}
+
+fn registry_with_local_mcp(
+    name: &str,
+    base_path: PathBuf,
+    workspace: &Path,
+) -> crate::plugins::PluginRegistry {
+    fs::write(
+        base_path.join("plugin.toml"),
+        format!(
+            r#"
+schema_version = 1
 [plugin]
 name = "{name}"
+version = "1.0.0"
 
 [mcp_servers.local]
 command = "node"
 args = ["server.js"]
 "#,
-    ))
+        ),
+    )
     .unwrap();
-    crate::plugins::manifest::LoadedPlugin {
-        manifest,
-        base_path,
-        enabled: true,
-    }
+    let plugins_root = base_path.parent().expect("plugin parent").to_path_buf();
+    let discovery = crate::plugins::discovery::DiscoveryConfig {
+        workspace: workspace.to_path_buf(),
+        user_plugins_dir: plugins_root,
+        workspace_plugins_dir: workspace.join(".codewhale/plugins-unused"),
+        builtin_plugin_dirs: Vec::new(),
+        state_path: workspace
+            .join("plugin-state")
+            .join(format!("plugin-state-{name}.json")),
+    };
+    let mut registry = crate::plugins::discovery::discover_with_config(&discovery);
+    registry.trust(name).unwrap();
+    registry.enable(name).unwrap();
+    registry
 }
 
 #[test]
@@ -865,26 +1149,618 @@ fn plugin_mcp_servers_merge_without_project_config() {
     )
     .unwrap();
 
-    let cfg = load_config_with_workspace_from_plugins(
-        &global_path,
-        &workspace,
-        vec![(
-            "fixture".to_string(),
-            plugin_with_local_mcp("fixture", plugin_base.clone()),
-        )],
+    let plugins = registry_with_local_mcp("fixture", plugin_base.clone(), &workspace);
+    let staged_root = plugins
+        .get("fixture")
+        .and_then(|plugin| plugin.staged_root.clone())
+        .expect("trusted plugin should have an immutable runtime snapshot");
+    let cfg = load_config_with_workspace_and_plugins(&global_path, &workspace, &plugins).unwrap();
+
+    assert!(cfg.servers.contains_key("global"));
+    let qualified_name = qualified_plugin_server_name("fixture", "local");
+    let local = cfg
+        .servers
+        .get(&qualified_name)
+        .expect("plugin MCP should merge without a project MCP config");
+    assert_eq!(local.command.as_deref(), Some("node"));
+    assert_eq!(local.cwd.as_deref(), Some(staged_root.as_path()));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn plugin_mcp_lazy_spawn_denies_component_changed_after_pool_construction() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let plugins_root = dir.path().join("plugins");
+    let plugin_base = plugins_root.join("guarded");
+    fs::create_dir_all(&plugin_base).unwrap();
+    let server_path = plugin_base.join("server.sh");
+    fs::write(&server_path, "#!/bin/sh\nexit 0\n").unwrap();
+    let mut permissions = fs::metadata(&server_path).unwrap().permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&server_path, permissions).unwrap();
+    fs::write(
+        plugin_base.join("plugin.toml"),
+        r#"
+schema_version = 1
+[plugin]
+name = "guarded"
+version = "1.0.0"
+
+[mcp_servers.local]
+command = "sh"
+args = ["server.sh"]
+connect_timeout = 1
+"#,
     )
     .unwrap();
 
-    assert!(cfg.servers.contains_key("global"));
-    let local = cfg
-        .servers
-        .get("fixture-local")
-        .expect("plugin MCP should merge without a project MCP config");
-    assert_eq!(local.command.as_deref(), Some("node"));
-    assert_eq!(
-        local.cwd.as_deref(),
-        Some(plugin_base.canonicalize().unwrap().as_path())
+    let discovery = crate::plugins::discovery::DiscoveryConfig {
+        workspace: dir.path().join("project"),
+        user_plugins_dir: plugins_root,
+        workspace_plugins_dir: dir.path().join("workspace-plugins"),
+        builtin_plugin_dirs: Vec::new(),
+        state_path: dir.path().join("plugin-state/state.json"),
+    };
+    let mut registry = crate::plugins::discovery::discover_with_config(&discovery);
+    registry.trust("guarded").unwrap();
+    registry.enable("guarded").unwrap();
+    let active = registry.active_plugins()[0].clone();
+    let authority = registry.authority_for("guarded").unwrap();
+    let merged = merge_plugin_mcp_servers_from_plugins(
+        McpConfig::default(),
+        vec![("guarded".to_string(), active, authority)],
+    )
+    .unwrap();
+    assert!(
+        merged.servers["plugin-7-guarded-local"]
+            .reviewed_plugin
+            .is_some(),
+        "plugin provenance must survive through MCP pool construction"
     );
+    let mut pool = McpPool::new(merged);
+
+    // Adversarial mutation after trust, enablement, merge, and pool
+    // construction. If the lazy child executes, it creates this marker before
+    // closing stdio, so the regression proves denial happened pre-spawn.
+    let executed_marker = plugin_base.join("executed.marker");
+    fs::write(&server_path, "#!/bin/sh\n: > executed.marker\nexit 0\n").unwrap();
+
+    let error = pool
+        .get_or_connect("plugin-7-guarded-local")
+        .await
+        .err()
+        .expect("changed reviewed component must be denied before spawn");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("Refusing to use MCP server 'plugin-7-guarded-local'"),
+        "unexpected pre-spawn denial: {message}"
+    );
+    assert!(message.contains("changed after review"));
+    assert!(message.contains("/plugin reload"));
+    assert!(
+        !executed_marker.exists(),
+        "mutated MCP component executed despite pre-spawn hash denial"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn plugin_mcp_inflight_call_is_cancelled_after_cross_process_revocation() {
+    let _env_lock = crate::test_support::lock_test_env();
+    let dir = tempfile::tempdir().unwrap();
+    let call_marker = dir.path().join("call.marker");
+    let _call_marker_env = crate::test_support::EnvVarGuard::set(
+        "CODEWHALE_TEST_PLUGIN_CALL_MARKER",
+        call_marker.as_os_str(),
+    );
+    let plugins_root = dir.path().join("plugins");
+    let plugin_base = plugins_root.join("revoked");
+    fs::create_dir_all(&plugin_base).unwrap();
+    fs::create_dir_all(dir.path().join("project")).unwrap();
+    fs::write(
+        plugin_base.join("server.sh"),
+        r#"#!/bin/sh
+trap 'exit 0' TERM INT
+while IFS= read -r line; do
+    case "$line" in
+        *'"method":"notifications/initialized"'*)
+            ;;
+        *'"method":"initialize"'*)
+            printf '%s\n' '{"jsonrpc":"2.0","id":"1","result":{"protocolVersion":"2024-11-05","serverInfo":{"name":"revocation-test","version":"1.0.0"},"capabilities":{"tools":{}}}}'
+            ;;
+        *'"method":"tools/list"'*)
+            printf '%s\n' '{"jsonrpc":"2.0","id":"2","result":{"tools":[{"name":"wait","description":"Wait until revoked","inputSchema":{"type":"object"}}]}}'
+            ;;
+        *'"method":"tools/call"'*)
+            : > "$CALL_MARKER"
+            while :; do sleep 1; done
+            ;;
+    esac
+done
+"#,
+    )
+    .unwrap();
+    fs::write(
+        plugin_base.join("plugin.toml"),
+        r#"
+schema_version = 1
+[plugin]
+name = "revoked"
+version = "1.0.0"
+
+[mcp_servers.local]
+command = "sh"
+args = ["server.sh"]
+connect_timeout = 2
+execute_timeout = 30
+read_timeout = 30
+
+[mcp_servers.local.env]
+CALL_MARKER = "${CODEWHALE_TEST_PLUGIN_CALL_MARKER}"
+"#,
+    )
+    .unwrap();
+
+    let discovery = crate::plugins::discovery::DiscoveryConfig {
+        workspace: dir.path().join("project"),
+        user_plugins_dir: plugins_root,
+        workspace_plugins_dir: dir.path().join("workspace-plugins-unused"),
+        builtin_plugin_dirs: Vec::new(),
+        state_path: dir.path().join("plugin-state/state.json"),
+    };
+    let mut registry = crate::plugins::discovery::discover_with_config(&discovery);
+    registry.trust("revoked").unwrap();
+    registry.enable("revoked").unwrap();
+    let active = registry.active_plugins()[0].clone();
+    let authority = registry.authority_for("revoked").unwrap();
+    let merged = merge_plugin_mcp_servers_from_plugins(
+        McpConfig::default(),
+        vec![("revoked".to_string(), active, authority)],
+    )
+    .unwrap();
+    let mut pool = McpPool::new(merged);
+    pool.get_or_connect("plugin-7-revoked-local").await.unwrap();
+
+    let call = tokio::spawn(async move {
+        pool.call_tool("mcp_plugin-7-revoked-local_wait", serde_json::json!({}))
+            .await
+    });
+    for _ in 0..100 {
+        if call_marker.exists() {
+            break;
+        }
+        if call.is_finished() {
+            let early = call
+                .await
+                .expect("in-flight tool task panicked before reaching the server");
+            panic!("in-flight tool call ended before reaching the server: {early:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        call_marker.exists(),
+        "test server never observed the in-flight tool call"
+    );
+
+    let mut external = crate::plugins::discovery::discover_with_config(&discovery);
+    external.revoke_trust("revoked").unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(5), call)
+        .await
+        .expect("revocation watcher did not cancel the in-flight call")
+        .unwrap();
+    let error = result
+        .expect_err("revoked in-flight call must not complete")
+        .to_string();
+    assert!(error.contains("cancelled after authority changed"));
+    assert!(error.contains("disabled, revoked, or no longer matches"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn plugin_stdio_authority_cancellation_terminates_an_idle_child() {
+    let dir = tempfile::tempdir().unwrap();
+    let plugin_base = dir.path().join("plugins/idle-child");
+    fs::create_dir_all(&plugin_base).unwrap();
+    fs::write(
+        plugin_base.join("plugin.toml"),
+        "schema_version = 1\n[plugin]\nname = \"idle-child\"\nversion = \"1.0.0\"\n",
+    )
+    .unwrap();
+    let (_, authority) = active_plugin_fixture(&plugin_base);
+    let mut config = test_server_config();
+    config.command = Some("sh".to_string());
+    config.args = vec![
+        "-c".to_string(),
+        "trap 'exit 0' TERM INT; while :; do sleep 1; done".to_string(),
+    ];
+    config.reviewed_plugin = Some(
+        ReviewedPluginMcpSource::from_authority(
+            authority,
+            None,
+            Arc::new(crate::plugins::HostEnvironment::capture()),
+        )
+        .unwrap(),
+    );
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let transport = StdioTransport::spawn(
+        "idle-child",
+        config.command.as_deref().unwrap(),
+        &config,
+        cancellation.clone(),
+    )
+    .unwrap();
+    assert!(transport.child.lock().await.try_wait().unwrap().is_none());
+
+    cancellation.cancel();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        if transport.child.lock().await.try_wait().unwrap().is_some() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "authority cancellation left the plugin stdio child alive"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn plugin_stdio_does_not_surface_reviewed_child_stderr() {
+    let dir = tempfile::tempdir().unwrap();
+    let plugin_base = dir.path().join("plugins/stderr-secret");
+    fs::create_dir_all(&plugin_base).unwrap();
+    fs::write(
+        plugin_base.join("plugin.toml"),
+        "schema_version = 1\n[plugin]\nname = \"stderr-secret\"\nversion = \"1.0.0\"\n",
+    )
+    .unwrap();
+    let (_, authority) = active_plugin_fixture(&plugin_base);
+    let mut config = test_server_config();
+    config.command = Some("sh".to_string());
+    config.args = vec![
+        "-c".to_string(),
+        "echo 'ARBITRARY_PLUGIN_CREDENTIAL' 1>&2; exit 1".to_string(),
+    ];
+    config.reviewed_plugin = Some(
+        ReviewedPluginMcpSource::from_authority(
+            authority,
+            None,
+            Arc::new(crate::plugins::HostEnvironment::capture()),
+        )
+        .unwrap(),
+    );
+    let mut transport = StdioTransport::spawn(
+        "stderr-secret",
+        config.command.as_deref().unwrap(),
+        &config,
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let error = transport
+        .recv()
+        .await
+        .expect_err("reviewed child should have closed its transport")
+        .to_string();
+    assert!(error.contains("Stdio transport closed"));
+    assert!(!error.contains("ARBITRARY_PLUGIN_CREDENTIAL"));
+}
+
+#[tokio::test]
+async fn revoked_plugin_mcp_denies_catalog_tool_resource_and_prompt_operations() {
+    let dir = tempfile::tempdir().unwrap();
+    let plugins_root = dir.path().join("plugins");
+    let plugin_base = plugins_root.join("catalog-guard");
+    fs::create_dir_all(&plugin_base).unwrap();
+    fs::create_dir_all(dir.path().join("project")).unwrap();
+    fs::write(
+        plugin_base.join("plugin.toml"),
+        "schema_version = 1\n[plugin]\nname = \"catalog-guard\"\nversion = \"1.0.0\"\n",
+    )
+    .unwrap();
+    let discovery = crate::plugins::discovery::DiscoveryConfig {
+        workspace: dir.path().join("project"),
+        user_plugins_dir: plugins_root,
+        workspace_plugins_dir: dir.path().join("workspace-plugins-unused"),
+        builtin_plugin_dirs: Vec::new(),
+        state_path: dir.path().join("plugin-state/state.json"),
+    };
+    let mut registry = crate::plugins::discovery::discover_with_config(&discovery);
+    registry.trust("catalog-guard").unwrap();
+    registry.enable("catalog-guard").unwrap();
+    let authority = registry.authority_for("catalog-guard").unwrap();
+
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let mut connection = test_connection(Box::new(ScriptedValueTransport {
+        sent: Arc::clone(&sent),
+        responses: VecDeque::new(),
+    }));
+    let source = ReviewedPluginMcpSource::from_authority(
+        authority,
+        None,
+        Arc::new(crate::plugins::HostEnvironment::capture()),
+    )
+    .unwrap();
+    connection.config.reviewed_plugin = Some(source.clone());
+    connection.tools.push(McpTool {
+        name: "echo".to_string(),
+        description: None,
+        input_schema: serde_json::json!({}),
+    });
+    connection.resources.push(McpResource {
+        uri: "memory://one".to_string(),
+        name: "one".to_string(),
+        description: None,
+        mime_type: None,
+    });
+    connection.resource_templates.push(McpResourceTemplate {
+        uri_template: "memory://{id}".to_string(),
+        name: "memory".to_string(),
+        description: None,
+        mime_type: None,
+    });
+    connection.prompts.push(McpPrompt {
+        name: "review".to_string(),
+        description: None,
+        arguments: Vec::new(),
+    });
+    let mut config = McpConfig::default();
+    let mut server = test_server_config();
+    server.reviewed_plugin = Some(source);
+    config.servers.insert("guarded".to_string(), server);
+    let mut pool = McpPool::new(config);
+    pool.connections.insert("guarded".to_string(), connection);
+    assert_eq!(pool.all_tools().len(), 1);
+    assert_eq!(pool.all_resources().len(), 1);
+    assert_eq!(pool.all_resource_templates().len(), 1);
+    assert_eq!(pool.all_prompts().len(), 1);
+
+    let mut external = crate::plugins::discovery::discover_with_config(&discovery);
+    external.revoke_trust("catalog-guard").unwrap();
+    assert!(pool.all_tools().is_empty());
+    assert!(pool.all_resources().is_empty());
+    assert!(pool.all_resource_templates().is_empty());
+    assert!(pool.all_prompts().is_empty());
+
+    let tool = pool
+        .call_tool("mcp_guarded_echo", serde_json::json!({}))
+        .await;
+    let resource = pool.read_resource("guarded", "memory://one").await;
+    let prompt = pool
+        .get_prompt("guarded", "review", serde_json::json!({}))
+        .await;
+    let resource_catalog = pool
+        .call_tool(
+            "list_mcp_resources",
+            serde_json::json!({"server": "guarded"}),
+        )
+        .await;
+    let template_catalog = pool
+        .call_tool(
+            "list_mcp_resource_templates",
+            serde_json::json!({"server": "guarded"}),
+        )
+        .await;
+    for result in [tool, resource, prompt, resource_catalog, template_catalog] {
+        let error = result
+            .expect_err("revoked plugin MCP operation must fail closed")
+            .to_string();
+        assert!(error.contains("Refusing to use MCP server 'guarded'"));
+    }
+    assert!(
+        sent.lock().unwrap().is_empty(),
+        "revoked plugin MCP operation reached the transport"
+    );
+}
+
+fn cached_reviewed_plugin_catalog_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, McpPool) {
+    let dir = tempfile::tempdir().unwrap();
+    let plugins_root = dir.path().join("plugins");
+    let plugin_base = plugins_root.join("catalog-drift");
+    fs::create_dir_all(&plugin_base).unwrap();
+    fs::create_dir_all(dir.path().join("project")).unwrap();
+    fs::write(
+        plugin_base.join("plugin.toml"),
+        "schema_version = 1\n[plugin]\nname = \"catalog-drift\"\nversion = \"1.0.0\"\n",
+    )
+    .unwrap();
+    let discovery = crate::plugins::discovery::DiscoveryConfig {
+        workspace: dir.path().join("project"),
+        user_plugins_dir: plugins_root,
+        workspace_plugins_dir: dir.path().join("workspace-plugins-unused"),
+        builtin_plugin_dirs: Vec::new(),
+        state_path: dir.path().join("plugin-state/state.json"),
+    };
+    let mut registry = crate::plugins::discovery::discover_with_config(&discovery);
+    registry.trust("catalog-drift").unwrap();
+    registry.enable("catalog-drift").unwrap();
+    let authority = registry.authority_for("catalog-drift").unwrap();
+    let staged_manifest = authority.staged_manifest.clone();
+
+    let mut connection = test_connection(Box::new(ScriptedValueTransport {
+        sent: Arc::new(Mutex::new(Vec::new())),
+        responses: VecDeque::new(),
+    }));
+    let source = ReviewedPluginMcpSource::from_authority(
+        authority,
+        None,
+        Arc::new(crate::plugins::HostEnvironment::capture()),
+    )
+    .unwrap();
+    connection.config.reviewed_plugin = Some(source.clone());
+    connection.tools.push(McpTool {
+        name: "echo".to_string(),
+        description: None,
+        input_schema: serde_json::json!({}),
+    });
+    connection.resources.push(McpResource {
+        uri: "memory://one".to_string(),
+        name: "one".to_string(),
+        description: None,
+        mime_type: None,
+    });
+    connection.resource_templates.push(McpResourceTemplate {
+        uri_template: "memory://{id}".to_string(),
+        name: "memory".to_string(),
+        description: None,
+        mime_type: None,
+    });
+    connection.prompts.push(McpPrompt {
+        name: "review".to_string(),
+        description: None,
+        arguments: Vec::new(),
+    });
+    let mut config = McpConfig::default();
+    let mut server = test_server_config();
+    server.reviewed_plugin = Some(source);
+    config.servers.insert("guarded".to_string(), server);
+    let mut pool = McpPool::new(config);
+    pool.connections.insert("guarded".to_string(), connection);
+    assert_eq!(pool.all_tools().len(), 1);
+    assert_eq!(pool.all_resources().len(), 1);
+    assert_eq!(pool.all_resource_templates().len(), 1);
+    assert_eq!(pool.all_prompts().len(), 1);
+
+    (dir, plugin_base, staged_manifest, pool)
+}
+
+fn assert_reviewed_plugin_catalog_hidden(pool: &McpPool, boundary: &str) {
+    assert!(pool.all_tools().is_empty());
+    assert!(pool.all_resources().is_empty());
+    assert!(pool.all_resource_templates().is_empty());
+    assert!(pool.all_prompts().is_empty());
+    assert!(
+        pool.to_api_tools()
+            .iter()
+            .all(|tool| tool.name != "mcp_guarded_echo"),
+        "{boundary} drift must remove cached reviewed tools from the model API catalog"
+    );
+    assert!(pool.parse_prefixed_name("mcp_guarded_echo").is_err());
+}
+
+#[test]
+fn reviewed_plugin_source_drift_hides_every_cached_catalog_surface() {
+    let (_dir, plugin_base, _staged_manifest, pool) = cached_reviewed_plugin_catalog_fixture();
+
+    fs::write(plugin_base.join("unreviewed-companion.txt"), b"drift").unwrap();
+
+    assert_reviewed_plugin_catalog_hidden(&pool, "source");
+}
+
+#[cfg(unix)]
+#[test]
+fn reviewed_plugin_stage_drift_hides_every_cached_catalog_surface() {
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let (_dir, _plugin_base, staged_manifest, pool) = cached_reviewed_plugin_catalog_fixture();
+    std::fs::set_permissions(&staged_manifest, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&staged_manifest)
+        .unwrap()
+        .write_all(b"\n# test-only staged drift\n")
+        .unwrap();
+
+    assert_reviewed_plugin_catalog_hidden(&pool, "staged-tree");
+}
+
+#[tokio::test]
+async fn reviewed_plugin_oauth_is_disabled_without_network_or_token_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let plugin_base = dir.path().join("plugins/oauth-disabled");
+    fs::create_dir_all(&plugin_base).unwrap();
+    fs::write(
+        plugin_base.join("plugin.toml"),
+        "schema_version = 1\n[plugin]\nname = \"oauth-disabled\"\nversion = \"1.0.0\"\n",
+    )
+    .unwrap();
+    let (_, authority) = active_plugin_fixture(&plugin_base);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let mut server = test_server_config();
+    server.command = None;
+    server.url = Some(endpoint.clone());
+    server.reviewed_plugin = Some(
+        ReviewedPluginMcpSource::from_authority(
+            authority,
+            Some(&endpoint),
+            Arc::new(crate::plugins::HostEnvironment::default()),
+        )
+        .unwrap(),
+    );
+
+    assert_eq!(
+        oauth::auth_status_for_server("plugin-oauth", &server).await,
+        oauth::McpAuthStatus::Unsupported
+    );
+    assert!(oauth::oauth_login_support(&server).await.unwrap().is_none());
+    assert!(
+        oauth::McpOAuthRuntime::from_server_config(
+            "plugin-oauth",
+            &server,
+            reqwest::header::HeaderMap::new(),
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    let login_error =
+        oauth::perform_oauth_login_for_server("plugin-oauth", &server, None, None, None)
+            .await
+            .expect_err("plugin OAuth login must be disabled")
+            .to_string();
+    assert!(login_error.contains("disabled for plugin-contributed MCP servers"));
+    let logout_error = oauth::delete_oauth_tokens_for_server("plugin-oauth", &server)
+        .expect_err("plugin OAuth logout must not touch token storage")
+        .to_string();
+    assert!(logout_error.contains("storage is disabled"));
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err(),
+        "plugin OAuth disabled paths must not probe the network"
+    );
+}
+
+fn active_plugin_fixture(
+    plugin_base: &Path,
+) -> (
+    crate::plugins::types::LoadedPlugin,
+    crate::plugins::types::PluginAuthority,
+) {
+    let plugins_root = plugin_base.parent().expect("plugin parent").to_path_buf();
+    let root = plugins_root.parent().unwrap_or(&plugins_root).to_path_buf();
+    let discovery = crate::plugins::discovery::DiscoveryConfig {
+        workspace: root.join("project"),
+        user_plugins_dir: plugins_root,
+        workspace_plugins_dir: root.join("workspace-plugins-unused"),
+        builtin_plugin_dirs: Vec::new(),
+        state_path: root.join("plugin-state").join(format!(
+            "plugin-state-{}.json",
+            plugin_base.file_name().unwrap().to_string_lossy()
+        )),
+    };
+    let mut registry = crate::plugins::discovery::discover_with_config(&discovery);
+    let name = registry
+        .list()
+        .first()
+        .expect("discovered plugin")
+        .name()
+        .to_string();
+    registry.trust(&name).unwrap();
+    registry.enable(&name).unwrap();
+    (
+        registry.get(&name).unwrap().clone(),
+        registry.authority_for(&name).unwrap(),
+    )
 }
 
 #[test]
@@ -907,20 +1783,14 @@ fn workspace_mcp_config_ignores_project_file_until_workspace_trusted() {
     )
     .unwrap();
 
-    let cfg = load_config_with_workspace_from_plugins(
-        &global_path,
-        &workspace,
-        vec![(
-            "fixture".to_string(),
-            plugin_with_local_mcp("fixture", plugin_base),
-        )],
-    )
-    .unwrap();
+    let plugins = registry_with_local_mcp("fixture", plugin_base, &workspace);
+    let cfg = load_config_with_workspace_and_plugins(&global_path, &workspace, &plugins).unwrap();
 
     assert!(cfg.servers.contains_key("global"));
     assert!(!cfg.servers.contains_key("project"));
     assert!(
-        cfg.servers.contains_key("fixture-local"),
+        cfg.servers
+            .contains_key(&qualified_plugin_server_name("fixture", "local")),
         "user plugin MCP should not be gated by project workspace trust"
     );
 }
@@ -1374,6 +2244,7 @@ fn test_server_effective_timeouts() {
         scopes: Vec::new(),
         oauth: None,
         oauth_resource: None,
+        reviewed_plugin: None,
     };
 
     assert_eq!(server_with_override.effective_connect_timeout(&global), 20);
@@ -1499,6 +2370,7 @@ fn test_server_config() -> McpServerConfig {
         scopes: Vec::new(),
         oauth: None,
         oauth_resource: None,
+        reviewed_plugin: None,
     }
 }
 
@@ -1517,6 +2389,9 @@ fn test_connection(transport: Box<dyn McpTransport>) -> McpConnection {
         discovery_timeout: Duration::from_secs(default_connect_timeout()),
         read_timeout_secs: default_read_timeout(),
         cancel_token: tokio_util::sync::CancellationToken::new(),
+        authority_revocation_reason: Arc::new(std::sync::Mutex::new(None)),
+        authority_watch: None,
+        catalog_generation: 0,
     }
 }
 
@@ -1761,6 +2636,7 @@ fn hash_mcp_config_is_stable_and_change_sensitive() {
             scopes: Vec::new(),
             oauth: None,
             oauth_resource: None,
+            reviewed_plugin: None,
         },
     );
     assert_ne!(
@@ -1810,6 +2686,42 @@ async fn discover_tools_sorts_by_name_for_cache_stability() {
         names,
         vec!["alpha", "beta", "mu", "zeta"],
         "tools must be sorted by name regardless of server order or pagination"
+    );
+}
+
+#[tokio::test]
+async fn discover_tools_rejects_a_repeated_pagination_cursor_without_publishing_partials() {
+    let transport = ScriptedValueTransport {
+        sent: Arc::new(Mutex::new(Vec::new())),
+        responses: VecDeque::from([
+            json_frame(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "tools": [{ "name": "first", "inputSchema": {} }],
+                    "nextCursor": "same"
+                }
+            })),
+            json_frame(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "tools": [{ "name": "second", "inputSchema": {} }],
+                    "nextCursor": "same"
+                }
+            })),
+        ]),
+    };
+    let mut conn = test_connection(Box::new(transport));
+
+    let error = conn
+        .discover_tools()
+        .await
+        .expect_err("repeated cursor must abort discovery");
+    assert!(error.to_string().contains("repeated pagination cursor"));
+    assert!(
+        conn.tools.is_empty(),
+        "an aborted catalogue must not publish attacker-controlled partial entries"
     );
 }
 
@@ -2029,6 +2941,85 @@ async fn mcp_pool_call_tool_preserves_tool_names_with_dashes() {
 }
 
 #[tokio::test]
+async fn mcp_pool_rejects_unadvertised_tool_without_sending_tools_call() {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let transport = ScriptedValueTransport {
+        sent: Arc::clone(&sent),
+        // A malicious server could implement this hidden method, but local
+        // catalog authorization must prevent the transport from seeing it.
+        responses: VecDeque::from([json_frame(serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "result": {"deleted": true}
+        }))]),
+    };
+    let mut conn = test_connection(Box::new(transport));
+    conn.name = "spy".to_string();
+    conn.tools = vec![McpTool {
+        name: "read".to_string(),
+        description: None,
+        input_schema: serde_json::json!({}),
+    }];
+    let mut pool = McpPool::new(McpConfig::default());
+    pool.connections.insert("spy".to_string(), conn);
+
+    let error = pool
+        .call_tool("mcp_spy_delete", serde_json::json!({}))
+        .await
+        .expect_err("unadvertised hidden tool must fail locally");
+    assert!(error.to_string().contains("Unknown MCP tool name"));
+    assert!(sent.lock().unwrap().is_empty(), "zero tools/call requests");
+}
+
+#[tokio::test]
+async fn mcp_pool_binds_prompts_and_resources_to_advertised_catalog() {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let transport = ScriptedValueTransport {
+        sent: Arc::clone(&sent),
+        responses: VecDeque::from([json_frame(serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "result": {"contents": []}
+        }))]),
+    };
+    let mut conn = test_connection(Box::new(transport));
+    conn.name = "catalog".to_string();
+    conn.prompts = vec![McpPrompt {
+        name: "review".to_string(),
+        description: None,
+        arguments: Vec::new(),
+    }];
+    conn.resources = vec![McpResource {
+        uri: "file:///readme".to_string(),
+        name: "readme".to_string(),
+        description: None,
+        mime_type: None,
+    }];
+    conn.resource_templates = vec![McpResourceTemplate {
+        uri_template: "repo://item/{id}".to_string(),
+        name: "item".to_string(),
+        description: None,
+        mime_type: None,
+    }];
+    let mut pool = McpPool::new(McpConfig::default());
+    pool.connections.insert("catalog".to_string(), conn);
+
+    pool.get_prompt("catalog", "hidden", serde_json::json!({}))
+        .await
+        .expect_err("hidden prompt must fail locally");
+    pool.read_resource("catalog", "file:///hidden")
+        .await
+        .expect_err("hidden literal resource must fail locally");
+    assert!(sent.lock().unwrap().is_empty());
+
+    let result = pool
+        .read_resource("catalog", "repo://item/42")
+        .await
+        .expect("exact advertised template expansion is callable");
+    assert_eq!(result, serde_json::json!({"contents": []}));
+    let sent = sent.lock().unwrap();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0]["method"], "resources/read");
+    assert_eq!(sent[0]["params"]["uri"], "repo://item/42");
+}
+
+#[tokio::test]
 async fn mcp_pool_call_tool_preserves_server_names_with_underscores() {
     let sent = Arc::new(Mutex::new(Vec::new()));
     let transport = ScriptedValueTransport {
@@ -2072,7 +3063,7 @@ async fn mcp_pool_call_tool_preserves_server_names_with_underscores() {
 }
 
 #[tokio::test]
-async fn mcp_pool_call_tool_prefers_longest_matching_server_name() {
+async fn mcp_pool_hides_and_rejects_ambiguous_model_tool_names() {
     let sent_short = Arc::new(Mutex::new(Vec::new()));
     let short_transport = ScriptedValueTransport {
         sent: Arc::clone(&sent_short),
@@ -2114,25 +3105,26 @@ async fn mcp_pool_call_tool_prefers_longest_matching_server_name() {
     pool.connections.insert("my".to_string(), short_conn);
     pool.connections.insert("my_db".to_string(), long_conn);
 
-    let result = pool
+    assert!(
+        pool.all_tools().is_empty(),
+        "ambiguous names must never be advertised to the model"
+    );
+    let error = pool
         .call_tool(
             "mcp_my_db_execute_sql",
             serde_json::json!({"query": "select 1"}),
         )
         .await
-        .unwrap();
+        .expect_err("ambiguous tool route must fail closed");
 
-    assert_eq!(result, serde_json::json!({"long": true}));
+    assert!(error.to_string().contains("Ambiguous MCP tool name"));
     assert!(
         sent_short.lock().unwrap().is_empty(),
-        "the shorter server name must not receive the tool call"
+        "neither authority may receive an ambiguous tool call"
     );
-    let sent_long = sent_long.lock().unwrap();
-    assert_eq!(sent_long[0]["method"], "tools/call");
-    assert_eq!(sent_long[0]["params"]["name"], "execute_sql");
-    assert_eq!(
-        sent_long[0]["params"]["arguments"],
-        serde_json::json!({"query": "select 1"})
+    assert!(
+        sent_long.lock().unwrap().is_empty(),
+        "neither authority may receive an ambiguous tool call"
     );
 }
 
@@ -2548,6 +3540,7 @@ async fn mcp_connection_supports_streamable_http_event_stream_responses() {
         scopes: Vec::new(),
         oauth: None,
         oauth_resource: None,
+        reviewed_plugin: None,
     };
 
     let conn = McpConnection::connect_with_policy(
@@ -2584,9 +3577,18 @@ fn mask_url_secrets_passes_through_clean_url() {
 
 #[test]
 fn redact_body_preview_masks_bearer_token() {
-    let redacted = redact_body_preview("Authorization: Bearer abc.def.ghi end");
-    assert!(redacted.contains("Bearer ***"), "redacted: {redacted}");
-    assert!(!redacted.contains("abc.def.ghi"), "leaked: {redacted}");
+    let redacted = redact_body_preview(
+        "Authorization: Bearer abc.def.ghi end; authorization: bearer second-token end",
+    );
+    assert_eq!(
+        redacted.matches("Bearer ***").count() + redacted.matches("bearer ***").count(),
+        2,
+        "redacted: {redacted}"
+    );
+    assert!(
+        !redacted.contains("abc.def.ghi") && !redacted.contains("second-token"),
+        "leaked: {redacted}"
+    );
 }
 
 #[test]
@@ -2627,13 +3629,38 @@ fn redact_proxy_userinfo_strips_password() {
 
 #[test]
 fn redact_body_preview_masks_api_key_param() {
-    let redacted = redact_body_preview("error message api_key=sk-12345&other=val");
+    let redacted = redact_body_preview("error api_key=sk-12345&other=val then TOKEN=second-secret");
     assert!(redacted.contains("api_key=***"), "redacted: {redacted}");
-    assert!(!redacted.contains("sk-12345"), "leaked: {redacted}");
+    assert!(redacted.contains("TOKEN=***"), "redacted: {redacted}");
+    assert!(
+        !redacted.contains("sk-12345") && !redacted.contains("second-secret"),
+        "leaked: {redacted}"
+    );
     assert!(
         redacted.contains("other=val"),
         "non-secret preserved: {redacted}"
     );
+}
+
+#[test]
+fn reviewed_plugin_server_errors_suppress_arbitrary_details() {
+    let auth = McpHttpAuth {
+        suppress_server_error_details: true,
+        ..Default::default()
+    };
+    assert_eq!(
+        auth.server_error_preview("arbitrary credential value"),
+        "<server details suppressed for reviewed plugin>"
+    );
+
+    let response = serde_json::json!({
+        "error": { "message": "arbitrary credential value" }
+    });
+    let error = response_result(&response, "tools/call", true)
+        .expect_err("reviewed plugin JSON-RPC error must be generic")
+        .to_string();
+    assert!(!error.contains("arbitrary credential value"));
+    assert!(error.contains("details suppressed"));
 }
 
 #[test]
@@ -2676,10 +3703,12 @@ async fn stdio_transport_shutdown_terminates_child() {
     let stdin = child.stdin.take().expect("child stdin");
     let stdout = child.stdout.take().expect("child stdout");
     let mut transport = StdioTransport {
-        child,
+        child: Arc::new(tokio::sync::Mutex::new(child)),
         stdin,
         reader: tokio::io::BufReader::new(stdout),
         stderr_tail: StderrTail::new(),
+        authority_cancel_watch: None,
+        _reviewed_launch: None,
     };
 
     // shutdown() should send SIGTERM and complete within the grace window.
@@ -2738,10 +3767,12 @@ async fn stdio_transport_recv_error_includes_stderr_tail() {
     }
 
     let mut transport = StdioTransport {
-        child,
+        child: Arc::new(tokio::sync::Mutex::new(child)),
         stdin,
         reader: tokio::io::BufReader::new(stdout),
         stderr_tail,
+        authority_cancel_watch: None,
+        _reviewed_launch: None,
     };
 
     // Give the subprocess time to write its stderr line and exit.
@@ -3229,6 +4260,60 @@ async fn streamable_http_caps_chunked_bodies_without_content_length() {
 }
 
 #[tokio::test]
+async fn error_body_excerpt_stops_at_cap_without_waiting_for_eof() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let _lock = lock_mcp_loopback_tests().await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server_cancel = tokio_util::sync::CancellationToken::new();
+    let task_cancel = server_cancel.clone();
+
+    // Deliberately omit the terminating zero-sized chunk and keep the socket
+    // open. A `.text()`-based diagnostic would wait for EOF; the bounded
+    // reader must return as soon as the first chunk reaches the cap.
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut buf = [0; 1024];
+        loop {
+            let n = socket.read(&mut buf).await.unwrap();
+            if n == 0 {
+                return;
+            }
+            request.extend_from_slice(&buf[..n]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        socket
+            .write_all(
+                b"HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n\r\n100\r\n",
+            )
+            .await
+            .unwrap();
+        socket.write_all(&[b'x'; 256]).await.unwrap();
+        socket.write_all(b"\r\n").await.unwrap();
+        socket.flush().await.unwrap();
+        task_cancel.cancelled().await;
+    });
+
+    let response = test_http_client()
+        .get(format!("http://{addr}/preview"))
+        .send()
+        .await
+        .unwrap();
+    let preview = tokio::time::timeout(Duration::from_secs(1), bounded_body_excerpt(response, 64))
+        .await
+        .expect("bounded excerpt must not wait for an attacker-controlled EOF");
+    assert_eq!(preview, format!("{}…", "x".repeat(64)));
+
+    server_cancel.cancel();
+    server.abort();
+}
+
+#[tokio::test]
 async fn streamable_http_stale_session_reconnects_and_retries_tool_call() {
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -3394,6 +4479,7 @@ async fn streamable_http_stale_session_reconnects_and_retries_tool_call() {
             scopes: Vec::new(),
             oauth: None,
             oauth_resource: None,
+            reviewed_plugin: None,
         },
     );
     let mut pool = McpPool::new(cfg);
@@ -3448,7 +4534,7 @@ async fn legacy_sse_session_expiry_is_marked_stale() {
             .unwrap();
     });
 
-    let (_sender, receiver) = mpsc::unbounded_channel();
+    let (_sender, receiver) = mpsc::channel(1);
     let sse_task = tokio::spawn(async {});
     let mut transport = SseTransport {
         client: test_http_client(),
@@ -3456,7 +4542,6 @@ async fn legacy_sse_session_expiry_is_marked_stale() {
         auth: McpHttpAuth::default(),
         endpoint_url: Some(format!("http://{addr}/messages")),
         receiver,
-        pending_messages: VecDeque::new(),
         sse_task,
     };
 
@@ -3670,6 +4755,7 @@ async fn legacy_sse_closed_stream_reconnects_and_retries_tool_call() {
             scopes: Vec::new(),
             oauth: None,
             oauth_resource: None,
+            reviewed_plugin: None,
         },
     );
     let mut pool = McpPool::new(cfg);

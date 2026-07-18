@@ -47,6 +47,9 @@ pub struct PromptSessionContext<'a> {
     /// Restrict skill discovery to Codewhale-owned roots plus explicit
     /// `skills_dir` configuration.
     pub skills_scan_codewhale_only: bool,
+    /// Immutable plugin snapshot owned by this App/Engine workspace context.
+    /// Never sourced from process-global mutable state.
+    pub plugin_registry: Option<&'a crate::plugins::PluginRegistry>,
 }
 
 impl Default for PromptSessionContext<'_> {
@@ -62,6 +65,7 @@ impl Default for PromptSessionContext<'_> {
             show_thinking: true,
             verbosity: None,
             skills_scan_codewhale_only: false,
+            plugin_registry: None,
         }
     }
 }
@@ -1150,6 +1154,7 @@ pub fn system_prompt_for_mode_with_context_and_skills(
             show_thinking: true,
             verbosity: None,
             skills_scan_codewhale_only: false,
+            plugin_registry: None,
         },
     )
 }
@@ -1263,17 +1268,19 @@ pub fn system_prompt_for_mode_with_context_skills_session_and_approval(
     );
     let skills_block = match skills_dir {
         Some(dir) => {
-            crate::skills::render_available_skills_context_for_workspace_and_dir_with_mode(
+            crate::skills::render_available_skills_context_for_workspace_and_dir_with_mode_and_plugins(
                 workspace,
                 dir,
                 skill_discovery_mode,
                 session_context.locale_tag,
+                session_context.plugin_registry,
             )
         }
-        None => crate::skills::render_available_skills_context_for_workspace_with_mode(
+        None => crate::skills::render_available_skills_context_for_workspace_with_mode_and_plugins(
             workspace,
             skill_discovery_mode,
             session_context.locale_tag,
+            session_context.plugin_registry,
         ),
     };
     if let Some(block) = skills_block {
@@ -2186,6 +2193,7 @@ mod tests {
                     show_thinking: true,
                     verbosity: None,
                     skills_scan_codewhale_only: false,
+                    plugin_registry: None,
                 },
             ),
         );
@@ -2257,6 +2265,7 @@ mod tests {
                     show_thinking: true,
                     verbosity: None,
                     skills_scan_codewhale_only: false,
+                    plugin_registry: None,
                 },
             ),
         );
@@ -2301,6 +2310,7 @@ mod tests {
                     show_thinking: false,
                     verbosity: None,
                     skills_scan_codewhale_only: false,
+                    plugin_registry: None,
                 },
             ),
         );
@@ -2355,6 +2365,7 @@ mod tests {
                     show_thinking: true,
                     verbosity: None,
                     skills_scan_codewhale_only: false,
+                    plugin_registry: None,
                 },
             ),
         );
@@ -2454,6 +2465,7 @@ mod tests {
                     show_thinking: true,
                     verbosity: None,
                     skills_scan_codewhale_only: false,
+                    plugin_registry: None,
                 },
             ));
         assert!(prompt.contains("## Environment"));
@@ -2638,6 +2650,7 @@ mod tests {
                     show_thinking: true,
                     verbosity: None,
                     skills_scan_codewhale_only: false,
+                    plugin_registry: None,
                 },
             ));
         assert!(
@@ -2667,6 +2680,7 @@ mod tests {
                     show_thinking: true,
                     verbosity: None,
                     skills_scan_codewhale_only: false,
+                    plugin_registry: None,
                 },
             ));
         let mem_at = prompt.find("User Memory").expect("user memory present");
@@ -2725,6 +2739,7 @@ mod tests {
                     show_thinking: true,
                     verbosity: None,
                     skills_scan_codewhale_only: false,
+                    plugin_registry: None,
                 },
             ));
         assert!(!prompt.contains("<project_context_pack>"));
@@ -2754,6 +2769,7 @@ mod tests {
                     show_thinking: true,
                     verbosity: None,
                     skills_scan_codewhale_only: false,
+                    plugin_registry: None,
                 },
             ));
         assert!(prompt.contains("<project_context_pack>"));
@@ -3049,6 +3065,7 @@ mod tests {
                     show_thinking: true,
                     verbosity: None,
                     skills_scan_codewhale_only: false,
+                    plugin_registry: None,
                 },
             ));
 
@@ -3084,6 +3101,7 @@ mod tests {
                     show_thinking: true,
                     verbosity: None,
                     skills_scan_codewhale_only: false,
+                    plugin_registry: None,
                 },
             ));
 
@@ -3171,6 +3189,7 @@ mod tests {
                     show_thinking: true,
                     verbosity: None,
                     skills_scan_codewhale_only: false,
+                    plugin_registry: None,
                 },
             ));
 
@@ -3752,6 +3771,7 @@ mod tests {
                     show_thinking: true,
                     verbosity: Some(" Concise "),
                     skills_scan_codewhale_only: false,
+                    plugin_registry: None,
                 },
             ),
         );
@@ -3795,6 +3815,7 @@ mod tests {
                 show_thinking: true,
                 verbosity: Some("concise"),
                 skills_scan_codewhale_only: false,
+                plugin_registry: None,
             },
         );
 
@@ -3843,6 +3864,7 @@ mod tests {
             show_thinking: true,
             verbosity: None,
             skills_scan_codewhale_only: false,
+            plugin_registry: None,
         };
         let first = system_prompt_for_mode_with_context_skills_session_and_approval(
             tmp.path(),

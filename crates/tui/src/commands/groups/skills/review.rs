@@ -21,13 +21,13 @@ fn review(app: &mut App, args: Option<&str>) -> CommandResult {
     }
 
     let skills_dir = app.skills_dir.clone();
-    let registry = SkillRegistry::discover(&skills_dir);
+    let registry = SkillRegistry::discover(&skills_dir).into_enabled();
     let mut warnings = warnings_suffix(&registry);
     let mut skill = registry.get("review").cloned();
 
     let global_dir = default_skills_dir();
     if skill.is_none() && global_dir != skills_dir {
-        let registry = SkillRegistry::discover(&global_dir);
+        let registry = SkillRegistry::discover(&global_dir).into_enabled();
         if warnings.is_empty() {
             warnings = warnings_suffix(&registry);
         } else if !registry.warnings().is_empty() {
@@ -58,6 +58,7 @@ fn review(app: &mut App, args: Option<&str>) -> CommandResult {
         content: format!("Activated skill: {}\n\n{}", skill.name, skill.description),
     });
     app.active_skill = Some(instruction);
+    app.active_skill_provenance = None;
 
     CommandResult::action(AppAction::SendMessage(target.to_string()))
 }

@@ -1,6 +1,9 @@
 @long-running
 # [LONG RUNNING] Plugin discovery and listing acceptance tests. Run with:
-# cargo test -p codewhale-tui --bin codewhale-tui --features long-running-tests plugin_e2e_acceptance -- --test-threads=1
+# cargo test -p codewhale-tui --test plugin_e2e_acceptance --features long-running-tests -- --test-threads=1
+# The same integration target also drives the real distributed binary through a
+# sealed PTY for plugin.toml show/trust/enable/revoke, reviewed Skill dispatch,
+# and reviewed stdio MCP startup/call/cancellation.
 Feature: Plugin discovery and listing
 
   Scenario: Plugin scripts are discovered from the configured plugin directory

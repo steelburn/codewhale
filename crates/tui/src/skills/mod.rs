@@ -82,6 +82,17 @@ pub struct Skill {
     /// or manually-placed skills, so callers must use this rather than
     /// reconstructing `<dir>/<name>/SKILL.md`.
     pub path: PathBuf,
+    pub source: SkillSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkillSource {
+    Native,
+    Plugin {
+        plugin_id: String,
+        plugin_name: String,
+        authority: Box<crate::plugins::types::PluginAuthority>,
+    },
 }
 
 impl Skill {
@@ -494,6 +505,7 @@ impl SkillRegistry {
                 // Filled in by `discover` after parse succeeds; default to an
                 // empty path so direct constructors (e.g. tests) compile.
                 path: PathBuf::new(),
+                source: SkillSource::Native,
             });
         }
 
@@ -515,7 +527,23 @@ impl SkillRegistry {
             localized_descriptions: HashMap::new(),
             body: content.trim().to_string(),
             path: PathBuf::new(),
+            source: SkillSource::Native,
         })
+    }
+
+    /// Parse one already-read Skill body while preserving the same name
+    /// normalization contract as filesystem discovery. Plugin discovery uses
+    /// this after checking the exact byte digest against its reviewed bundle
+    /// inventory, so parsing never has to reopen the mutable pathname.
+    pub(crate) fn parse_verified_content(
+        path: &Path,
+        content: &str,
+    ) -> std::result::Result<(Skill, Vec<String>), String> {
+        let mut registry = Self::default();
+        let mut skill = Self::parse_skill(path, content)?;
+        skill.path = path.to_path_buf();
+        registry.normalize_skill_name(&mut skill, path);
+        Ok((skill, registry.warnings))
     }
 
     /// Lookup a skill by name.
@@ -527,6 +555,37 @@ impl SkillRegistry {
     /// Return all loaded skills.
     pub fn list(&self) -> &[Skill] {
         &self.skills
+    }
+
+    /// Apply the shared exact-name activation state after filesystem/plugin
+    /// discovery. A qualified plugin Skill can be hidden independently, but
+    /// this never changes the plugin bundle's trust or MCP lifecycle.
+    #[must_use]
+    pub(crate) fn into_enabled(self) -> Self {
+        self.into_enabled_with_state(crate::skill_state::SkillStateStore::load_default())
+    }
+
+    #[must_use]
+    fn into_enabled_with_state(
+        mut self,
+        state: anyhow::Result<crate::skill_state::SkillStateStore>,
+    ) -> Self {
+        match state {
+            Ok(state) => self.skills.retain(|skill| state.is_enabled(&skill.name)),
+            Err(error) => {
+                let hidden_plugin_skills = self
+                    .skills
+                    .iter()
+                    .filter(|skill| matches!(skill.source, SkillSource::Plugin { .. }))
+                    .count();
+                self.skills
+                    .retain(|skill| matches!(skill.source, SkillSource::Native));
+                self.push_warning(format!(
+                    "Failed to read Skill activation state; native Skills remain available for recovery, but {hidden_plugin_skills} reviewed plugin Skill(s) were hidden fail-closed: {error}"
+                ));
+            }
+        }
+        self
     }
 
     /// Parse or I/O warnings encountered while discovering skills.
@@ -561,6 +620,21 @@ fn is_valid_skill_name(name: &str) -> bool {
 }
 
 fn normalize_skill_name_for_lookup(name: &str) -> String {
+    if let Some((plugin, skill)) = name.trim().split_once(':')
+        && !plugin.is_empty()
+        && !skill.is_empty()
+        && !skill.contains(':')
+    {
+        return format!(
+            "{}:{}",
+            normalize_skill_name_segment(plugin),
+            normalize_skill_name_segment(skill)
+        );
+    }
+    normalize_skill_name_segment(name)
+}
+
+fn normalize_skill_name_segment(name: &str) -> String {
     let mut out = String::new();
     let mut pending_dash = false;
 
@@ -703,7 +777,16 @@ pub fn discover_in_workspace_with_mode(
     workspace: &Path,
     mode: SkillDiscoveryMode,
 ) -> SkillRegistry {
-    discover_from_directories(skills_directories_for_mode(workspace, mode))
+    discover_in_workspace_with_mode_and_plugins(workspace, mode, None)
+}
+
+#[must_use]
+pub fn discover_in_workspace_with_mode_and_plugins(
+    workspace: &Path,
+    mode: SkillDiscoveryMode,
+    plugins: Option<&crate::plugins::PluginRegistry>,
+) -> SkillRegistry {
+    discover_from_directories_with_plugins(skills_directories_for_mode(workspace, mode), plugins)
 }
 
 /// Discover skills from the workspace search set plus the configured install
@@ -723,8 +806,18 @@ pub fn discover_for_workspace_and_dir_with_mode(
     skills_dir: &Path,
     mode: SkillDiscoveryMode,
 ) -> SkillRegistry {
+    discover_for_workspace_and_dir_with_mode_and_plugins(workspace, skills_dir, mode, None)
+}
+
+#[must_use]
+pub fn discover_for_workspace_and_dir_with_mode_and_plugins(
+    workspace: &Path,
+    skills_dir: &Path,
+    mode: SkillDiscoveryMode,
+    plugins: Option<&crate::plugins::PluginRegistry>,
+) -> SkillRegistry {
     let dirs = skill_directories_for_workspace_and_dir(workspace, skills_dir, mode);
-    discover_from_directories(dirs)
+    discover_from_directories_with_plugins(dirs, plugins)
 }
 
 #[must_use]
@@ -764,7 +857,15 @@ fn paths_refer_to_same_dir(left: &Path, right: &Path) -> bool {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn discover_from_directories(dirs: impl IntoIterator<Item = PathBuf>) -> SkillRegistry {
+    discover_from_directories_with_plugins(dirs, None)
+}
+
+pub(crate) fn discover_from_directories_with_plugins(
+    dirs: impl IntoIterator<Item = PathBuf>,
+    plugins: Option<&crate::plugins::PluginRegistry>,
+) -> SkillRegistry {
     let mut merged = SkillRegistry::default();
     for dir in dirs {
         let registry = SkillRegistry::discover(&dir);
@@ -784,7 +885,77 @@ pub(crate) fn discover_from_directories(dirs: impl IntoIterator<Item = PathBuf>)
             merged.warnings.push(warning);
         }
     }
+    if let Some(plugins) = plugins {
+        merge_active_plugin_skills(&mut merged, plugins);
+    }
     merged
+}
+
+fn merge_active_plugin_skills(
+    registry: &mut SkillRegistry,
+    plugins: &crate::plugins::PluginRegistry,
+) {
+    let Some(state_path) = plugins.state_path().map(Path::to_path_buf) else {
+        return;
+    };
+    let plugins = plugins
+        .list()
+        .into_iter()
+        .filter_map(|plugin| {
+            plugin
+                .authority(state_path.clone(), plugins.workspace().to_path_buf())
+                .map(|authority| (plugin.clone(), authority))
+        })
+        .collect::<Vec<_>>();
+    merge_plugin_skills_from_plugins(registry, plugins);
+}
+
+fn merge_plugin_skills_from_plugins(
+    registry: &mut SkillRegistry,
+    plugins: impl IntoIterator<
+        Item = (
+            crate::plugins::types::LoadedPlugin,
+            crate::plugins::types::PluginAuthority,
+        ),
+    >,
+) {
+    for (plugin, authority) in plugins {
+        // Keep the adapter independently fail-closed for headless callers.
+        if !plugin.active()
+            || crate::plugins::registry::verify_plugin_authority(&authority).is_err()
+        {
+            continue;
+        }
+        let plugin_id = plugin.id.to_string();
+        let plugin_name = plugin.name().to_string();
+        for snapshot in plugin.skill_snapshots {
+            let qualified_name = format!("{plugin_name}:{}", snapshot.name);
+            if let Some(existing) = registry
+                .skills
+                .iter()
+                .find(|skill| skill.name == qualified_name)
+            {
+                registry.push_warning(format!(
+                    "Plugin skill `{qualified_name}` at {} is shadowed by {}.",
+                    snapshot.path.display(),
+                    existing.path.display()
+                ));
+                continue;
+            }
+            registry.skills.push(Skill {
+                name: qualified_name,
+                description: snapshot.description,
+                localized_descriptions: snapshot.localized_descriptions,
+                body: snapshot.body,
+                path: snapshot.path,
+                source: SkillSource::Plugin {
+                    plugin_id: plugin_id.clone(),
+                    plugin_name: plugin_name.clone(),
+                    authority: Box::new(authority.clone()),
+                },
+            });
+        }
+    }
 }
 
 #[cfg(test)]
@@ -808,9 +979,22 @@ pub(crate) fn discover_for_workspace_and_dir_with_home_and_mode(
     home_dir: Option<&Path>,
     mode: SkillDiscoveryMode,
 ) -> SkillRegistry {
+    discover_for_workspace_and_dir_with_home_and_mode_and_plugins(
+        workspace, skills_dir, home_dir, mode, None,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn discover_for_workspace_and_dir_with_home_and_mode_and_plugins(
+    workspace: &Path,
+    skills_dir: &Path,
+    home_dir: Option<&Path>,
+    mode: SkillDiscoveryMode,
+    plugins: Option<&crate::plugins::PluginRegistry>,
+) -> SkillRegistry {
     let mut dirs = skills_directories_with_home_and_mode(workspace, home_dir, mode);
     insert_configured_skills_dir(&mut dirs, workspace, skills_dir);
-    discover_from_directories(dirs)
+    discover_from_directories_with_plugins(dirs, plugins)
 }
 
 /// Render the system-prompt skills block from every workspace
@@ -824,12 +1008,13 @@ pub fn render_available_skills_context_for_workspace(workspace: &Path) -> Option
 }
 
 #[must_use]
-pub fn render_available_skills_context_for_workspace_with_mode(
+pub fn render_available_skills_context_for_workspace_with_mode_and_plugins(
     workspace: &Path,
     mode: SkillDiscoveryMode,
     locale: &str,
+    plugins: Option<&crate::plugins::PluginRegistry>,
 ) -> Option<String> {
-    let registry = discover_in_workspace_with_mode(workspace, mode);
+    let registry = discover_in_workspace_with_mode_and_plugins(workspace, mode, plugins);
     render_skills_block(&registry, locale)
 }
 
@@ -869,7 +1054,23 @@ pub fn render_available_skills_context_for_workspace_and_dir_with_mode(
     mode: SkillDiscoveryMode,
     locale: &str,
 ) -> Option<String> {
-    let registry = discover_for_workspace_and_dir_with_mode(workspace, skills_dir, mode);
+    let registry =
+        discover_for_workspace_and_dir_with_mode_and_plugins(workspace, skills_dir, mode, None)
+            .into_enabled();
+    render_skills_block(&registry, locale)
+}
+
+#[must_use]
+pub fn render_available_skills_context_for_workspace_and_dir_with_mode_and_plugins(
+    workspace: &Path,
+    skills_dir: &Path,
+    mode: SkillDiscoveryMode,
+    locale: &str,
+    plugins: Option<&crate::plugins::PluginRegistry>,
+) -> Option<String> {
+    let registry =
+        discover_for_workspace_and_dir_with_mode_and_plugins(workspace, skills_dir, mode, plugins)
+            .into_enabled();
     render_skills_block(&registry, locale)
 }
 
@@ -883,30 +1084,33 @@ fn render_skills_block(registry: &SkillRegistry, locale: &str) -> Option<String>
     out.push_str(
         "A skill is a set of local instructions stored in a `SKILL.md` file. \
 Below is the list of skills available in this session. Each entry includes a \
-name, description, and file path so you can open the source for full \
-instructions when using a specific skill.\n\n",
+name, description, and source locator. Native skills expose a file path; \
+reviewed plugin snapshots must be opened with `load_skill`.\n\n",
     );
     out.push_str("### Available skills\n");
 
     let mut omitted = 0usize;
     for skill in registry.list() {
-        // Use the real on-disk path captured at discovery — the directory
-        // name can differ from the frontmatter `name` for community
-        // installs, in which case `<dir>/<name>/SKILL.md` would not exist
-        // and the model would fail to open it.
+        // Native skills expose the real on-disk path captured at discovery.
+        // Plugin skills expose only their reviewed snapshot identity so the
+        // model cannot bypass the content-bound trust receipt via a mutable
+        // source path.
         let description = truncate_for_prompt(
             skill.description_for_locale(locale),
             MAX_SKILL_DESCRIPTION_CHARS,
         );
+        let source = match &skill.source {
+            SkillSource::Native => format!("file: {}", skill.path.display()),
+            SkillSource::Plugin {
+                plugin_id,
+                plugin_name,
+                ..
+            } => format!("reviewed plugin snapshot: {plugin_name} ({plugin_id}); use load_skill"),
+        };
         let line = if description.is_empty() {
-            format!("- {}: (file: {})\n", skill.name, skill.path.display())
+            format!("- {}: ({source})\n", skill.name)
         } else {
-            format!(
-                "- {}: {} (file: {})\n",
-                skill.name,
-                description,
-                skill.path.display()
-            )
+            format!("- {}: {} ({source})\n", skill.name, description)
         };
 
         if out.chars().count() + line.chars().count() > MAX_AVAILABLE_SKILLS_CHARS {
@@ -933,7 +1137,7 @@ instructions when using a specific skill.\n\n",
 
     out.push_str(
         "\n### How to use skills\n\
-- Skill bodies live on disk at the listed paths. When a skill is relevant, open only that skill's `SKILL.md` and the specific companion files it references.\n\
+- Native skill bodies live on disk at the listed paths. For a reviewed plugin snapshot, use `load_skill` and do not read its mutable source path directly.\n\
 - Trigger rules: use a skill when the user names it (`$SkillName`, `/skill <name>`, or plain text) or the task clearly matches its description. Do not carry skills across turns unless re-mentioned.\n\
 - Missing/blocked: if a named skill is missing or cannot be read, say so briefly and continue with the best fallback.\n\
 - Safety: do not execute scripts from a community skill unless the user explicitly asks or the skill has been trusted for script use.\n",
@@ -1127,6 +1331,7 @@ mod tests {
                 .join("skills")
                 .join("workspace-priority")
                 .join("SKILL.md"),
+            source: super::SkillSource::Native,
         });
 
         let big_desc = "y".repeat(super::MAX_SKILL_DESCRIPTION_CHARS - 20);
@@ -1142,6 +1347,7 @@ mod tests {
                     .join("skills")
                     .join(format!("aaa-global-{i:03}"))
                     .join("SKILL.md"),
+                source: super::SkillSource::Native,
             });
         }
 
@@ -1195,6 +1401,7 @@ body";
             localized_descriptions: localized,
             body: String::new(),
             path: std::path::PathBuf::new(),
+            source: super::SkillSource::Native,
         };
 
         assert_eq!(skill.description_for_locale("zh"), "中文描述"); // exact
@@ -1226,6 +1433,7 @@ body";
             localized_descriptions: localized,
             body: String::new(),
             path: std::path::PathBuf::new(),
+            source: super::SkillSource::Native,
         };
         // Exact Traditional key wins for a Traditional session.
         assert_eq!(skill.description_for_locale("zh-Hant"), "繁體描述");
@@ -1242,6 +1450,7 @@ body";
             localized_descriptions: std::collections::HashMap::new(),
             body: String::new(),
             path: std::path::PathBuf::new(),
+            source: super::SkillSource::Native,
         };
         assert_eq!(skill.description_for_locale("zh"), "only english");
     }
@@ -1257,6 +1466,7 @@ body";
             localized_descriptions: localized,
             body: "body".to_string(),
             path: std::path::PathBuf::from("/skills/compress/SKILL.md"),
+            source: super::SkillSource::Native,
         });
 
         let zh = super::render_skills_block(&registry, "zh-Hans").expect("zh block");
@@ -2213,6 +2423,89 @@ body";
         assert_eq!(
             skill.description,
             "See also:   the config file   the env var"
+        );
+    }
+
+    #[test]
+    fn plugin_skills_are_qualified_and_denied_until_trusted_and_enabled() {
+        let tmp = TempDir::new().unwrap();
+        let plugin_root = tmp.path().join("plugins/demo");
+        std::fs::create_dir_all(plugin_root.join("skills/hello-world")).unwrap();
+        std::fs::write(
+            plugin_root.join("plugin.toml"),
+            "schema_version = 1\n[plugin]\nname = \"demo\"\nversion = \"1.0.0\"\n[skills]\npath = \"skills\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            plugin_root.join("skills/hello-world/SKILL.md"),
+            "---\nname: hello-world\ndescription: hello\n---\nbody\n",
+        )
+        .unwrap();
+        let config = crate::plugins::discovery::DiscoveryConfig {
+            workspace: tmp.path().join("workspace"),
+            user_plugins_dir: tmp.path().join("plugins"),
+            workspace_plugins_dir: tmp.path().join("workspace-plugins"),
+            builtin_plugin_dirs: Vec::new(),
+            state_path: tmp.path().join("plugin-state/state.json"),
+        };
+        let mut plugins = crate::plugins::discovery::discover_with_config(&config);
+
+        let mut registry = super::SkillRegistry::default();
+        super::merge_active_plugin_skills(&mut registry, &plugins);
+        assert!(registry.get("demo:hello-world").is_none());
+
+        plugins.trust("demo").unwrap();
+        super::merge_active_plugin_skills(&mut registry, &plugins);
+        assert!(registry.get("demo:hello-world").is_none());
+
+        plugins.enable("demo").unwrap();
+        super::merge_active_plugin_skills(&mut registry, &plugins);
+        let skill = registry
+            .get("Demo:Hello_World")
+            .expect("qualified lookup should normalize each namespace segment");
+        assert_eq!(skill.name, "demo:hello-world");
+        assert!(matches!(
+            skill.source,
+            super::SkillSource::Plugin { ref plugin_name, .. } if plugin_name == "demo"
+        ));
+        let rendered = super::render_skills_block(&registry, "en").unwrap();
+        assert!(rendered.contains("reviewed plugin snapshot: demo"));
+        assert!(rendered.contains("use load_skill"));
+        assert!(
+            !rendered.contains(&plugin_root.display().to_string()),
+            "model prompt must not expose mutable plugin files after snapshot review"
+        );
+
+        let mut fail_closed_input = registry.clone();
+        fail_closed_input.skills.push(super::Skill {
+            name: "native-recovery".to_string(),
+            description: "native recovery skill".to_string(),
+            localized_descriptions: std::collections::HashMap::new(),
+            body: "recovery".to_string(),
+            path: tmp.path().join("native/SKILL.md"),
+            source: super::SkillSource::Native,
+        });
+        let fail_closed = fail_closed_input.into_enabled_with_state(Err(anyhow::anyhow!(
+            "injected activation-state read failure"
+        )));
+        assert!(fail_closed.get("native-recovery").is_some());
+        assert!(
+            fail_closed.get("demo:hello-world").is_none(),
+            "reviewed plugin Skills must not fail open when activation state is unreadable"
+        );
+        assert!(
+            fail_closed
+                .warnings()
+                .iter()
+                .any(|warning| warning.contains("hidden fail-closed"))
+        );
+
+        std::fs::remove_file(config.state_path.with_file_name("state.json.lock")).unwrap();
+        let mut denied = super::SkillRegistry::default();
+        super::merge_active_plugin_skills(&mut denied, &plugins);
+        assert!(
+            denied.get("demo:hello-world").is_none(),
+            "a missing authority lock must remove plugin instructions from the prompt catalogue"
         );
     }
 }

@@ -295,6 +295,10 @@ pub struct EngineConfig {
     /// Restrict skill discovery to CodeWhale-owned roots plus explicit
     /// `skills_dir` configuration.
     pub skills_scan_codewhale_only: bool,
+    /// Immutable plugin authority snapshot scoped to `workspace`. Normal App
+    /// hosts provide this explicitly; headless/embed callers that leave it
+    /// unset receive a fresh workspace-specific snapshot in [`Engine::new`].
+    pub plugin_registry: Option<Arc<crate::plugins::PluginRegistry>>,
     /// Sources injected as `<instructions source="…">` blocks in the system
     /// prompt (#454). Each entry is either a disk path (read at render time)
     /// or an inline string. Loaded in declared order from the user's
@@ -463,6 +467,7 @@ impl Default for EngineConfig {
             mcp_config_path: PathBuf::from("mcp.json"),
             skills_dir: crate::skills::default_skills_dir(),
             skills_scan_codewhale_only: false,
+            plugin_registry: None,
             instructions: Vec::new(),
             project_context_pack_enabled: true,
             translation_enabled: false,
@@ -622,6 +627,8 @@ pub struct Engine {
     /// transient `ToolContext` (#4475).
     file_read_tracker: SharedFileReadTracker,
     mcp_pool: Option<Arc<AsyncMutex<McpPool>>>,
+    /// Workspace-scoped immutable plugin catalogue and authority receipts.
+    plugin_registry: Arc<crate::plugins::PluginRegistry>,
     api_provider: ApiProvider,
     /// Exact configured route key. Named custom providers share the `Custom`
     /// enum, so the enum alone cannot prove that the active client is current.
@@ -1004,6 +1011,12 @@ impl Engine {
         let cancel_reason: Arc<StdMutex<Option<CancelReason>>> = Arc::new(StdMutex::new(None));
         let shared_paused = Arc::new(StdMutex::new(false));
         let tool_exec_lock = Arc::new(RwLock::new(()));
+        let plugin_registry = config
+            .plugin_registry
+            .as_ref()
+            .filter(|registry| registry.workspace() == config.workspace)
+            .cloned()
+            .unwrap_or_else(|| Arc::new(crate::plugins::PluginRegistry::empty(&config.workspace)));
 
         // Create clients for both providers
         let (deepseek_client, deepseek_client_error) = match DeepSeekClient::new(api_config) {
@@ -1066,6 +1079,7 @@ impl Engine {
                     show_thinking: config.show_thinking,
                     verbosity: config.verbosity.as_deref(),
                     skills_scan_codewhale_only: config.skills_scan_codewhale_only,
+                    plugin_registry: Some(plugin_registry.as_ref()),
                 },
             );
         let stable_prompt = Some(system_prompt);
@@ -1174,6 +1188,7 @@ impl Engine {
             shell_manager,
             file_read_tracker,
             mcp_pool: None,
+            plugin_registry,
             api_provider,
             api_provider_identity,
             api_provider_id,
@@ -1937,6 +1952,8 @@ impl Engine {
                         workspace,
                         mode,
                     } => {
+                        let plugin_workspace_changed =
+                            self.plugin_registry.workspace() != workspace.as_path();
                         if let Some(session_id) = session_id {
                             self.session.id = session_id;
                         } else if messages.is_empty() && system_prompt.is_none() {
@@ -1959,6 +1976,14 @@ impl Engine {
                         self.current_mode = mode;
                         self.config.model.clone_from(&self.session.model);
                         self.config.workspace = workspace.clone();
+                        if plugin_workspace_changed {
+                            self.plugin_registry =
+                                self.plugin_registry.rediscover_for_workspace(&workspace);
+                            self.config.plugin_registry = Some(Arc::clone(&self.plugin_registry));
+                            // A pool may contain plugin servers and authority
+                            // receipts from the previous workspace snapshot.
+                            self.mcp_pool = None;
+                        }
                         let ctx =
                             crate::project_context::load_project_context_with_parents(&workspace);
                         self.session.project_context = if ctx.has_instructions() {
@@ -3493,6 +3518,7 @@ impl Engine {
             self.config.skills_dir.clone(),
             self.config.skills_scan_codewhale_only,
         )
+        .with_plugin_registry(Arc::clone(&self.plugin_registry))
         .with_session_objects(crate::rlm::session::SessionObjectSnapshot::new(
             self.session.id.clone(),
             self.session.model.clone(),
@@ -3554,9 +3580,10 @@ impl Engine {
         if let Some(pool) = self.mcp_pool.as_ref() {
             return Ok(Arc::clone(pool));
         }
-        let mut pool = McpPool::from_config_path_with_workspace(
+        let mut pool = McpPool::from_config_path_with_workspace_and_plugins(
             &self.session.mcp_config_path,
             &self.session.workspace,
+            Arc::clone(&self.plugin_registry),
         )
         .unwrap_or_else(|e| {
             tracing::debug!("No MCP config: {e}");
@@ -3731,6 +3758,7 @@ impl Engine {
                 show_thinking: self.config.show_thinking,
                 verbosity: self.config.verbosity.as_deref(),
                 skills_scan_codewhale_only: self.config.skills_scan_codewhale_only,
+                plugin_registry: Some(self.plugin_registry.as_ref()),
             },
         );
         let mut stable_prompt =

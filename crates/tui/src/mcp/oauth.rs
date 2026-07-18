@@ -148,6 +148,9 @@ impl McpOAuthRuntime {
         server: &McpServerConfig,
         default_headers: HeaderMap,
     ) -> Result<Option<Self>> {
+        if server.reviewed_plugin.is_some() {
+            return Ok(None);
+        }
         let Some(url) = server.url.as_deref() else {
             return Ok(None);
         };
@@ -293,7 +296,7 @@ impl McpOAuthRuntime {
 }
 
 pub async fn auth_status_for_server(name: &str, server: &McpServerConfig) -> McpAuthStatus {
-    if !server.is_enabled() || server.url.is_none() {
+    if server.reviewed_plugin.is_some() || !server.is_enabled() || server.url.is_none() {
         return McpAuthStatus::Unsupported;
     }
     if server_has_manual_authorization(server) {
@@ -329,6 +332,9 @@ pub async fn auth_status_for_server(name: &str, server: &McpServerConfig) -> Mcp
 }
 
 pub async fn oauth_login_support(server: &McpServerConfig) -> Result<Option<McpOAuthDiscovery>> {
+    if server.reviewed_plugin.is_some() {
+        return Ok(None);
+    }
     let Some(url) = server.url.as_deref() else {
         return Ok(None);
     };
@@ -428,6 +434,11 @@ pub async fn perform_oauth_login_for_server_with_cancel(
     callback_url: Option<&str>,
     cancellation_token: CancellationToken,
 ) -> Result<()> {
+    if server.reviewed_plugin.is_some() {
+        bail!(
+            "OAuth is disabled for plugin-contributed MCP servers in v0.9.1; use a reviewed environment-backed header or bearer token"
+        );
+    }
     run_cancellable_oauth(
         &cancellation_token,
         perform_oauth_login_for_server_inner(
@@ -542,6 +553,9 @@ async fn perform_oauth_login(
 }
 
 pub fn delete_oauth_tokens_for_server(name: &str, server: &McpServerConfig) -> Result<bool> {
+    if server.reviewed_plugin.is_some() {
+        bail!("OAuth storage is disabled for plugin-contributed MCP servers in v0.9.1");
+    }
     let Some(url) = server.url.as_deref() else {
         bail!("OAuth logout is only supported for URL-based MCP servers");
     };

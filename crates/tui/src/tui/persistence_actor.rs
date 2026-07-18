@@ -59,7 +59,7 @@ pub enum PersistRequest {
 #[derive(Debug)]
 enum PendingOfflineQueue {
     Save {
-        state: OfflineQueueState,
+        state: Box<OfflineQueueState>,
         session_id: Option<String>,
     },
     Clear,
@@ -147,8 +147,10 @@ pub fn spawn_persistence_actor(
                             latest_sessions.insert(session.metadata.id.clone(), session);
                         }
                         PersistRequest::OfflineQueue { state, session_id } => {
-                            latest_offline_queue =
-                                Some(PendingOfflineQueue::Save { state, session_id });
+                            latest_offline_queue = Some(PendingOfflineQueue::Save {
+                                state: Box::new(state),
+                                session_id,
+                            });
                         }
                         PersistRequest::ClearOfflineQueue => {
                             latest_offline_queue = Some(PendingOfflineQueue::Clear);
@@ -196,8 +198,10 @@ pub fn spawn_persistence_actor(
                         latest_sessions.insert(session.metadata.id.clone(), session);
                     }
                     Some(PersistRequest::OfflineQueue { state, session_id }) => {
-                        latest_offline_queue =
-                            Some(PendingOfflineQueue::Save { state, session_id });
+                        latest_offline_queue = Some(PendingOfflineQueue::Save {
+                            state: Box::new(state),
+                            session_id,
+                        });
                     }
                     Some(PersistRequest::ClearOfflineQueue) => {
                         latest_offline_queue = Some(PendingOfflineQueue::Clear);
@@ -301,6 +305,7 @@ mod tests {
             messages: vec![QueuedSessionMessage {
                 display: "queued from enter".to_string(),
                 skill_instruction: None,
+                skill_provenance: None,
             }],
             ..OfflineQueueState::default()
         };

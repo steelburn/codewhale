@@ -3,11 +3,11 @@
 use std::fmt::Write;
 
 use crate::network_policy::NetworkPolicy;
-use crate::skills::SkillRegistry;
 use crate::skills::install::{
     self, DEFAULT_MAX_SIZE_BYTES, DEFAULT_REGISTRY_URL, InstallOutcome, InstallSource,
     RegistryFetchResult, SkillSyncOutcome, SyncResult, UpdateResult,
 };
+use crate::skills::{SkillRegistry, SkillSource};
 use crate::tui::app::{App, AppAction};
 use crate::tui::history::HistoryCell;
 
@@ -21,33 +21,39 @@ thread_local! {
 
 #[cfg(not(test))]
 fn discover_visible_skills(app: &App) -> SkillRegistry {
-    crate::skills::discover_for_workspace_and_dir_with_mode(
+    crate::skills::discover_for_workspace_and_dir_with_mode_and_plugins(
         &app.workspace,
         &app.skills_dir,
         crate::skills::SkillDiscoveryMode::from_codewhale_only(app.skills_scan_codewhale_only),
+        Some(app.plugin_registry.as_ref()),
     )
+    .into_enabled()
 }
 
 #[cfg(test)]
 fn discover_visible_skills(app: &App) -> SkillRegistry {
     let mode =
         crate::skills::SkillDiscoveryMode::from_codewhale_only(app.skills_scan_codewhale_only);
-    TEST_HOME_DIR.with(|home| {
-        if let Some(home) = home.borrow().as_deref() {
-            crate::skills::discover_for_workspace_and_dir_with_home_and_mode(
-                &app.workspace,
-                &app.skills_dir,
-                Some(home),
-                mode,
-            )
-        } else {
-            crate::skills::discover_for_workspace_and_dir_with_mode(
-                &app.workspace,
-                &app.skills_dir,
-                mode,
-            )
-        }
-    })
+    TEST_HOME_DIR
+        .with(|home| {
+            if let Some(home) = home.borrow().as_deref() {
+                crate::skills::discover_for_workspace_and_dir_with_home_and_mode_and_plugins(
+                    &app.workspace,
+                    &app.skills_dir,
+                    Some(home),
+                    mode,
+                    Some(app.plugin_registry.as_ref()),
+                )
+            } else {
+                crate::skills::discover_for_workspace_and_dir_with_mode_and_plugins(
+                    &app.workspace,
+                    &app.skills_dir,
+                    mode,
+                    Some(app.plugin_registry.as_ref()),
+                )
+            }
+        })
+        .into_enabled()
 }
 
 fn render_skill_warnings(registry: &SkillRegistry) -> String {
@@ -80,6 +86,17 @@ fn visible_skill_directories(app: &App) -> Vec<std::path::PathBuf> {
         &app.skills_dir,
         skill_discovery_mode(app),
     )
+}
+
+fn skill_source_label(source: &SkillSource) -> String {
+    match source {
+        SkillSource::Native => "native".to_string(),
+        SkillSource::Plugin {
+            plugin_id,
+            plugin_name,
+            ..
+        } => format!("reviewed plugin snapshot {plugin_name} ({plugin_id})"),
+    }
 }
 
 fn inspect_skills(app: &mut App) -> CommandResult {
@@ -121,7 +138,10 @@ fn inspect_skills(app: &mut App) -> CommandResult {
             } else {
                 let _ = writeln!(output, "  - {} — {}", skill.name, skill.description);
             }
-            let _ = writeln!(output, "    path: {}", skill.path.display());
+            let _ = writeln!(output, "    source: {}", skill_source_label(&skill.source));
+            if matches!(skill.source, SkillSource::Native) {
+                let _ = writeln!(output, "    path: {}", skill.path.display());
+            }
         }
     }
 
@@ -345,6 +365,18 @@ fn activate_skill(app: &mut App, name: &str) -> CommandResult {
     let registry = discover_visible_skills(app);
 
     if let Some(skill) = registry.get(name) {
+        let plugin_provenance = match &skill.source {
+            SkillSource::Native => None,
+            SkillSource::Plugin { authority, .. } => {
+                if let Err(reason) = crate::plugins::registry::verify_plugin_authority(authority) {
+                    return CommandResult::error(format!(
+                        "Plugin skill '{}' is no longer active: {reason}",
+                        skill.name
+                    ));
+                }
+                Some(authority.as_ref().clone())
+            }
+        };
         let instruction = format!(
             "You are now using a skill. Follow these instructions:\n\n# Skill: {}\n\n{}\n\n---\n\nNow respond to the user's request following the above skill instructions.",
             skill.name, skill.body
@@ -355,6 +387,7 @@ fn activate_skill(app: &mut App, name: &str) -> CommandResult {
         });
 
         app.active_skill = Some(instruction);
+        app.active_skill_provenance = plugin_provenance;
 
         CommandResult::message(format!(
             "Skill '{}' activated.\n\nDescription: {}\n\nType your request and the skill instructions will be applied.",

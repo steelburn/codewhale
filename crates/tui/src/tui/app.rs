@@ -1834,8 +1834,15 @@ pub struct App {
     /// Last concrete thinking tier chosen while `reasoning_effort` is auto.
     pub last_effective_reasoning_effort: Option<ReasoningEffort>,
     pub workspace: PathBuf,
+    /// Immutable plugin catalogue scoped to this App's effective workspace.
+    pub plugin_registry: std::sync::Arc<crate::plugins::PluginRegistry>,
     pub config_path: Option<PathBuf>,
     pub config_profile: Option<String>,
+    /// Legacy executable plugin-tool directory resolved from the already
+    /// loaded configuration. Slash-command inventory must not reload the full
+    /// config (and thereby re-read credential-bearing fields) merely to find
+    /// this path.
+    pub legacy_plugin_tools_dir: Option<PathBuf>,
     pub mcp_config_path: PathBuf,
     pub skills_dir: PathBuf,
     pub skills_scan_codewhale_only: bool,
@@ -2150,6 +2157,9 @@ pub struct App {
     pub tool_log: Vec<String>,
     /// Active skill to apply to next user message
     pub active_skill: Option<String>,
+    /// Content-bound plugin authority carried with `active_skill`, when the
+    /// selected skill came from a reviewed plugin bundle.
+    pub active_skill_provenance: Option<crate::plugins::types::PluginAuthority>,
     /// Cached (name, description) pairs from the skill registry.
     /// Populated once at startup and refreshed on install/uninstall so
     /// the slash menu can show skills without filesystem I/O on every keystroke.
@@ -2420,6 +2430,7 @@ pub struct App {
 pub struct QueuedMessage {
     pub display: String,
     pub skill_instruction: Option<String>,
+    pub skill_provenance: Option<crate::plugins::types::PluginAuthority>,
 }
 
 /// How a freshly-typed user input should be sent.
@@ -2474,7 +2485,17 @@ impl QueuedMessage {
         Self {
             display,
             skill_instruction,
+            skill_provenance: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_skill_provenance(
+        mut self,
+        provenance: Option<crate::plugins::types::PluginAuthority>,
+    ) -> Self {
+        self.skill_provenance = provenance;
+        self
     }
 
     #[allow(dead_code)] // Tests and queue helpers use the display-only form; send path resolves @mentions.
@@ -2579,8 +2600,22 @@ impl App {
         tr(self.ui_locale, id)
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[cfg(test)]
     pub fn new(options: TuiOptions, config: &Config) -> Self {
+        let workspace = options.workspace.clone();
+        Self::new_with_plugin_registry(
+            options,
+            config,
+            std::sync::Arc::new(crate::plugins::PluginRegistry::empty(&workspace)),
+        )
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub fn new_with_plugin_registry(
+        options: TuiOptions,
+        config: &Config,
+        plugin_registry: std::sync::Arc<crate::plugins::PluginRegistry>,
+    ) -> Self {
         let TuiOptions {
             model,
             workspace,
@@ -2965,8 +3000,12 @@ impl App {
 
         let skills_scan_codewhale_only = config.skills_config().scan_codewhale_only();
         let skills_dir = resolve_skills_dir(&workspace, &global_skills_dir, config);
-        let cached_skills =
-            Self::discover_cached_skills(&workspace, &skills_dir, skills_scan_codewhale_only);
+        let cached_skills = Self::discover_cached_skills(
+            &workspace,
+            &skills_dir,
+            skills_scan_codewhale_only,
+            plugin_registry.as_ref(),
+        );
 
         let input_history = crate::composer_history::load_history();
         let mention_cwd = std::env::current_dir().ok();
@@ -2986,10 +3025,13 @@ impl App {
                 }
                 _ => (String::new(), 0, false),
             };
-        let mcp_configured_count =
-            crate::mcp::load_config_with_workspace(&mcp_config_path, &workspace)
-                .map(|cfg| cfg.servers.len())
-                .unwrap_or(0);
+        let mcp_configured_count = crate::mcp::load_config_with_workspace_and_plugins(
+            &mcp_config_path,
+            &workspace,
+            plugin_registry.as_ref(),
+        )
+        .map(|cfg| cfg.servers.len())
+        .unwrap_or(0);
         let mut hotbar_actions = HotbarActionRegistry::with_configured_routes(
             config,
             provider,
@@ -3081,8 +3123,14 @@ impl App {
             reasoning_effort_explicit,
             last_effective_reasoning_effort: None,
             workspace,
+            plugin_registry,
             config_path,
             config_profile,
+            legacy_plugin_tools_dir: config
+                .tools
+                .as_ref()
+                .and_then(|tools| tools.plugin_dir.as_deref())
+                .map(PathBuf::from),
             mcp_config_path: mcp_config_path.clone(),
             skills_dir,
             skills_scan_codewhale_only,
@@ -3225,6 +3273,7 @@ impl App {
             mcp_restart_required: false,
             tool_log: Vec::new(),
             active_skill: None,
+            active_skill_provenance: None,
             cached_skills,
             tool_cells: HashMap::new(),
             tool_details_by_cell: HashMap::new(),
@@ -3319,12 +3368,15 @@ impl App {
         workspace: &std::path::Path,
         skills_dir: &std::path::Path,
         scan_codewhale_only: bool,
+        plugins: &crate::plugins::PluginRegistry,
     ) -> Vec<(String, String)> {
-        crate::skills::discover_for_workspace_and_dir_with_mode(
+        crate::skills::discover_for_workspace_and_dir_with_mode_and_plugins(
             workspace,
             skills_dir,
             crate::skills::SkillDiscoveryMode::from_codewhale_only(scan_codewhale_only),
+            Some(plugins),
         )
+        .into_enabled()
         .list()
         .iter()
         .map(|s| (s.name.clone(), s.description.clone()))
@@ -3333,11 +3385,14 @@ impl App {
 
     pub fn refresh_skill_cache(&mut self) {
         let skills_dir = self.skills_dir.clone();
-        self.cached_skills = Self::discover_cached_skills(
+        let cached_skills = Self::discover_cached_skills(
             &self.workspace,
             &skills_dir,
             self.skills_scan_codewhale_only,
+            self.plugin_registry.as_ref(),
         );
+        self.hotbar_actions.replace_skills(&cached_skills);
+        self.cached_skills = cached_skills;
     }
 
     pub fn submit_api_key(&mut self) -> Result<SavedCredential, ApiKeyError> {
@@ -7033,6 +7088,9 @@ pub enum AppAction {
     ApprovalPolicyPersisted {
         policy: Option<String>,
     },
+    /// Rebuild the engine's Skill/MCP catalogue from the App's newly replaced
+    /// immutable plugin snapshot after trust, enable, revoke, or reload.
+    PluginRegistryChanged,
     /// Open the `/statusline` multi-select picker for footer items.
     OpenStatusPicker,
     /// Open the `/feedback` picker for GitHub issue/security destinations.

@@ -10,7 +10,7 @@
 //! would blow the prompt budget the moment a user has half a dozen
 //! skills installed.
 //!
-//! Two paths exist for the model to actually read a skill:
+//! Two paths exist for the model to actually read a native skill:
 //!
 //! 1. The existing progressive-disclosure pattern: model spots a
 //!    skill in the catalogue, calls `read_file <path>` from the
@@ -20,16 +20,16 @@
 //!    directory so the model sees the companion resources without
 //!    a separate `list_dir`.
 //!
-//! Both are valid; the tool is the higher-level affordance and
-//! avoids the two-call dance for skills that ship with multiple
-//! resource files.
+//! Both are valid for native skills. Reviewed plugin skills are exposed only
+//! through this tool's content-bound in-memory snapshot; their mutable source
+//! paths and companion files are deliberately not returned.
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use crate::skills::{
-    Skill, SkillDiscoveryMode, discover_for_workspace_and_dir_with_mode,
-    discover_in_workspace_with_mode, skill_directories_for_workspace_and_dir,
+    Skill, SkillDiscoveryMode, SkillSource, discover_for_workspace_and_dir_with_mode_and_plugins,
+    discover_in_workspace_with_mode_and_plugins, skill_directories_for_workspace_and_dir,
     skills_directories_for_mode,
 };
 
@@ -98,10 +98,20 @@ impl ToolSpec for LoadSkillTool {
         let discovery_mode =
             SkillDiscoveryMode::from_codewhale_only(context.skills_scan_codewhale_only);
         let registry = if let Some(skills_dir) = context.skills_dir.as_deref() {
-            discover_for_workspace_and_dir_with_mode(&context.workspace, skills_dir, discovery_mode)
+            discover_for_workspace_and_dir_with_mode_and_plugins(
+                &context.workspace,
+                skills_dir,
+                discovery_mode,
+                context.plugin_registry.as_deref(),
+            )
         } else {
-            discover_in_workspace_with_mode(&context.workspace, discovery_mode)
-        };
+            discover_in_workspace_with_mode_and_plugins(
+                &context.workspace,
+                discovery_mode,
+                context.plugin_registry.as_deref(),
+            )
+        }
+        .into_enabled();
         let Some(skill) = registry.get(name) else {
             let available: Vec<&str> = registry.list().iter().map(|s| s.name.as_str()).collect();
             let hint = if available.is_empty() {
@@ -141,16 +151,57 @@ impl ToolSpec for LoadSkillTool {
             return Err(ToolError::execution_failed(hint));
         };
 
+        ensure_reviewed_plugin_skill_is_current(skill, &context.workspace)?;
         let body = format_skill_body(skill);
+        let (skill_path, skill_source) = match &skill.source {
+            SkillSource::Native => (Some(skill.path.display().to_string()), "native".to_string()),
+            SkillSource::Plugin {
+                plugin_id,
+                plugin_name,
+                ..
+            } => (
+                None,
+                format!("reviewed-plugin-snapshot:{plugin_name}:{plugin_id}"),
+            ),
+        };
         Ok(ToolResult::success(body).with_metadata(json!({
             "skill_name": skill.name,
-            "skill_path": skill.path.display().to_string(),
+            "skill_path": skill_path,
+            "skill_source": skill_source,
             "companion_files": collect_companion_files(skill)
                 .into_iter()
                 .map(|p| p.display().to_string())
                 .collect::<Vec<String>>(),
         })))
     }
+}
+
+fn ensure_reviewed_plugin_skill_is_current(
+    skill: &Skill,
+    workspace: &std::path::Path,
+) -> Result<(), ToolError> {
+    let SkillSource::Plugin {
+        plugin_name,
+        authority,
+        ..
+    } = &skill.source
+    else {
+        return Ok(());
+    };
+
+    if authority.workspace != workspace {
+        return Err(ToolError::execution_failed(format!(
+            "Plugin skill `{}` belongs to a different workspace and was denied",
+            skill.name
+        )));
+    }
+
+    crate::plugins::registry::verify_plugin_authority(authority).map_err(|reason| {
+        ToolError::execution_failed(format!(
+            "Plugin skill `{}` was denied: {reason}. Run `/plugin reload`, inspect `/plugin show {plugin_name}`, then repeat the displayed trust command and enable it before retrying",
+            skill.name
+        ))
+    })
 }
 
 /// Render the skill body the model will see. Includes the description
@@ -164,7 +215,16 @@ fn format_skill_body(skill: &Skill) -> String {
     if !skill.description.trim().is_empty() {
         out.push_str(&format!("> {}\n\n", skill.description.trim()));
     }
-    out.push_str(&format!("Source: `{}`\n\n", skill.path.display()));
+    match &skill.source {
+        SkillSource::Native => out.push_str(&format!("Source: `{}`\n\n", skill.path.display())),
+        SkillSource::Plugin {
+            plugin_id,
+            plugin_name,
+            ..
+        } => out.push_str(&format!(
+            "Source: reviewed in-memory plugin snapshot `{plugin_name}` ({plugin_id})\n\n"
+        )),
+    }
     out.push_str("## SKILL.md\n\n");
     out.push_str(skill.body.trim());
     out.push('\n');
@@ -187,6 +247,11 @@ fn format_skill_body(skill: &Skill) -> String {
 /// listing stays focused on at-hand resources. Sorted lexically for
 /// deterministic output (matters for transcript diffing in tests).
 fn collect_companion_files(skill: &Skill) -> Vec<std::path::PathBuf> {
+    if matches!(&skill.source, SkillSource::Plugin { .. }) {
+        // Companion files remain hashed, but exposing their mutable on-disk
+        // paths would let content change after review and bypass the snapshot.
+        return Vec::new();
+    }
     let Some(dir) = skill.path.parent() else {
         return Vec::new();
     };
@@ -273,6 +338,86 @@ mod tests {
             names,
             vec!["data.json".to_string(), "script.py".to_string()]
         );
+    }
+
+    #[test]
+    fn plugin_skill_body_uses_reviewed_snapshot_without_mutable_file_paths() {
+        let tmp = tempdir().unwrap();
+        let skill_path = tmp.path().join("SKILL.md");
+        fs::write(&skill_path, "changed on disk").unwrap();
+        fs::write(tmp.path().join("companion.txt"), "changed companion").unwrap();
+        let skill = Skill {
+            name: "demo:hello".to_string(),
+            description: "hello".to_string(),
+            localized_descriptions: std::collections::HashMap::new(),
+            body: "reviewed body".to_string(),
+            path: skill_path.clone(),
+            source: SkillSource::Plugin {
+                plugin_id: "workspace/123/demo".to_string(),
+                plugin_name: "demo".to_string(),
+                authority: Box::new(crate::plugins::types::PluginAuthority {
+                    plugin_id: crate::plugins::types::PluginId("workspace/123/demo".to_string()),
+                    plugin_name: "demo".to_string(),
+                    workspace: tmp.path().to_path_buf(),
+                    state_path: tmp.path().join("state.json"),
+                    source_manifest: tmp.path().join("plugin.toml"),
+                    staged_manifest: tmp.path().join("staged/plugin.toml"),
+                    content_hash: "0".repeat(64),
+                    capability_hash: "0".repeat(64),
+                    state_generation: 0,
+                }),
+            },
+        };
+
+        let rendered = format_skill_body(&skill);
+        assert!(rendered.contains("reviewed body"));
+        assert!(rendered.contains("reviewed in-memory plugin snapshot"));
+        assert!(!rendered.contains(&skill_path.display().to_string()));
+        assert!(collect_companion_files(&skill).is_empty());
+    }
+
+    #[test]
+    fn plugin_skill_load_fails_closed_when_reviewed_bundle_drifts() {
+        let _lock = crate::test_support::lock_test_env();
+        let tmp = tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &home);
+        let bundle = tmp.path().join(".codewhale/plugins/demo");
+        let skill_dir = bundle.join("skills/hello");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            bundle.join("plugin.toml"),
+            "schema_version = 1\n[plugin]\nname = \"demo\"\nversion = \"1.0.0\"\n[skills]\npath = \"skills\"\n",
+        )
+        .unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: hello\ndescription: hello\n---\nreviewed body\n",
+        )
+        .unwrap();
+        fs::write(skill_dir.join("companion.txt"), "reviewed companion").unwrap();
+
+        let discovery = crate::plugins::PluginDiscoveryContext::capture_pre_dotenv();
+        let mut plugins = discovery.registry_for_workspace(tmp.path());
+        std::sync::Arc::make_mut(&mut plugins)
+            .trust("demo")
+            .unwrap();
+        std::sync::Arc::make_mut(&mut plugins)
+            .enable("demo")
+            .unwrap();
+        let registry = crate::skills::discover_in_workspace_with_mode_and_plugins(
+            tmp.path(),
+            SkillDiscoveryMode::CodeWhaleOnly,
+            Some(plugins.as_ref()),
+        );
+        let skill = registry.get("demo:hello").expect("active plugin skill");
+        ensure_reviewed_plugin_skill_is_current(skill, tmp.path())
+            .expect("stable reviewed snapshot");
+
+        fs::write(skill_dir.join("companion.txt"), "changed after review").unwrap();
+        let error = ensure_reviewed_plugin_skill_is_current(skill, tmp.path())
+            .expect_err("bundle drift must deny the reviewed skill snapshot");
+        assert!(error.to_string().contains("changed after review"));
     }
 
     #[test]
