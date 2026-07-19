@@ -1,16 +1,13 @@
 //! Process-level regression coverage for read-only diagnostic commands.
 
 use std::fs;
-use std::io::{Read, Write};
-use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Command, Output};
-use std::sync::mpsc;
-use std::thread;
-use std::time::Duration;
 
 use codewhale_secrets::{FileKeyringStore, KeyringStore};
 use tempfile::TempDir;
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[test]
 fn doctor_text_leaves_a_sealed_home_untouched() {
@@ -198,7 +195,8 @@ fn doctor_text_probe_uses_a_legacy_key_without_migrating_it() {
         .set("deepseek", "diagnostic-legacy-key")
         .expect("seed legacy secret");
     let legacy_before = fs::read(&legacy).expect("read legacy secret before doctor");
-    let (base_url, request) = one_request_completion_server();
+    let server = CompletionServer::start();
+    let base_url = server.base_url();
     let config = workspace.join("doctor.toml");
     fs::write(
         &config,
@@ -228,15 +226,20 @@ fn doctor_text_probe_uses_a_legacy_key_without_migrating_it() {
         "stdout:\n{}",
         String::from_utf8_lossy(&output.stdout)
     );
-    let request = request
-        .recv_timeout(Duration::from_secs(5))
-        .expect("doctor must make one local probe request")
-        .expect("local probe request");
-    assert!(
-        request
-            .to_ascii_lowercase()
-            .contains("authorization: bearer diagnostic-legacy-key"),
-        "doctor probe must use the legacy credential without printing it; request:\n{request}"
+    let requests = server.received_requests();
+    assert_eq!(
+        requests.len(),
+        1,
+        "doctor must make one local probe request"
+    );
+    let authorization = requests[0]
+        .headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok());
+    assert_eq!(
+        authorization,
+        Some("Bearer diagnostic-legacy-key"),
+        "doctor probe must use the legacy credential without printing it"
     );
     assert!(
         !primary.exists(),
@@ -457,78 +460,38 @@ fn diagnostic_command(workspace: &std::path::Path, home: &std::path::Path) -> Co
     command
 }
 
-fn one_request_completion_server() -> (String, mpsc::Receiver<Result<String, String>>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind local probe server");
-    let address = listener.local_addr().expect("local probe server address");
-    let (sender, receiver) = mpsc::channel();
-    thread::spawn(move || {
-        let result = (|| -> Result<String, String> {
-            let (mut stream, _) = listener.accept().map_err(|error| error.to_string())?;
-            stream
-                .set_read_timeout(Some(Duration::from_secs(10)))
-                .map_err(|error| error.to_string())?;
-            let request = read_http_request(&mut stream)?;
-            let body = "{\"id\":\"doctor\",\"object\":\"chat.completion\",\"created\":0,\"model\":\"deepseek-chat\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}";
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
-                body.len()
-            );
-            stream
-                .write_all(response.as_bytes())
-                .map_err(|error| error.to_string())?;
-            stream.flush().map_err(|error| error.to_string())?;
-            Ok(request)
-        })();
-        let _ = sender.send(result);
-    });
-    (format!("http://{address}/v1"), receiver)
+struct CompletionServer {
+    server: MockServer,
+    runtime: tokio::runtime::Runtime,
 }
 
-fn read_http_request(stream: &mut std::net::TcpStream) -> Result<String, String> {
-    let mut bytes = Vec::new();
-    let mut chunk = [0_u8; 1024];
-    let header_end = loop {
-        let read = stream.read(&mut chunk).map_err(|error| error.to_string())?;
-        if read == 0 {
-            return Err("connection closed before HTTP headers arrived".to_string());
-        }
-        bytes.extend_from_slice(&chunk[..read]);
-        if let Some(index) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
-            break index + 4;
-        }
-        if bytes.len() > 32 * 1024 {
-            return Err("HTTP headers exceeded test limit".to_string());
-        }
-    };
-    let headers = String::from_utf8_lossy(&bytes[..header_end]);
-    let content_length = http_content_length(&headers);
-    while bytes.len() < header_end + content_length {
-        let read = stream.read(&mut chunk).map_err(|error| error.to_string())?;
-        if read == 0 {
-            return Err("connection closed before HTTP body arrived".to_string());
-        }
-        bytes.extend_from_slice(&chunk[..read]);
+impl CompletionServer {
+    fn start() -> Self {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("local probe runtime");
+        let server = runtime.block_on(MockServer::start());
+        let body = "{\"id\":\"doctor\",\"object\":\"chat.completion\",\"created\":0,\"model\":\"deepseek-chat\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}";
+        runtime.block_on(
+            Mock::given(method("POST"))
+                .and(path("/v1/chat/completions"))
+                .respond_with(ResponseTemplate::new(200).set_body_raw(body, "application/json"))
+                .mount(&server),
+        );
+        Self { server, runtime }
     }
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
-}
 
-fn http_content_length(headers: &str) -> usize {
-    headers
-        .lines()
-        .filter_map(|line| line.split_once(':'))
-        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-        .and_then(|(_, value)| value.trim().parse::<usize>().ok())
-        .unwrap_or(0)
-}
+    fn base_url(&self) -> String {
+        format!("{}/v1", self.server.uri())
+    }
 
-#[test]
-fn local_probe_server_finds_content_length_after_other_headers() {
-    let headers = "POST /v1/chat/completions HTTP/1.1\r\n\
-        authorization: Bearer redacted\r\n\
-        content-type: application/json\r\n\
-        Content-Length: 37\r\n\r\n";
-
-    assert_eq!(http_content_length(headers), 37);
+    fn received_requests(&self) -> Vec<wiremock::Request> {
+        self.runtime
+            .block_on(self.server.received_requests())
+            .expect("request recording enabled")
+    }
 }
 
 /// A rustup shim may initialize its own toolchain state below `$HOME` when
