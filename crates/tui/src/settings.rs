@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::{ApiProvider, expand_path, normalize_model_name};
 use crate::localization::normalize_configured_locale;
 use crate::palette::{normalize_hex_rgb_color, normalize_theme_name};
+use crate::tui::app::ReasoningEffort;
 
 const SETTINGS_FILE_NAME: &str = "settings.toml";
 const TUI_PREFS_FILE_NAME: &str = "tui.toml";
@@ -1469,20 +1470,9 @@ fn normalize_reasoning_effort_setting(value: &str) -> Result<Option<String>> {
         return Ok(None);
     }
 
-    let normalized = match trimmed.to_ascii_lowercase().as_str() {
-        "off" | "disabled" | "none" | "false" => "off",
-        "low" | "minimal" => "low",
-        "medium" | "mid" => "medium",
-        "high" => "high",
-        "auto" | "automatic" => "auto",
-        "max" | "maximum" | "xhigh" | "ultracode" => "max",
-        _ => {
-            anyhow::bail!(
-                "Failed to update setting: invalid reasoning_effort '{value}'. Expected: auto, off, low, medium, high, max, xhigh, ultracode, or default."
-            );
-        }
-    };
-    Ok(Some(normalized.to_string()))
+    ReasoningEffort::parse_strict(trimmed)
+        .map(|effort| Some(effort.as_setting().to_string()))
+        .map_err(|err| anyhow::anyhow!("Failed to update setting: {err}"))
 }
 
 /// Parse a boolean value from various formats

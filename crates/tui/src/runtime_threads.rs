@@ -4372,12 +4372,17 @@ impl RuntimeThreadManager {
                 selection.provider,
                 Some(&selection.model),
             )?;
-            (
-                route,
-                selection
-                    .reasoning_effort
-                    .map(|effort| effort.as_setting().to_string()),
-            )
+            let reasoning_effort = selection.reasoning_effort.map(|effort| {
+                effort
+                    .normalize_for_route(
+                        route.identity.provider,
+                        &route.candidate.endpoint.base_url,
+                        &route.model,
+                    )
+                    .as_setting()
+                    .to_string()
+            });
+            (route, reasoning_effort)
         } else {
             (
                 resolve_runtime_thread_route_for_identity(

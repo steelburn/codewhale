@@ -422,18 +422,7 @@ fn extract_first_json_object(raw: &str) -> Option<&str> {
 }
 
 fn parse_auto_route_reasoning_effort(effort: &str) -> Option<ReasoningEffort> {
-    match effort.trim().to_ascii_lowercase().as_str() {
-        "off" | "disabled" | "none" | "false" => Some(ReasoningEffort::Off),
-        "low" | "minimal" | "medium" | "mid" => Some(ReasoningEffort::High),
-        "high" => Some(ReasoningEffort::High),
-        "max" | "maximum" | "xhigh" | "ultracode" => Some(ReasoningEffort::Max),
-        _ => None,
-    }
-}
-
-#[must_use]
-pub(crate) fn normalize_auto_route_effort(effort: ReasoningEffort) -> ReasoningEffort {
-    normalize_auto_route_effort_for_provider(ApiProvider::Deepseek, effort)
+    ReasoningEffort::parse_strict(effort).ok()
 }
 
 #[must_use]
@@ -448,6 +437,39 @@ pub(crate) fn normalize_auto_route_effort_for_provider(
         ReasoningEffort::Low | ReasoningEffort::Medium => ReasoningEffort::High,
         other => other,
     }
+}
+
+/// Route-aware equivalent of [`normalize_auto_route_effort_for_provider`].
+/// The inventory knows the selected provider/model, and the route resolver
+/// supplies the endpoint needed to distinguish Kimi Code's official bare-K3
+/// contract from generic Moonshot.
+#[must_use]
+pub(crate) fn normalize_auto_route_effort_for_configured_route(
+    config: &Config,
+    provider: ApiProvider,
+    model: &str,
+    effort: ReasoningEffort,
+) -> ReasoningEffort {
+    crate::route_runtime::resolve_runtime_route(config, provider, Some(model))
+        .map(|route| {
+            effort.normalize_for_route(provider, &route.candidate.endpoint.base_url, &route.model)
+        })
+        .unwrap_or_else(|_| normalize_auto_route_effort_for_provider(provider, effort))
+}
+
+fn normalize_auto_route_selection_for_config(
+    config: &Config,
+    mut selection: AutoRouteSelection,
+) -> AutoRouteSelection {
+    selection.reasoning_effort = selection.reasoning_effort.map(|effort| {
+        normalize_auto_route_effort_for_configured_route(
+            config,
+            selection.provider,
+            &selection.model,
+            effort,
+        )
+    });
+    selection
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -487,19 +509,18 @@ pub(crate) async fn resolve_auto_route_with_inventory_for_session(
     if !inventory.router_available {
         // Fall back to heuristic-only auto routing when the flash router
         // is unavailable (e.g. non-DeepSeek providers like wanjie-ark).
-        return Ok(auto_route_from_inventory_heuristic(
+        return Ok(normalize_auto_route_selection_for_config(
             config,
-            latest_request,
-            &inventory,
+            auto_route_from_inventory_heuristic(config, latest_request, &inventory),
         ));
     }
 
     let heuristic = auto_route_from_inventory_heuristic(config, latest_request, &inventory);
     if cfg!(test) {
-        return Ok(heuristic);
+        return Ok(normalize_auto_route_selection_for_config(config, heuristic));
     }
 
-    match auto_route_inventory_recommendation(
+    let selection = match auto_route_inventory_recommendation(
         config,
         &inventory,
         latest_request,
@@ -510,9 +531,10 @@ pub(crate) async fn resolve_auto_route_with_inventory_for_session(
     )
     .await
     {
-        Ok(Some(recommendation)) => Ok(auto_route_from_classifier(&inventory, recommendation)),
-        Ok(None) | Err(_) => Ok(auto_route_classifier_fallback(heuristic, &inventory)),
-    }
+        Ok(Some(recommendation)) => auto_route_from_classifier(&inventory, recommendation),
+        Ok(None) | Err(_) => auto_route_classifier_fallback(heuristic, &inventory),
+    };
+    Ok(normalize_auto_route_selection_for_config(config, selection))
 }
 
 pub(crate) fn resolve_explicit_route_with_inventory(
@@ -535,8 +557,10 @@ pub(crate) fn resolve_explicit_route_with_inventory(
             provider: candidate.provider,
             model: candidate.model.clone(),
             reasoning_effort: config.reasoning_effort().map(|setting| {
-                normalize_auto_route_effort_for_provider(
+                normalize_auto_route_effort_for_configured_route(
+                    config,
                     candidate.provider,
+                    &candidate.model,
                     ReasoningEffort::from_setting(setting),
                 )
             }),
@@ -558,8 +582,10 @@ pub(crate) fn resolve_explicit_route_with_inventory(
         provider: candidate.provider,
         model: candidate.model.clone(),
         reasoning_effort: config.reasoning_effort().map(|setting| {
-            normalize_auto_route_effort_for_provider(
+            normalize_auto_route_effort_for_configured_route(
+                config,
                 candidate.provider,
+                &candidate.model,
                 ReasoningEffort::from_setting(setting),
             )
         }),
@@ -904,8 +930,7 @@ fn parse_inventory_auto_route_recommendation(
         .or_else(|| value.get("reasoning_effort"))
         .or_else(|| value.get("effort"))
         .and_then(serde_json::Value::as_str)
-        .and_then(parse_auto_route_reasoning_effort)
-        .map(|effort| normalize_auto_route_effort_for_provider(provider, effort));
+        .and_then(parse_auto_route_reasoning_effort);
 
     Some(InventoryAutoRouteRecommendation {
         provider,
@@ -1151,6 +1176,56 @@ mod tests {
     }
 
     #[test]
+    fn configured_route_effort_normalizer_keeps_kimi_code_low_medium_local() {
+        let mut config = Config {
+            provider: Some("moonshot".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                moonshot: crate::config::ProviderConfig {
+                    base_url: Some(crate::config::DEFAULT_KIMI_CODE_BASE_URL.to_string()),
+                    model: Some("k3".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            normalize_auto_route_effort_for_configured_route(
+                &config,
+                ApiProvider::Moonshot,
+                "k3",
+                ReasoningEffort::Low,
+            ),
+            ReasoningEffort::Low
+        );
+        assert_eq!(
+            normalize_auto_route_effort_for_configured_route(
+                &config,
+                ApiProvider::Moonshot,
+                "k3",
+                ReasoningEffort::Medium,
+            ),
+            ReasoningEffort::Medium
+        );
+
+        config
+            .providers
+            .as_mut()
+            .expect("providers")
+            .moonshot
+            .base_url = Some(crate::config::DEFAULT_MOONSHOT_BASE_URL.to_string());
+        assert_eq!(
+            normalize_auto_route_effort_for_configured_route(
+                &config,
+                ApiProvider::Moonshot,
+                "k3",
+                ReasoningEffort::Low,
+            ),
+            ReasoningEffort::High
+        );
+    }
+
+    #[test]
     fn inventory_auto_route_recommendation_requires_runnable_pair() {
         let _env_lock = crate::test_support::lock_test_env();
         let _deepseek = crate::test_support::EnvVarGuard::set("DEEPSEEK_API_KEY", "ds-key");
@@ -1187,7 +1262,10 @@ mod tests {
         .expect("wrapped inventory route should parse");
         assert_eq!(wrapped.provider, ApiProvider::Zai);
         assert_eq!(wrapped.model, crate::config::ZAI_GLM_5_TURBO_MODEL);
-        assert_eq!(wrapped.reasoning_effort, Some(ReasoningEffort::High));
+        // Parsing is strict and literal; the historic Medium->High coercion
+        // is applied downstream by normalize_auto_route_selection_for_config
+        // so route-specific contracts (Kimi Code K3) can keep Medium.
+        assert_eq!(wrapped.reasoning_effort, Some(ReasoningEffort::Medium));
     }
 
     #[test]

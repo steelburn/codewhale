@@ -6856,7 +6856,7 @@ async fn run_review(config: &Config, args: ReviewArgs) -> Result<()> {
     let model = route.model.clone();
     let reasoning_effort = route
         .reasoning_effort
-        .and_then(|effort| cli_reasoning_effort_value(&execution_config, effort));
+        .and_then(|effort| cli_reasoning_effort_value(&execution_config, &model, effort));
 
     let system = SystemPrompt::Text(
         "You are a senior code reviewer. Focus on bugs, risks, behavioral regressions, and missing tests. \
@@ -8677,10 +8677,11 @@ struct CliAutoRoute {
 
 fn cli_reasoning_effort_value(
     config: &Config,
+    model: &str,
     effort: crate::tui::app::ReasoningEffort,
 ) -> Option<String> {
     effort
-        .api_value_for_provider(config.api_provider())
+        .api_value_for_route(config.api_provider(), &config.deepseek_base_url(), model)
         .map(str::to_string)
 }
 
@@ -8689,19 +8690,15 @@ fn normalize_cli_reasoning_effort(value: &str) -> Result<Option<String>> {
     if trimmed.is_empty() {
         return Ok(None);
     }
-    let normalized = match trimmed.to_ascii_lowercase().as_str() {
-        "inherit" | "parent" | "same" | "current" | "default" | "unset" => return Ok(None),
-        "off" | "disabled" | "none" | "false" => "off",
-        "low" | "minimal" => "low",
-        "medium" | "mid" => "medium",
-        "high" => "high",
-        "auto" | "automatic" => "auto",
-        "max" | "maximum" | "xhigh" | "ultracode" => "max",
-        _ => bail!(
-            "Unrecognized --reasoning-effort {trimmed:?}. Expected: auto, off, low, medium, high, max, or default."
-        ),
-    };
-    Ok(Some(normalized.to_string()))
+    if matches!(
+        trimmed.to_ascii_lowercase().as_str(),
+        "inherit" | "parent" | "same" | "current" | "default" | "unset"
+    ) {
+        return Ok(None);
+    }
+    crate::tui::app::ReasoningEffort::parse_strict(trimmed)
+        .map(|effort| Some(effort.as_setting().to_string()))
+        .map_err(anyhow::Error::msg)
 }
 
 fn config_for_cli_route(config: &Config, route: &CliAutoRoute) -> Config {
@@ -8820,7 +8817,7 @@ async fn run_one_shot(
     let client = DeepSeekClient::new(&execution_config)?;
     let reasoning_effort = route
         .reasoning_effort
-        .and_then(|effort| cli_reasoning_effort_value(&execution_config, effort));
+        .and_then(|effort| cli_reasoning_effort_value(&execution_config, &route.model, effort));
 
     let request = MessageRequest {
         model: route.model,
@@ -8870,7 +8867,7 @@ async fn run_one_shot_json(
     let model = route.model.clone();
     let reasoning_effort = route
         .reasoning_effort
-        .and_then(|effort| cli_reasoning_effort_value(&execution_config, effort));
+        .and_then(|effort| cli_reasoning_effort_value(&execution_config, &model, effort));
     let request = MessageRequest {
         model: model.clone(),
         messages: vec![Message {
@@ -9477,7 +9474,7 @@ async fn build_direct_workflow_tool(
     let client = DeepSeekClient::new(config)?;
     let reasoning_effort = route
         .reasoning_effort
-        .and_then(|effort| cli_reasoning_effort_value(config, effort));
+        .and_then(|effort| cli_reasoning_effort_value(config, &route.model, effort));
     let mcp_pool = if let Some((pool, failures)) =
         initialize_direct_workflow_mcp_pool(config, workspace, network_policy, plugin_registry)
             .await
@@ -9894,7 +9891,7 @@ async fn run_exec_agent(
     };
     let effective_reasoning_effort = route
         .reasoning_effort
-        .and_then(|effort| cli_reasoning_effort_value(&execution_config, effort));
+        .and_then(|effort| cli_reasoning_effort_value(&execution_config, &effective_model, effort));
 
     let settings = crate::settings::Settings::load().unwrap_or_default();
     let auto_compact_enabled = if crate::settings::Settings::auto_compact_explicitly_configured() {

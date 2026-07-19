@@ -51,6 +51,18 @@ const DEFAULT_PICKER_EFFORTS: &[ReasoningEffort] = &[
     ReasoningEffort::High,
     ReasoningEffort::Max,
 ];
+/// Kimi Code K3 accepts route-specific low and medium controls at the
+/// official membership endpoint. Medium becomes K3's nested high wire effort,
+/// but keeping the selected intent visible is important for recovery and
+/// route receipts.
+const KIMI_CODE_K3_PICKER_EFFORTS: &[ReasoningEffort] = &[
+    ReasoningEffort::Auto,
+    ReasoningEffort::Off,
+    ReasoningEffort::Low,
+    ReasoningEffort::Medium,
+    ReasoningEffort::High,
+    ReasoningEffort::Max,
+];
 const CODEX_PICKER_EFFORTS: &[ReasoningEffort] = &[
     ReasoningEffort::Low,
     ReasoningEffort::Medium,
@@ -259,12 +271,30 @@ impl ModelPickerView {
         let selected_model_idx = selected_model_idx.unwrap_or(0);
 
         let initial_effort = app.reasoning_effort;
-        let effort_rows = picker_efforts_for_provider(app.api_provider, app.auto_model);
-        let normalized = normalize_picker_effort(initial_effort, app.api_provider, app.auto_model);
+        let effort_rows = picker_efforts_for_route(
+            app.api_provider,
+            &config.deepseek_base_url(),
+            &initial_model,
+            app.auto_model,
+        );
+        let normalized = normalize_picker_effort(
+            initial_effort,
+            app.api_provider,
+            &config.deepseek_base_url(),
+            &initial_model,
+            app.auto_model,
+        );
         let selected_effort_idx = effort_rows
             .iter()
             .position(|e| *e == normalized)
-            .unwrap_or_else(|| default_picker_effort_idx(app.api_provider, app.auto_model));
+            .unwrap_or_else(|| {
+                default_picker_effort_idx(
+                    app.api_provider,
+                    &config.deepseek_base_url(),
+                    &initial_model,
+                    app.auto_model,
+                )
+            });
 
         let mut view = Self {
             initial_model,
@@ -408,10 +438,21 @@ impl ModelPickerView {
     }
 
     fn current_efforts(&self) -> &'static [ReasoningEffort] {
-        picker_efforts_for_provider(
-            self.resolved_provider().unwrap_or(self.initial_provider),
-            self.resolved_model().trim().eq_ignore_ascii_case("auto"),
+        let provider = self.resolved_provider().unwrap_or(self.initial_provider);
+        let model = self.resolved_model();
+        let base_url = self.resolved_base_url_for_provider(provider, &model);
+        picker_efforts_for_route(
+            provider,
+            &base_url,
+            &model,
+            model.trim().eq_ignore_ascii_case("auto"),
         )
+    }
+
+    fn resolved_base_url_for_provider(&self, provider: ApiProvider, model: &str) -> String {
+        crate::route_runtime::resolve_runtime_route(&self.route_config, provider, Some(model))
+            .map(|route| route.candidate.endpoint.base_url)
+            .unwrap_or_else(|_| provider.default_base_url().to_string())
     }
 
     fn custom_model_row(&self) -> Option<(String, ApiProvider)> {
@@ -495,12 +536,18 @@ impl ModelPickerView {
 
     fn select_effort_for_current_model(&mut self, effort: ReasoningEffort) {
         let provider = self.resolved_provider().unwrap_or(self.initial_provider);
-        let model_is_auto = self.resolved_model().trim().eq_ignore_ascii_case("auto");
-        let normalized = normalize_picker_effort(effort, provider, model_is_auto);
-        self.selected_effort_idx = picker_efforts_for_provider(provider, model_is_auto)
-            .iter()
-            .position(|candidate| *candidate == normalized)
-            .unwrap_or_else(|| default_picker_effort_idx(provider, model_is_auto));
+        let model = self.resolved_model();
+        let model_is_auto = model.trim().eq_ignore_ascii_case("auto");
+        let base_url = self.resolved_base_url_for_provider(provider, &model);
+        let normalized =
+            normalize_picker_effort(effort, provider, &base_url, &model, model_is_auto);
+        self.selected_effort_idx =
+            picker_efforts_for_route(provider, &base_url, &model, model_is_auto)
+                .iter()
+                .position(|candidate| *candidate == normalized)
+                .unwrap_or_else(|| {
+                    default_picker_effort_idx(provider, &base_url, &model, model_is_auto)
+                });
     }
 
     fn move_up(&mut self) -> bool {
@@ -1806,12 +1853,17 @@ impl ModelPickerView {
     }
 }
 
-fn picker_efforts_for_provider(
+fn picker_efforts_for_route(
     provider: ApiProvider,
+    base_url: &str,
+    wire_model: &str,
     model_is_auto: bool,
 ) -> &'static [ReasoningEffort] {
     if model_is_auto {
         return AUTO_MODEL_PICKER_EFFORTS;
+    }
+    if crate::config::is_exact_kimi_code_k3_route(provider, base_url, wire_model) {
+        return KIMI_CODE_K3_PICKER_EFFORTS;
     }
     match provider {
         ApiProvider::OpenaiCodex => CODEX_PICKER_EFFORTS,
@@ -1822,21 +1874,22 @@ fn picker_efforts_for_provider(
 fn normalize_picker_effort(
     effort: ReasoningEffort,
     provider: ApiProvider,
+    base_url: &str,
+    wire_model: &str,
     model_is_auto: bool,
 ) -> ReasoningEffort {
     if model_is_auto {
         return ReasoningEffort::Auto;
     }
-    if provider == ApiProvider::OpenaiCodex {
-        return effort.normalize_for_provider(provider);
-    }
-    match effort {
-        ReasoningEffort::Low | ReasoningEffort::Medium => ReasoningEffort::High,
-        other => other,
-    }
+    effort.normalize_for_route(provider, base_url, wire_model)
 }
 
-fn default_picker_effort_idx(provider: ApiProvider, model_is_auto: bool) -> usize {
+fn default_picker_effort_idx(
+    provider: ApiProvider,
+    base_url: &str,
+    wire_model: &str,
+    model_is_auto: bool,
+) -> usize {
     let default_effort = if model_is_auto {
         ReasoningEffort::Auto
     } else if provider == ApiProvider::OpenaiCodex {
@@ -1844,7 +1897,7 @@ fn default_picker_effort_idx(provider: ApiProvider, model_is_auto: bool) -> usiz
     } else {
         ReasoningEffort::High
     };
-    picker_efforts_for_provider(provider, model_is_auto)
+    picker_efforts_for_route(provider, base_url, wire_model, model_is_auto)
         .iter()
         .position(|effort| *effort == default_effort)
         .unwrap_or(0)
@@ -2744,6 +2797,42 @@ mod tests {
     }
 
     #[test]
+    fn picker_preserves_kimi_code_k3_low_medium_but_not_generic_moonshot() {
+        let (mut app, mut config, _lock) = create_test_app();
+        config.provider = Some("moonshot".to_string());
+        config.providers = Some(crate::config::ProvidersConfig {
+            moonshot: crate::config::ProviderConfig {
+                base_url: Some(crate::config::DEFAULT_KIMI_CODE_BASE_URL.to_string()),
+                model: Some("k3".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        app.api_provider = crate::config::ApiProvider::Moonshot;
+        app.model = "k3".to_string();
+        app.auto_model = false;
+        app.reasoning_effort = ReasoningEffort::Medium;
+
+        let view = ModelPickerView::new(&app, &config);
+        assert_eq!(view.resolved_effort(), ReasoningEffort::Medium);
+        assert_eq!(
+            view.current_efforts(),
+            KIMI_CODE_K3_PICKER_EFFORTS,
+            "the official K3 route must expose low/medium before sending a secret"
+        );
+
+        config
+            .providers
+            .as_mut()
+            .expect("providers")
+            .moonshot
+            .base_url = Some(crate::config::DEFAULT_MOONSHOT_BASE_URL.to_string());
+        let generic = ModelPickerView::new(&app, &config);
+        assert_eq!(generic.resolved_effort(), ReasoningEffort::High);
+        assert_eq!(generic.current_efforts(), DEFAULT_PICKER_EFFORTS);
+    }
+
+    #[test]
     fn picker_exposes_auto_and_distinct_thinking_tiers() {
         let model_labels = picker_model_ids_for_provider(crate::config::ApiProvider::Deepseek);
         assert_eq!(
@@ -2751,11 +2840,15 @@ mod tests {
             vec!["auto", "deepseek-v4-pro", "deepseek-v4-flash"]
         );
 
-        let effort_labels: Vec<_> =
-            picker_efforts_for_provider(crate::config::ApiProvider::Deepseek, false)
-                .iter()
-                .map(|effort| effort.as_setting())
-                .collect();
+        let effort_labels: Vec<_> = picker_efforts_for_route(
+            crate::config::ApiProvider::Deepseek,
+            crate::config::DEFAULT_DEEPSEEK_BASE_URL,
+            "deepseek-v4-pro",
+            false,
+        )
+        .iter()
+        .map(|effort| effort.as_setting())
+        .collect();
         assert_eq!(effort_labels, vec!["auto", "off", "high", "max"]);
     }
 
@@ -2770,13 +2863,15 @@ mod tests {
         let view = ModelPickerView::new(&app, &config);
 
         assert_eq!(view.resolved_effort(), ReasoningEffort::Low);
-        let labels: Vec<_> =
-            picker_efforts_for_provider(crate::config::ApiProvider::OpenaiCodex, false)
-                .iter()
-                .map(|effort| {
-                    effort.display_label_for_provider(crate::config::ApiProvider::OpenaiCodex)
-                })
-                .collect();
+        let labels: Vec<_> = picker_efforts_for_route(
+            crate::config::ApiProvider::OpenaiCodex,
+            crate::config::DEFAULT_OPENAI_CODEX_BASE_URL,
+            "gpt-5.5-codex",
+            false,
+        )
+        .iter()
+        .map(|effort| effort.display_label_for_provider(crate::config::ApiProvider::OpenaiCodex))
+        .collect();
         assert_eq!(labels, vec!["low", "medium", "high", "xhigh"]);
     }
 
@@ -4022,11 +4117,15 @@ mod tests {
 
     #[test]
     fn deepseek_picker_exposes_auto_off_high_max() {
-        let labels: Vec<&str> =
-            picker_efforts_for_provider(crate::config::ApiProvider::Deepseek, false)
-                .iter()
-                .map(|effort| effort.short_label())
-                .collect();
+        let labels: Vec<&str> = picker_efforts_for_route(
+            crate::config::ApiProvider::Deepseek,
+            crate::config::DEFAULT_DEEPSEEK_BASE_URL,
+            "deepseek-v4-pro",
+            false,
+        )
+        .iter()
+        .map(|effort| effort.short_label())
+        .collect();
         assert_eq!(labels, vec!["auto", "off", "high", "max"]);
     }
 

@@ -102,6 +102,14 @@ pub const MOONSHOT_KIMI_K2_6_MODEL: &str = "kimi-k2.6";
 pub const DEFAULT_MOONSHOT_BASE_URL: &str = "https://api.moonshot.ai/v1";
 pub const DEFAULT_KIMI_CODE_MODEL: &str = "kimi-for-coding";
 pub const DEFAULT_KIMI_CODE_BASE_URL: &str = "https://api.kimi.com/coding/v1";
+pub const KIMI_CODE_MEMBERSHIP_PLAN_CONSOLE_URL: &str =
+    codewhale_config::provider::KIMI_CODE_MEMBERSHIP_PLAN_CONSOLE_URL;
+/// Official Kimi Code route model id. It is deliberately distinct from
+/// Moonshot's pay-as-you-go `kimi-k3` catalog id.
+pub const KIMI_CODE_K3_MODEL: &str = "k3";
+/// Conservative Kimi Code K3 context baseline. Higher plan entitlements must
+/// be supplied by an explicit provider configuration or fresh provider facts.
+pub const KIMI_CODE_K3_CONTEXT_WINDOW_TOKENS: u32 = 262_144;
 pub const DEFAULT_SGLANG_MODEL: &str = "deepseek-ai/DeepSeek-V4-Pro";
 pub const DEFAULT_SGLANG_FLASH_MODEL: &str = "deepseek-ai/DeepSeek-V4-Flash";
 pub const DEFAULT_SGLANG_BASE_URL: &str = "http://localhost:30000/v1";

@@ -542,7 +542,13 @@ impl AcpServer {
         let client = DeepSeekClient::new(&execution_config)?;
         let reasoning_effort = route
             .reasoning_effort
-            .and_then(|effort| effort.api_value_for_provider(execution_config.api_provider()))
+            .and_then(|effort| {
+                effort.api_value_for_route(
+                    execution_config.api_provider(),
+                    &execution_config.deepseek_base_url(),
+                    &route.model,
+                )
+            })
             .map(str::to_string);
 
         let request = MessageRequest {

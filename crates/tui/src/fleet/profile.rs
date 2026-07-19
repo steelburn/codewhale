@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 
+use crate::tui::app::ReasoningEffort;
+
 #[allow(unused_imports)]
 pub use codewhale_config::{
     FleetDelegationHints, FleetLoadout, FleetProfile, FleetProfilePermissions, FleetRole, FleetSlot,
@@ -470,20 +472,20 @@ fn normalize_agent_profile_reasoning_effort(
     let Some(value) = non_empty_trimmed(value) else {
         return Ok(None);
     };
-    let normalized = match value.to_ascii_lowercase().as_str() {
-        "inherit" | "parent" | "same" | "current" | "default" | "unset" => return Ok(None),
-        "off" | "disabled" | "none" | "false" => "off",
-        "low" | "minimal" => "low",
-        "medium" | "mid" => "medium",
-        "high" => "high",
-        "auto" | "automatic" => "auto",
-        "max" | "maximum" | "xhigh" | "ultracode" => "max",
-        _ => bail!(
-            "agent profile {} reasoning_effort {value:?} must be one of: inherit, auto, off, low, medium, high, max",
-            path.display()
-        ),
-    };
-    Ok(Some(normalized.to_string()))
+    if matches!(
+        value.to_ascii_lowercase().as_str(),
+        "inherit" | "parent" | "same" | "current" | "default" | "unset"
+    ) {
+        return Ok(None);
+    }
+    ReasoningEffort::parse_strict(value)
+        .map(|effort| Some(effort.as_setting().to_string()))
+        .map_err(|_| {
+            anyhow!(
+                "agent profile {} reasoning_effort {value:?} must be one of: inherit, auto, off, low, medium, high, max",
+                path.display()
+            )
+        })
 }
 
 fn is_agent_profile_token_char(ch: char) -> bool {

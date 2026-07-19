@@ -246,19 +246,35 @@ pub enum ReasoningEffort {
 }
 
 impl ReasoningEffort {
-    /// Parse a config-file string into an effort tier. Unknown values fall
-    /// back to the default (`Max`) rather than erroring out.
+    /// Parse an operator-supplied effort value.
+    ///
+    /// This is deliberately the one canonical spelling table for every
+    /// human-facing route.  Callers that read an old persisted config may use
+    /// [`Self::from_setting`] for its compatibility fallback, but a new CLI,
+    /// settings, or tool input must reject an unknown value instead of quietly
+    /// turning it into `max`.
+    pub fn parse_strict(value: &str) -> Result<Self, String> {
+        let trimmed = value.trim();
+        match trimmed.to_ascii_lowercase().as_str() {
+            "off" | "disabled" | "none" | "false" => Ok(Self::Off),
+            "low" | "minimum" | "minimal" | "light" => Ok(Self::Low),
+            "medium" | "mid" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            "auto" | "automatic" => Ok(Self::Auto),
+            "max" | "maximum" | "xhigh" | "ultra" | "ultracode" => Ok(Self::Max),
+            _ => Err(format!(
+                "Unrecognized reasoning effort {trimmed:?}. Expected: auto, off, low, medium, high, or max."
+            )),
+        }
+    }
+
+    /// Parse a persisted config-file string into an effort tier. Unknown
+    /// legacy values fall back to the default (`Max`) so an old malformed
+    /// settings file never prevents startup.  New user input should use
+    /// [`Self::parse_strict`] instead.
     #[must_use]
     pub fn from_setting(value: &str) -> Self {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "off" | "disabled" | "none" | "false" => Self::Off,
-            "low" | "minimal" => Self::Low,
-            "medium" | "mid" => Self::Medium,
-            "high" => Self::High,
-            "auto" | "automatic" => Self::Auto,
-            "max" | "maximum" | "xhigh" | "ultracode" => Self::Max,
-            _ => Self::default(),
-        }
+        Self::parse_strict(value).unwrap_or_default()
     }
 
     #[must_use]
@@ -324,6 +340,32 @@ impl ReasoningEffort {
         }
     }
 
+    /// Resolve an effort against the exact provider route that will receive
+    /// the request.  Low/medium remain distinct only for the official Kimi
+    /// Code K3 endpoint; generic Moonshot and every other non-Codex route
+    /// retain the historic high coercion.  This intentionally does not change
+    /// [`Self::normalize_for_provider`], whose generic wire semantics are used
+    /// by older callers that do not yet have a route receipt.
+    #[must_use]
+    pub fn normalize_for_route(
+        self,
+        provider: ApiProvider,
+        base_url: &str,
+        wire_model: &str,
+    ) -> Self {
+        let normalized = self.normalize_for_provider(provider);
+        if crate::config::is_exact_kimi_code_k3_route(provider, base_url, wire_model) {
+            return normalized;
+        }
+        if provider == ApiProvider::OpenaiCodex {
+            return normalized;
+        }
+        match normalized {
+            Self::Low | Self::Medium => Self::High,
+            other => other,
+        }
+    }
+
     #[must_use]
     pub fn api_value_for_provider(self, provider: ApiProvider) -> Option<&'static str> {
         if provider != ApiProvider::OpenaiCodex {
@@ -339,10 +381,34 @@ impl ReasoningEffort {
         })
     }
 
+    /// Provider-facing value after exact-route normalization.
+    #[must_use]
+    pub fn api_value_for_route(
+        self,
+        provider: ApiProvider,
+        base_url: &str,
+        wire_model: &str,
+    ) -> Option<&'static str> {
+        self.normalize_for_route(provider, base_url, wire_model)
+            .api_value_for_provider(provider)
+    }
+
     #[must_use]
     pub fn as_setting_for_provider(self, provider: ApiProvider) -> &'static str {
         self.api_value_for_provider(provider)
             .unwrap_or_else(|| self.as_setting())
+    }
+
+    /// Persist the canonical setting after exact-route normalization.
+    #[must_use]
+    pub fn as_setting_for_route(
+        self,
+        provider: ApiProvider,
+        base_url: &str,
+        wire_model: &str,
+    ) -> &'static str {
+        self.normalize_for_route(provider, base_url, wire_model)
+            .as_setting_for_provider(provider)
     }
 
     /// Cycle through the three behaviorally distinct tiers.
@@ -1689,6 +1755,8 @@ pub(crate) struct PendingProviderSwitch {
     pub previous_model: String,
     pub previous_model_ids_passthrough: bool,
     pub previous_route_limits: Option<RouteLimits>,
+    pub previous_route_base_url: String,
+    pub previous_context_window_source: crate::route_runtime::ContextWindowSource,
     pub previous_context_window_override: Option<u32>,
     pub previous_config: Config,
     pub previous_onboarding: OnboardingState,
@@ -1820,6 +1888,14 @@ pub struct App {
     pub model_ids_passthrough: bool,
     /// Resolved provider/model route limits for the active runtime route.
     pub active_route_limits: Option<RouteLimits>,
+    /// Exact resolved endpoint for the active runtime route. This stays
+    /// separate from persisted config so endpoint-sensitive compatibility
+    /// (notably Kimi Code's bare `k3`) is never inferred from a provider name
+    /// alone.
+    pub active_route_base_url: String,
+    /// Provenance for `active_route_limits`' effective context window. This
+    /// is an operator-facing receipt, not a claim about provider billing.
+    pub active_context_window_source: crate::route_runtime::ContextWindowSource,
     /// User-configured provider context-window override for the active route.
     pub active_context_window_override: Option<u32>,
     /// Pending provider transition for transactional rollback when the next
@@ -2846,25 +2922,46 @@ impl App {
             .unwrap_or(model);
         let auto_model = model.trim().eq_ignore_ascii_case("auto");
         let active_context_window_override = config.context_window_for_provider_config(provider);
-        let active_route_limits = if auto_model {
-            active_context_window_override.map(|window| RouteLimits {
-                context_tokens: Some(u64::from(window)),
-                ..RouteLimits::default()
-            })
-        } else {
-            let saved_provider_model = config
-                .provider_config_for(provider)
-                .and_then(|provider| provider.model.as_deref());
-            crate::route_runtime::resolve_route_candidate(
-                provider,
-                Some(&model),
-                saved_provider_model,
-                Some(effective_auth_config.deepseek_base_url()),
-                active_context_window_override,
-            )
-            .ok()
-            .and_then(|candidate| crate::route_budget::known_route_limits(candidate.limits))
-        };
+        let configured_route_base_url = effective_auth_config.deepseek_base_url();
+        let (active_route_limits, active_route_base_url, active_context_window_source) =
+            if auto_model {
+                (
+                    active_context_window_override.map(|window| RouteLimits {
+                        context_tokens: Some(u64::from(window)),
+                        ..RouteLimits::default()
+                    }),
+                    configured_route_base_url,
+                    if active_context_window_override.is_some() {
+                        crate::route_runtime::ContextWindowSource::Configured
+                    } else {
+                        crate::route_runtime::ContextWindowSource::Fallback
+                    },
+                )
+            } else {
+                let saved_provider_model = config
+                    .provider_config_for(provider)
+                    .and_then(|provider| provider.model.as_deref());
+                crate::route_runtime::resolve_route_candidate_with_context_metadata(
+                    provider,
+                    Some(&model),
+                    saved_provider_model,
+                    Some(configured_route_base_url.clone()),
+                    active_context_window_override,
+                    None,
+                )
+                .map(|resolution| {
+                    (
+                        crate::route_budget::known_route_limits(resolution.candidate.limits),
+                        resolution.candidate.endpoint.base_url,
+                        resolution.context_window.source,
+                    )
+                })
+                .unwrap_or((
+                    None,
+                    configured_route_base_url,
+                    crate::route_runtime::ContextWindowSource::Fallback,
+                ))
+            };
         let reasoning_effort_explicit =
             settings.reasoning_effort.is_some() || config.reasoning_effort_is_explicit();
         let configured_reasoning_effort = settings
@@ -3117,6 +3214,8 @@ impl App {
             last_fallback_reason: None,
             model_ids_passthrough,
             active_route_limits,
+            active_route_base_url,
+            active_context_window_source,
             active_context_window_override,
             pending_provider_switch: None,
             reasoning_effort,
@@ -6649,8 +6748,25 @@ impl App {
         self.active_route_limits = crate::route_budget::known_route_limits(limits);
     }
 
+    /// Install an already-resolved runtime route receipt in one operation so
+    /// endpoint-sensitive reasoning and context reporting cannot drift apart.
+    pub fn set_active_route_resolution(
+        &mut self,
+        base_url: impl Into<String>,
+        limits: RouteLimits,
+        context_window_source: crate::route_runtime::ContextWindowSource,
+    ) {
+        self.active_route_base_url = base_url.into();
+        self.set_active_route_limits(limits);
+        self.active_context_window_source = context_window_source;
+    }
+
     pub fn set_active_context_window_override(&mut self, context_window: Option<u32>) {
         self.active_context_window_override = context_window;
+        if context_window.is_some() {
+            self.active_context_window_source =
+                crate::route_runtime::ContextWindowSource::Configured;
+        }
         if self.active_route_limits.is_none() {
             self.active_route_limits = self.context_window_override_limits();
         }
@@ -6778,15 +6894,19 @@ impl App {
         base_url: &str,
         model_override: Option<&str>,
     ) {
+        let wire_model = model_override.unwrap_or(&self.model);
         let inferred = model_override.and_then(|model| {
             crate::config::legacy_deepseek_alias_effort_for_route(provider, base_url, model)
         });
         self.reasoning_effort = if self.reasoning_effort_explicit {
-            self.reasoning_effort.normalize_for_provider(provider)
+            self.reasoning_effort
+                .normalize_for_route(provider, base_url, wire_model)
         } else if let Some(effort) = inferred {
-            ReasoningEffort::from_setting_for_provider(effort, provider)
+            ReasoningEffort::from_setting(effort)
+                .normalize_for_route(provider, base_url, wire_model)
         } else {
-            self.reasoning_effort.normalize_for_provider(provider)
+            self.reasoning_effort
+                .normalize_for_route(provider, base_url, wire_model)
         };
         self.last_effective_reasoning_effort = None;
     }

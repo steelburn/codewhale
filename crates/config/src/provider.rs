@@ -88,6 +88,13 @@ pub struct CredentialHelp {
     pub guidance: &'static str,
 }
 
+/// Kimi Code's membership-plan key console.
+///
+/// This is intentionally distinct from Moonshot's direct API console.  The
+/// route-specific helper below owns the choice so a configured Kimi Code route
+/// is never described as a generic Moonshot route.
+pub const KIMI_CODE_MEMBERSHIP_PLAN_CONSOLE_URL: &str = "https://www.kimi.com/code/console";
+
 /// Static metadata for a built-in model provider.
 pub trait Provider: Send + Sync {
     /// Provider enum variant represented by this entry.
@@ -135,6 +142,9 @@ pub trait Provider: Send + Sync {
 /// URLs here are provider-owned links already documented in this repository.
 /// If no stable vendor credential page is known, the URL remains absent and the
 /// guidance explains the supported local, OAuth, or configuration path.
+/// This is provider-level fallback metadata: callers that know a concrete base
+/// URL must use [`credential_help_for_route`] so route-owned credentials do not
+/// inherit a default endpoint's console.
 #[must_use]
 pub const fn credential_help(kind: ProviderKind) -> CredentialHelp {
     use CredentialAcquisition::{ApiKey, ApiKeyOrOAuth, Configuration, LocalOptional, OAuth};
@@ -222,7 +232,7 @@ pub const fn credential_help(kind: ProviderKind) -> CredentialHelp {
             acquisition: ApiKey,
             credential_url: Some("https://platform.kimi.ai/console/api-keys"),
             docs_url: Some("https://platform.kimi.ai/docs/overview"),
-            guidance: "Sign in to Kimi API Platform, create and copy an API key, then paste it into Codewhale; first-class Kimi OAuth is not available.",
+            guidance: "For Moonshot's default direct API route, sign in to Kimi API Platform and create and copy an API key. A configured Kimi Code route uses a separate membership-plan console and never imports Kimi CLI credentials; first-class Kimi OAuth is not available.",
         },
         ProviderKind::Sglang => CredentialHelp {
             acquisition: LocalOptional,
@@ -341,6 +351,54 @@ pub const fn credential_help(kind: ProviderKind) -> CredentialHelp {
             guidance: "Set this custom provider's base_url and api_key_env or api_key in configuration; no canonical vendor credential page exists.",
         },
     }
+}
+
+/// Whether a configured route is exactly the official Kimi Code endpoint.
+///
+/// A trailing slash is insignificant, but neighboring Kimi-hosted paths must
+/// not inherit membership-plan credentials merely because they share a host.
+#[must_use]
+pub fn is_exact_kimi_code_route(kind: ProviderKind, base_url: &str) -> bool {
+    if kind != ProviderKind::Moonshot {
+        return false;
+    }
+
+    // URL schemes and host names are ASCII case-insensitive; paths are not.
+    // Do not lowercase the whole URL here: `/CODING/v1` is a neighboring
+    // route, not the membership-plan endpoint. Keep this intentionally
+    // dependency-free because provider metadata is used by low-level config
+    // callers that should not need URL parsing machinery just for this guard.
+    let trimmed = base_url.trim();
+    let normalized = trimmed.strip_suffix('/').unwrap_or(trimmed);
+    let Some((scheme, authority_and_path)) = normalized.split_once("://") else {
+        return false;
+    };
+    let Some((authority, path)) = authority_and_path.split_once('/') else {
+        return false;
+    };
+
+    scheme.eq_ignore_ascii_case("https")
+        && authority.eq_ignore_ascii_case("api.kimi.com")
+        && path == "coding/v1"
+}
+
+/// Return credential help for one concrete provider route.
+///
+/// This protects non-UI callers such as diagnostics and command surfaces from
+/// presenting Moonshot's direct API console for a Kimi Code membership-plan
+/// endpoint. It performs no discovery, credential lookup, or network I/O.
+#[must_use]
+pub fn credential_help_for_route(kind: ProviderKind, base_url: &str) -> CredentialHelp {
+    if is_exact_kimi_code_route(kind, base_url) {
+        return CredentialHelp {
+            acquisition: CredentialAcquisition::ApiKey,
+            credential_url: Some(KIMI_CODE_MEMBERSHIP_PLAN_CONSOLE_URL),
+            docs_url: None,
+            guidance: "Create a Kimi Code membership-plan API key in the Kimi Code console. This route uses api.kimi.com/coding/v1; Codewhale does not import Kimi CLI credentials.",
+        };
+    }
+
+    credential_help(kind)
 }
 
 macro_rules! provider {
@@ -1210,6 +1268,54 @@ mod tests {
         );
         assert!(help.guidance.contains("create and copy an API key"));
         assert!(help.guidance.contains("OAuth is not available"));
+    }
+
+    #[test]
+    fn kimi_code_route_credential_help_is_distinct_from_direct_moonshot() {
+        let direct = credential_help_for_route(ProviderKind::Moonshot, DEFAULT_MOONSHOT_BASE_URL);
+        let kimi_code =
+            credential_help_for_route(ProviderKind::Moonshot, "https://api.kimi.com/coding/v1/");
+
+        assert_eq!(
+            direct.credential_url,
+            Some("https://platform.kimi.ai/console/api-keys")
+        );
+        assert_eq!(
+            kimi_code.credential_url,
+            Some(KIMI_CODE_MEMBERSHIP_PLAN_CONSOLE_URL)
+        );
+        assert_eq!(kimi_code.docs_url, None);
+        assert!(kimi_code.guidance.contains("membership-plan API key"));
+        assert!(
+            kimi_code
+                .guidance
+                .contains("does not import Kimi CLI credentials")
+        );
+        assert!(!is_exact_kimi_code_route(
+            ProviderKind::Moonshot,
+            "https://api.kimi.com/coding/v1/preview"
+        ));
+
+        // Scheme and hostname casing are insignificant, but the endpoint
+        // path is a route identifier and must remain exact.
+        assert!(is_exact_kimi_code_route(
+            ProviderKind::Moonshot,
+            "HTTPS://API.KIMI.COM/coding/v1/"
+        ));
+        for neighboring_route in [
+            "https://api.kimi.com/CODING/v1",
+            "https://api.kimi.com/coding/V1",
+            "http://api.kimi.com/coding/v1",
+            "https://api.kimi.com:443/coding/v1",
+            "https://api.kimi.com/coding/v1?preview=1",
+            "https://api.kimi.com/coding/v1#fragment",
+            "https://api.kimi.com/coding/v1//",
+        ] {
+            assert!(
+                !is_exact_kimi_code_route(ProviderKind::Moonshot, neighboring_route),
+                "{neighboring_route} must not inherit Kimi Code membership semantics"
+            );
+        }
     }
 
     #[test]

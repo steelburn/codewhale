@@ -14,7 +14,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::time::timeout as tokio_timeout;
 
-use crate::config::{TOGETHER_INKLING_MODEL, wire_model_for_provider_route};
+use crate::config::{
+    TOGETHER_INKLING_MODEL, is_exact_kimi_code_k3_route, wire_model_for_provider_route,
+};
 
 /// Default timeout for the initial streaming response headers.
 ///
@@ -134,6 +136,43 @@ fn apply_inkling_reasoning_effort(
     body["reasoning_effort"] = json!(wire_effort);
 }
 
+/// Apply Kimi Code K3's route-specific nested thinking effort after the
+/// generic Moonshot shaping. Other Moonshot and Kimi-compatible routes accept
+/// only the generic enabled/disabled form, so the exact endpoint and bare
+/// model identifier are both part of this guard.
+fn apply_kimi_code_k3_reasoning_effort(
+    body: &mut Value,
+    provider: ApiProvider,
+    base_url: &str,
+    model: &str,
+    effort: Option<&str>,
+) {
+    if !is_exact_kimi_code_k3_route(provider, base_url, model) {
+        return;
+    }
+    let Some(effort) = effort else {
+        return;
+    };
+
+    let thinking = match effort.trim().to_ascii_lowercase().as_str() {
+        "off" | "none" | "disabled" | "false" => json!({ "type": "disabled" }),
+        "low" | "minimum" | "minimal" | "light" => {
+            json!({ "type": "enabled", "effort": "low" })
+        }
+        "medium" | "high" => json!({ "type": "enabled", "effort": "high" }),
+        "xhigh" | "ultra" | "max" => json!({ "type": "enabled", "effort": "max" }),
+        _ => return,
+    };
+
+    // K3 uses the nested `thinking.effort` dialect. Do not leave an
+    // OpenAI-style effort value behind if another shaping layer was added
+    // before this route-specific override.
+    if let Some(object) = body.as_object_mut() {
+        object.remove("reasoning_effort");
+    }
+    body["thinking"] = thinking;
+}
+
 fn openai_compatible_reasoning_effort(
     effort: &str,
     supports_max: bool,
@@ -194,7 +233,11 @@ impl DeepSeekClient {
         request: &MessageRequest,
     ) -> Result<MessageResponse> {
         let cacheable = crate::llm_response_cache::request_is_cacheable(request);
-        let messages = build_chat_messages_for_request_and_provider(request, self.api_provider);
+        let messages = build_chat_messages_for_request_and_provider_and_route(
+            request,
+            self.api_provider,
+            &self.base_url,
+        );
         let model =
             wire_model_for_provider_route(self.api_provider, &self.base_url, &request.model);
         let mut body = json!({
@@ -279,6 +322,13 @@ impl DeepSeekClient {
             &model,
             request.reasoning_effort.as_deref(),
         );
+        apply_kimi_code_k3_reasoning_effort(
+            &mut body,
+            self.api_provider,
+            &self.base_url,
+            &model,
+            request.reasoning_effort.as_deref(),
+        );
         mirror_minimax_reasoning_details_for_body(&mut body, self.api_provider);
 
         let response_cache_key = if cacheable {
@@ -350,7 +400,11 @@ impl DeepSeekClient {
         request: MessageRequest,
     ) -> Result<StreamEventBox> {
         // Try true SSE streaming via chat completions (widely supported)
-        let messages = build_chat_messages_for_request_and_provider(&request, self.api_provider);
+        let messages = build_chat_messages_for_request_and_provider_and_route(
+            &request,
+            self.api_provider,
+            &self.base_url,
+        );
         let model =
             wire_model_for_provider_route(self.api_provider, &self.base_url, &request.model);
         let mut body = json!({
@@ -439,6 +493,13 @@ impl DeepSeekClient {
             &model,
             request.reasoning_effort.as_deref(),
         );
+        apply_kimi_code_k3_reasoning_effort(
+            &mut body,
+            self.api_provider,
+            &self.base_url,
+            &model,
+            request.reasoning_effort.as_deref(),
+        );
 
         // Bulletproof final sanitizer: walk the wire payload and force
         // `reasoning_content` onto any assistant message that has tool_calls
@@ -448,11 +509,12 @@ impl DeepSeekClient {
         // misses a case (e.g. a session restored from disk, a sub-agent
         // adding messages directly, or a cached prefix mismatch), this pass
         // still produces a valid request.
-        let replay_input_tokens = sanitize_thinking_mode_messages(
+        let replay_input_tokens = sanitize_thinking_mode_messages_for_route(
             &mut body,
             &model,
             request.reasoning_effort.as_deref(),
             self.api_provider,
+            &self.base_url,
         );
         mirror_minimax_reasoning_details_for_body(&mut body, self.api_provider);
 
@@ -481,6 +543,7 @@ impl DeepSeekClient {
         }
 
         let api_provider = self.api_provider;
+        let base_url = self.base_url.clone();
 
         // Capture transport-shape headers before we consume `response` into
         // `bytes_stream()`. They are surfaced in the decode-error log path so
@@ -521,8 +584,9 @@ impl DeepSeekClient {
             let mut tool_indices: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
             let mut reasoning_detail_buffers: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
             let mut inline_reasoning_tags = InlineReasoningTagState::default();
-            let reasoning_stream_style = reasoning_stream_style_for_stream(
+            let reasoning_stream_style = reasoning_stream_style_for_route(
                 api_provider,
+                &base_url,
                 &model,
                 configured_reasoning_stream_style.as_deref(),
             );
@@ -752,11 +816,26 @@ pub(super) fn build_chat_messages_for_request(request: &MessageRequest) -> Vec<V
     PromptBuilder::for_request(request).build()
 }
 
+#[cfg(test)]
 pub(super) fn build_chat_messages_for_request_and_provider(
     request: &MessageRequest,
     provider: ApiProvider,
 ) -> Vec<Value> {
-    PromptBuilder::for_request(request).build_for_provider(provider)
+    build_chat_messages_for_request_and_provider_and_route(request, provider, "")
+}
+
+/// Build a wire prompt for one fully resolved provider route.
+///
+/// Most provider behavior is keyed only by the provider kind and model. Kimi
+/// Code K3 is deliberately narrower: the bare `k3` model owns reasoning
+/// replay only on its official membership-plan endpoint, so callers that have
+/// a concrete base URL must retain it through prompt construction.
+pub(super) fn build_chat_messages_for_request_and_provider_and_route(
+    request: &MessageRequest,
+    provider: ApiProvider,
+    base_url: &str,
+) -> Vec<Value> {
+    PromptBuilder::for_request(request).build_for_provider_and_route(provider, base_url)
 }
 
 pub(crate) fn inspect_prompt_for_request(request: &MessageRequest) -> PromptInspection {
@@ -797,13 +876,14 @@ impl<'a> PromptBuilder<'a> {
         )
     }
 
-    fn build_for_provider(self, provider: ApiProvider) -> Vec<Value> {
+    fn build_for_provider_and_route(self, provider: ApiProvider, base_url: &str) -> Vec<Value> {
         let mut messages = build_chat_messages_with_reasoning(
             self.system,
             self.messages,
             self.model,
-            should_replay_reasoning_content_for_provider(
+            should_replay_reasoning_content_for_provider_on_route(
                 provider,
+                base_url,
                 self.model,
                 self.reasoning_effort,
             ),
@@ -2094,13 +2174,30 @@ fn reasoning_effort_enables_thinking(effort: Option<&str>) -> bool {
 /// Also tallies the size of all replayed `reasoning_content` and logs it, so
 /// users on `RUST_LOG=codewhale_tui=debug` can see how much of their input
 /// budget is being spent re-sending prior thinking traces.
+#[cfg(test)]
 pub(super) fn sanitize_thinking_mode_messages(
     body: &mut Value,
     model: &str,
     effort: Option<&str>,
     provider: ApiProvider,
 ) -> Option<u32> {
-    if !should_replay_reasoning_content_for_provider(provider, model, effort) {
+    sanitize_thinking_mode_messages_for_route(body, model, effort, provider, "")
+}
+
+/// Route-aware variant of [`sanitize_thinking_mode_messages`].
+///
+/// The wrapper above remains intentionally route-agnostic for existing test
+/// helpers and generic callers. Production chat requests call this version so
+/// exact Kimi Code K3 assistant tool turns retain the reasoning trace that
+/// K3 expects on the next request.
+pub(super) fn sanitize_thinking_mode_messages_for_route(
+    body: &mut Value,
+    model: &str,
+    effort: Option<&str>,
+    provider: ApiProvider,
+    base_url: &str,
+) -> Option<u32> {
+    if !should_replay_reasoning_content_for_provider_on_route(provider, base_url, model, effort) {
         return None;
     }
     let messages = body.get_mut("messages").and_then(Value::as_array_mut)?;
@@ -2257,8 +2354,24 @@ fn should_replay_reasoning_content(model: &str, effort: Option<&str>) -> bool {
     requires_reasoning_content(model)
 }
 
+#[cfg(test)]
 fn should_replay_reasoning_content_for_provider(
     provider: ApiProvider,
+    model: &str,
+    effort: Option<&str>,
+) -> bool {
+    should_replay_reasoning_content_for_provider_on_route(provider, "", model, effort)
+}
+
+/// Route-aware reasoning replay policy.
+///
+/// Keep the bare K3 identifier out of the global model catalog: direct
+/// Moonshot and arbitrary OpenAI-compatible routes can also expose a `k3`
+/// model name, but only Kimi Code's exact membership-plan endpoint has this
+/// replay contract.
+fn should_replay_reasoning_content_for_provider_on_route(
+    provider: ApiProvider,
+    base_url: &str,
     model: &str,
     effort: Option<&str>,
 ) -> bool {
@@ -2272,6 +2385,10 @@ fn should_replay_reasoning_content_for_provider(
         .unwrap_or(false)
     {
         return false;
+    }
+
+    if is_exact_kimi_code_k3_route(provider, base_url, model) {
+        return true;
     }
 
     if requires_reasoning_content(model) {
@@ -2298,7 +2415,21 @@ fn should_replay_reasoning_content_for_provider(
 /// known reasoning-capable large models are classified only on providers whose
 /// streaming shape exposes reasoning fields, so `reasoning`/`reasoning_content`
 /// deltas become Thinking cells instead of leaking as normal answer text.
+#[cfg(test)]
 fn is_reasoning_model_for_stream(provider: ApiProvider, model: &str) -> bool {
+    is_reasoning_model_for_stream_on_route(provider, "", model)
+}
+
+/// Route-aware stream classification for providers that share model names.
+fn is_reasoning_model_for_stream_on_route(
+    provider: ApiProvider,
+    base_url: &str,
+    model: &str,
+) -> bool {
+    if is_exact_kimi_code_k3_route(provider, base_url, model) {
+        return true;
+    }
+
     if requires_reasoning_content(model) {
         return true;
     }
@@ -2312,8 +2443,19 @@ pub(super) enum ReasoningStreamStyle {
     None,
 }
 
+#[cfg(test)]
 fn reasoning_stream_style_for_stream(
     provider: ApiProvider,
+    model: &str,
+    configured: Option<&str>,
+) -> ReasoningStreamStyle {
+    reasoning_stream_style_for_route(provider, "", model, configured)
+}
+
+/// Choose stream decoding semantics for a fully resolved provider route.
+fn reasoning_stream_style_for_route(
+    provider: ApiProvider,
+    base_url: &str,
     model: &str,
     configured: Option<&str>,
 ) -> ReasoningStreamStyle {
@@ -2325,7 +2467,7 @@ fn reasoning_stream_style_for_stream(
             "Ignoring unrecognized reasoning_stream_style `{configured}`; expected separate_field, inline_tags, or none"
         ));
     }
-    if is_reasoning_model_for_stream(provider, model) {
+    if is_reasoning_model_for_stream_on_route(provider, base_url, model) {
         ReasoningStreamStyle::SeparateField
     } else {
         ReasoningStreamStyle::None
@@ -3244,8 +3386,14 @@ mod arcee_waf_message_encoding_tests {
 
 #[cfg(test)]
 mod minimax_reasoning_replay_tests {
-    use super::build_chat_messages_for_request_and_provider;
-    use crate::config::{ApiProvider, DEFAULT_MINIMAX_MODEL};
+    use super::{
+        build_chat_messages_for_request_and_provider,
+        build_chat_messages_for_request_and_provider_and_route,
+    };
+    use crate::config::{
+        ApiProvider, DEFAULT_KIMI_CODE_BASE_URL, DEFAULT_MINIMAX_MODEL, DEFAULT_MOONSHOT_BASE_URL,
+        KIMI_CODE_K3_MODEL,
+    };
     use crate::models::{ContentBlock, Message, MessageRequest};
 
     fn request_with_assistant_thinking() -> MessageRequest {
@@ -3301,6 +3449,34 @@ mod minimax_reasoning_replay_tests {
                 .pointer("/reasoning_details/0/text")
                 .and_then(|value| value.as_str()),
             Some("Inspect tool state")
+        );
+    }
+
+    #[test]
+    fn kimi_code_k3_replays_thinking_only_on_the_exact_membership_route() {
+        let mut request = request_with_assistant_thinking();
+        request.model = KIMI_CODE_K3_MODEL.to_string();
+
+        let exact = build_chat_messages_for_request_and_provider_and_route(
+            &request,
+            ApiProvider::Moonshot,
+            DEFAULT_KIMI_CODE_BASE_URL,
+        );
+        assert_eq!(
+            exact[0]
+                .get("reasoning_content")
+                .and_then(serde_json::Value::as_str),
+            Some("Inspect tool state")
+        );
+
+        let neighbor = build_chat_messages_for_request_and_provider_and_route(
+            &request,
+            ApiProvider::Moonshot,
+            DEFAULT_MOONSHOT_BASE_URL,
+        );
+        assert!(
+            neighbor[0].get("reasoning_content").is_none(),
+            "a generic Moonshot k3 identifier must not inherit Kimi Code replay"
         );
     }
 }
@@ -3683,6 +3859,32 @@ mod stream_decoder_tests {
 
         assert_eq!(thinking_delta_text(&events), "private plan");
         assert_eq!(text_delta_text(&events), "Public answer.");
+    }
+
+    #[test]
+    fn exact_kimi_code_k3_streams_reasoning_content_as_thinking() {
+        let style = reasoning_stream_style_for_route(
+            ApiProvider::Moonshot,
+            crate::config::DEFAULT_KIMI_CODE_BASE_URL,
+            crate::config::KIMI_CODE_K3_MODEL,
+            None,
+        );
+        assert_eq!(style, ReasoningStreamStyle::SeparateField);
+
+        let events = decode_chunks_with_style(
+            &[r#"{"choices":[{"delta":{"reasoning_content":"private K3 plan"}}]}"#],
+            style,
+        );
+        assert_eq!(thinking_delta_text(&events), "private K3 plan");
+        assert_eq!(text_delta_text(&events), "");
+
+        let generic_style = reasoning_stream_style_for_route(
+            ApiProvider::Moonshot,
+            crate::config::DEFAULT_MOONSHOT_BASE_URL,
+            crate::config::KIMI_CODE_K3_MODEL,
+            None,
+        );
+        assert_eq!(generic_style, ReasoningStreamStyle::None);
     }
 
     #[test]
@@ -4556,10 +4758,12 @@ mod alias_thinking_detection_tests {
     //! turn. See upstream API docs:
     //! https://api-docs.deepseek.com/guides/thinking_mode
     use super::{
-        apply_inkling_reasoning_effort, apply_openai_reasoning_effort, apply_provider_token_limit,
-        is_reasoning_model_for_stream, provider_accepts_reasoning_content,
-        requires_reasoning_content, should_replay_reasoning_content,
-        should_replay_reasoning_content_for_provider,
+        ReasoningStreamStyle, apply_inkling_reasoning_effort, apply_kimi_code_k3_reasoning_effort,
+        apply_openai_reasoning_effort, apply_provider_token_limit, is_reasoning_model_for_stream,
+        is_reasoning_model_for_stream_on_route, provider_accepts_reasoning_content,
+        reasoning_stream_style_for_route, requires_reasoning_content,
+        should_replay_reasoning_content, should_replay_reasoning_content_for_provider,
+        should_replay_reasoning_content_for_provider_on_route,
     };
     use crate::config::ApiProvider;
     use serde_json::json;
@@ -4680,6 +4884,60 @@ mod alias_thinking_detection_tests {
     }
 
     #[test]
+    fn bare_k3_reasoning_semantics_are_scoped_to_exact_kimi_code_route() {
+        let kimi_code = crate::config::DEFAULT_KIMI_CODE_BASE_URL;
+        let direct_moonshot = crate::config::DEFAULT_MOONSHOT_BASE_URL;
+
+        assert!(should_replay_reasoning_content_for_provider_on_route(
+            ApiProvider::Moonshot,
+            kimi_code,
+            crate::config::KIMI_CODE_K3_MODEL,
+            Some("high"),
+        ));
+        assert!(is_reasoning_model_for_stream_on_route(
+            ApiProvider::Moonshot,
+            kimi_code,
+            crate::config::KIMI_CODE_K3_MODEL,
+        ));
+        assert_eq!(
+            reasoning_stream_style_for_route(
+                ApiProvider::Moonshot,
+                kimi_code,
+                crate::config::KIMI_CODE_K3_MODEL,
+                None,
+            ),
+            ReasoningStreamStyle::SeparateField
+        );
+
+        assert!(!should_replay_reasoning_content_for_provider_on_route(
+            ApiProvider::Moonshot,
+            direct_moonshot,
+            crate::config::KIMI_CODE_K3_MODEL,
+            Some("high"),
+        ));
+        assert!(!is_reasoning_model_for_stream_on_route(
+            ApiProvider::Moonshot,
+            direct_moonshot,
+            crate::config::KIMI_CODE_K3_MODEL,
+        ));
+        assert_eq!(
+            reasoning_stream_style_for_route(
+                ApiProvider::Moonshot,
+                direct_moonshot,
+                crate::config::KIMI_CODE_K3_MODEL,
+                None,
+            ),
+            ReasoningStreamStyle::None
+        );
+        assert!(!should_replay_reasoning_content_for_provider_on_route(
+            ApiProvider::Moonshot,
+            kimi_code,
+            crate::config::KIMI_CODE_K3_MODEL,
+            Some("off"),
+        ));
+    }
+
+    #[test]
     fn xiaomi_mimo_uses_max_completion_tokens_payload_key() {
         let mut body = json!({
             "model": "mimo-v2.5-pro",
@@ -4786,6 +5044,62 @@ mod alias_thinking_detection_tests {
         );
         assert_eq!(other_provider["thinking"]["type"], json!("enabled"));
         assert!(other_provider.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn kimi_code_k3_uses_documented_nested_thinking_effort() {
+        for (requested, expected) in [
+            ("low", json!({ "type": "enabled", "effort": "low" })),
+            ("minimum", json!({ "type": "enabled", "effort": "low" })),
+            ("light", json!({ "type": "enabled", "effort": "low" })),
+            ("medium", json!({ "type": "enabled", "effort": "high" })),
+            ("high", json!({ "type": "enabled", "effort": "high" })),
+            ("xhigh", json!({ "type": "enabled", "effort": "max" })),
+            ("ultra", json!({ "type": "enabled", "effort": "max" })),
+            ("max", json!({ "type": "enabled", "effort": "max" })),
+            ("none", json!({ "type": "disabled" })),
+            ("off", json!({ "type": "disabled" })),
+        ] {
+            let mut body = json!({ "reasoning_effort": "stale" });
+            apply_kimi_code_k3_reasoning_effort(
+                &mut body,
+                ApiProvider::Moonshot,
+                crate::config::DEFAULT_KIMI_CODE_BASE_URL,
+                crate::config::KIMI_CODE_K3_MODEL,
+                Some(requested),
+            );
+
+            assert_eq!(body["thinking"], expected, "requested {requested}");
+            assert!(body.get("reasoning_effort").is_none());
+        }
+    }
+
+    #[test]
+    fn kimi_code_k3_effort_override_never_leaks_to_neighbor_routes() {
+        for (base_url, model) in [
+            (crate::config::DEFAULT_KIMI_CODE_BASE_URL, "kimi-k3"),
+            (
+                crate::config::DEFAULT_KIMI_CODE_BASE_URL,
+                crate::config::DEFAULT_KIMI_CODE_MODEL,
+            ),
+            (crate::config::DEFAULT_MOONSHOT_BASE_URL, "k3"),
+        ] {
+            let mut body = json!({ "thinking": { "type": "enabled" } });
+            apply_kimi_code_k3_reasoning_effort(
+                &mut body,
+                ApiProvider::Moonshot,
+                base_url,
+                model,
+                Some("max"),
+            );
+
+            assert_eq!(body["thinking"], json!({ "type": "enabled" }));
+            assert!(
+                body.pointer("/thinking/effort").is_none(),
+                "{base_url} / {model}"
+            );
+            assert!(body.get("reasoning_effort").is_none());
+        }
     }
 
     #[test]

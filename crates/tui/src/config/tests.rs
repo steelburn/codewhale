@@ -7457,6 +7457,11 @@ api_key = "stale-api-key"
     assert!(
         error
             .to_string()
+            .contains(KIMI_CODE_MEMBERSHIP_PLAN_CONSOLE_URL)
+    );
+    assert!(
+        !error
+            .to_string()
             .contains("https://platform.kimi.ai/console/api-keys")
     );
     assert!(!has_api_key_for(&config, ApiProvider::Moonshot));
@@ -7466,6 +7471,34 @@ api_key = "stale-api-key"
         "Codewhale must never read, refresh, or rewrite Kimi CLI credentials"
     );
     Ok(())
+}
+
+#[test]
+fn moonshot_credential_help_keeps_direct_and_kimi_code_routes_distinct() {
+    let direct =
+        credential_help_for_provider_route(ApiProvider::Moonshot, DEFAULT_MOONSHOT_BASE_URL);
+    assert_eq!(
+        direct.credential_url,
+        Some("https://platform.kimi.ai/console/api-keys")
+    );
+    assert_eq!(
+        direct.docs_url,
+        Some("https://platform.kimi.ai/docs/overview")
+    );
+
+    let kimi_code =
+        credential_help_for_provider_route(ApiProvider::Moonshot, DEFAULT_KIMI_CODE_BASE_URL);
+    assert_eq!(
+        kimi_code.credential_url,
+        Some(KIMI_CODE_MEMBERSHIP_PLAN_CONSOLE_URL)
+    );
+    assert_eq!(kimi_code.docs_url, None);
+    assert!(kimi_code.guidance.contains("membership-plan API key"));
+    assert!(
+        kimi_code
+            .guidance
+            .contains("does not import Kimi CLI credentials")
+    );
 }
 
 #[test]
@@ -7673,6 +7706,41 @@ base_url = "https://api.kimi.com/coding/v1"
     assert_eq!(config.default_model(), DEFAULT_KIMI_CODE_MODEL);
     assert_eq!(config.deepseek_api_key()?, "kimi-code-key");
     assert!(has_api_key_for(&config, ApiProvider::Moonshot));
+    Ok(())
+}
+
+#[test]
+fn moonshot_kimi_code_missing_key_reports_membership_plan_console() -> Result<()> {
+    let _lock = lock_test_env();
+    let temp = tempfile::tempdir()?;
+    let _guard = EnvGuard::new(temp.path());
+    let config = Config {
+        provider: Some(ApiProvider::Moonshot.as_str().to_string()),
+        providers: Some(ProvidersConfig {
+            moonshot: ProviderConfig {
+                base_url: Some(DEFAULT_KIMI_CODE_BASE_URL.to_string()),
+                model: Some(KIMI_CODE_K3_MODEL.to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let error = config
+        .deepseek_api_key()
+        .expect_err("Kimi Code route needs a membership-plan API key");
+    let message = error.to_string();
+    assert!(
+        message.contains(KIMI_CODE_MEMBERSHIP_PLAN_CONSOLE_URL),
+        "{message}"
+    );
+    assert!(message.contains("api.kimi.com/coding/v1"), "{message}");
+    assert!(
+        message.contains("does not import Kimi CLI credentials"),
+        "{message}"
+    );
+    assert!(!message.contains("https://platform.kimi.ai/console/api-keys"));
     Ok(())
 }
 

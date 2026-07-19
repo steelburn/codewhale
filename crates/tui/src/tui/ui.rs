@@ -6344,11 +6344,11 @@ async fn run_cache_warmup(app: &App, config: &Config) -> Result<(Usage, String, 
     let base_url = client.base_url().to_string();
     let reasoning_effort = if app.reasoning_effort == ReasoningEffort::Auto {
         app.last_effective_reasoning_effort
-            .and_then(|effort| effort.api_value_for_provider(app.api_provider))
+            .and_then(|effort| effort.api_value_for_route(app.api_provider, &base_url, &app.model))
             .map(str::to_string)
     } else {
         app.reasoning_effort
-            .api_value_for_provider(app.api_provider)
+            .api_value_for_route(app.api_provider, &base_url, &app.model)
             .map(str::to_string)
     };
     let request = MessageRequest {
@@ -7191,6 +7191,8 @@ fn rollback_provider_after_auth_failure(app: &mut App, config: &mut Config) -> O
         previous_model,
         previous_model_ids_passthrough,
         previous_route_limits,
+        previous_route_base_url,
+        previous_context_window_source,
         previous_context_window_override,
         previous_config,
         previous_onboarding,
@@ -7216,6 +7218,8 @@ fn rollback_provider_after_auth_failure(app: &mut App, config: &mut Config) -> O
     app.model_ids_passthrough = previous_model_ids_passthrough;
     app.active_context_window_override = previous_context_window_override;
     app.active_route_limits = previous_route_limits;
+    app.active_route_base_url = previous_route_base_url;
+    app.active_context_window_source = previous_context_window_source;
     app.update_model_compaction_budget();
     app.clear_model_scoped_telemetry();
     app.offline_mode = false;
@@ -8076,23 +8080,26 @@ async fn dispatch_user_message(
         let effort = auto_selection
             .as_ref()
             .and_then(|selection| selection.reasoning_effort)
-            .unwrap_or_else(|| {
-                auto_router::normalize_auto_routed_effort(crate::auto_reasoning::select(
-                    false,
-                    &message.display,
-                ))
-            });
+            .unwrap_or_else(|| crate::auto_reasoning::select(false, &message.display));
         Some(effort)
     } else {
         None
     };
     let effective_reasoning_effort = if let Some(effort) = selected_reasoning_effort {
         effort
-            .api_value_for_provider(effective_provider)
+            .api_value_for_route(
+                effective_provider,
+                &turn_route.candidate.endpoint.base_url,
+                &turn_route.model,
+            )
             .map(str::to_string)
     } else {
         app.reasoning_effort
-            .api_value_for_provider(effective_provider)
+            .api_value_for_route(
+                effective_provider,
+                &turn_route.candidate.endpoint.base_url,
+                &turn_route.model,
+            )
             .map(str::to_string)
     };
 
@@ -8440,8 +8447,6 @@ async fn apply_model_picker_choice(
     let model_is_auto = model.trim().eq_ignore_ascii_case("auto");
     if model_is_auto {
         effort = ReasoningEffort::Auto;
-    } else {
-        effort = effort.normalize_for_provider(target_provider);
     }
     if target_provider != app.api_provider
         || target_identity != app.provider_identity_for_persistence()
@@ -8461,12 +8466,66 @@ async fn apply_model_picker_choice(
             return;
         }
         if !model_is_auto {
+            effort = effort.normalize_for_route(
+                app.api_provider,
+                &app.active_route_base_url,
+                &app.model,
+            );
             apply_picker_effort_choice(app, engine_handle, effort, previous_effort).await;
             return;
         }
     }
 
     let model_changed = model != previous_model || app.auto_model != model_is_auto;
+    let mut resolved_model = model.clone();
+    let mut route_base_url = config.deepseek_base_url();
+    if !model_is_auto {
+        let saved_provider_model = config
+            .provider_config_for(app.api_provider)
+            .and_then(|provider| provider.model.as_deref());
+        match crate::route_runtime::resolve_route_candidate_with_context_metadata(
+            app.api_provider,
+            Some(&model),
+            saved_provider_model,
+            Some(config.deepseek_base_url()),
+            config.context_window_for_provider_config(app.api_provider),
+            None,
+        ) {
+            Ok(resolution) => {
+                resolved_model = resolution.candidate.wire_model_id.as_str().to_string();
+                route_base_url = resolution.candidate.endpoint.base_url.clone();
+                if model_changed {
+                    app.set_active_context_window_override(
+                        config.context_window_for_provider_config(app.api_provider),
+                    );
+                    app.set_active_route_resolution(
+                        route_base_url.clone(),
+                        resolution.candidate.limits,
+                        resolution.context_window.source,
+                    );
+                }
+            }
+            Err(reason) => {
+                app.status_message = Some(reason);
+                return;
+            }
+        }
+    } else if model_changed {
+        app.set_active_context_window_override(
+            config.context_window_for_provider_config(app.api_provider),
+        );
+        app.active_route_limits = app.context_window_override_limits();
+        app.active_route_base_url = route_base_url.clone();
+        app.active_context_window_source = if app.active_context_window_override.is_some() {
+            crate::route_runtime::ContextWindowSource::Configured
+        } else {
+            crate::route_runtime::ContextWindowSource::Fallback
+        };
+    }
+
+    if !model_is_auto {
+        effort = effort.normalize_for_route(app.api_provider, &route_base_url, &resolved_model);
+    }
     let effort_changed = effort != previous_effort;
     if !model_changed && !effort_changed {
         app.status_message = Some(format!(
@@ -8474,37 +8533,6 @@ async fn apply_model_picker_choice(
             effort.display_label_for_provider(app.api_provider)
         ));
         return;
-    }
-
-    let mut resolved_model = model.clone();
-    if model_changed && !model_is_auto {
-        let saved_provider_model = config
-            .provider_config_for(app.api_provider)
-            .and_then(|provider| provider.model.as_deref());
-        match resolve_route_candidate(
-            app.api_provider,
-            Some(&model),
-            saved_provider_model,
-            Some(config.deepseek_base_url()),
-            config.context_window_for_provider_config(app.api_provider),
-        ) {
-            Ok(candidate) => {
-                resolved_model = candidate.wire_model_id.as_str().to_string();
-                app.set_active_context_window_override(
-                    config.context_window_for_provider_config(app.api_provider),
-                );
-                app.set_active_route_limits(candidate.limits);
-            }
-            Err(reason) => {
-                app.status_message = Some(reason);
-                return;
-            }
-        }
-    } else if model_changed && model_is_auto {
-        app.set_active_context_window_override(
-            config.context_window_for_provider_config(app.api_provider),
-        );
-        app.active_route_limits = app.context_window_override_limits();
     }
 
     if model_changed {
@@ -8542,7 +8570,7 @@ async fn apply_model_picker_choice(
         if effort_changed {
             settings.set(
                 "reasoning_effort",
-                effort.as_setting_for_provider(app.api_provider),
+                effort.as_setting_for_route(app.api_provider, &route_base_url, &resolved_model),
             )?;
         }
         settings.save()
@@ -8604,7 +8632,7 @@ async fn apply_picker_effort_choice(
     mut effort: ReasoningEffort,
     previous_effort: ReasoningEffort,
 ) {
-    effort = effort.normalize_for_provider(app.api_provider);
+    effort = effort.normalize_for_route(app.api_provider, &app.active_route_base_url, &app.model);
     if effort == previous_effort {
         return;
     }
@@ -8618,7 +8646,7 @@ async fn apply_picker_effort_choice(
         let mut settings = crate::settings::Settings::load_persisted()?;
         settings.set(
             "reasoning_effort",
-            effort.as_setting_for_provider(app.api_provider),
+            effort.as_setting_for_route(app.api_provider, &app.active_route_base_url, &app.model),
         )?;
         settings.save()
     })()
@@ -8668,6 +8696,8 @@ async fn switch_provider(
         previous_model: previous_model.clone(),
         previous_model_ids_passthrough,
         previous_route_limits: app.active_route_limits,
+        previous_route_base_url: app.active_route_base_url.clone(),
+        previous_context_window_source: app.active_context_window_source,
         previous_context_window_override: app.active_context_window_override,
         previous_config: previous_config.clone(),
         previous_onboarding: app.onboarding,
@@ -9497,7 +9527,7 @@ async fn apply_command_result(
                     model,
                     Some(provider),
                     None,
-                    previous_effort.normalize_for_provider(provider),
+                    previous_effort,
                     previous_model,
                     previous_effort,
                 )

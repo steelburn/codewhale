@@ -1440,15 +1440,17 @@ impl SubAgentThinking {
         let normalized = value.trim().to_ascii_lowercase();
         match normalized.as_str() {
             "inherit" | "parent" | "same" | "current" => Ok(Self::Inherit),
-            "auto" | "automatic" => Ok(Self::Auto),
-            "off" | "disabled" | "none" | "false" => Ok(Self::Effort(ReasoningEffort::Off)),
-            "low" | "minimal" => Ok(Self::Effort(ReasoningEffort::Low)),
-            "medium" | "mid" => Ok(Self::Effort(ReasoningEffort::Medium)),
-            "high" => Ok(Self::Effort(ReasoningEffort::High)),
-            "max" | "maximum" | "xhigh" | "ultracode" => Ok(Self::Effort(ReasoningEffort::Max)),
-            _ => Err(ToolError::invalid_input(
-                "thinking must be one of: inherit, auto, off, low, medium, high, max".to_string(),
-            )),
+            _ => ReasoningEffort::parse_strict(value)
+                .map(|effort| match effort {
+                    ReasoningEffort::Auto => Self::Auto,
+                    effort => Self::Effort(effort),
+                })
+                .map_err(|_| {
+                    ToolError::invalid_input(
+                        "thinking must be one of: inherit, auto, off, low, medium, high, max"
+                            .to_string(),
+                    )
+                }),
         }
     }
 }
@@ -8608,6 +8610,7 @@ fn worker_profile_subagent_assignment_route(
 
     let reasoning_effort = subagent_reasoning_effort_for_request(
         runtime,
+        &model,
         prompt,
         requested_fast_lane,
         requested_thinking,
@@ -8618,14 +8621,22 @@ fn worker_profile_subagent_assignment_route(
 
 fn subagent_reasoning_effort_for_request(
     runtime: &SubAgentRuntime,
+    model: &str,
     prompt: &str,
     requested_fast_lane: bool,
     requested_thinking: SubAgentThinking,
 ) -> Option<String> {
+    let normalize = |effort: ReasoningEffort| {
+        effort.normalize_for_route(
+            runtime.client.api_provider(),
+            runtime.client.base_url(),
+            model,
+        )
+    };
     match requested_thinking {
-        SubAgentThinking::Effort(effort) => Some(effort.as_setting().to_string()),
+        SubAgentThinking::Effort(effort) => Some(normalize(effort).as_setting().to_string()),
         SubAgentThinking::Auto => Some(
-            auto_subagent_reasoning_effort(prompt)
+            normalize(auto_subagent_reasoning_effort(prompt))
                 .as_setting()
                 .to_string(),
         ),
@@ -8641,29 +8652,42 @@ fn subagent_reasoning_effort_for_request(
             } else {
                 ReasoningEffort::Off
             };
-            Some(effort.as_setting().to_string())
+            Some(normalize(effort).as_setting().to_string())
         }
-        SubAgentThinking::Inherit => fallback_subagent_reasoning_effort(runtime, prompt),
+        SubAgentThinking::Inherit => fallback_subagent_reasoning_effort(runtime, model, prompt),
     }
 }
 
-fn fallback_subagent_reasoning_effort(runtime: &SubAgentRuntime, prompt: &str) -> Option<String> {
+fn fallback_subagent_reasoning_effort(
+    runtime: &SubAgentRuntime,
+    model: &str,
+    prompt: &str,
+) -> Option<String> {
+    let normalize = |effort: ReasoningEffort| {
+        effort.normalize_for_route(
+            runtime.client.api_provider(),
+            runtime.client.base_url(),
+            model,
+        )
+    };
     if runtime.reasoning_effort_auto {
         Some(
-            auto_subagent_reasoning_effort(prompt)
+            normalize(auto_subagent_reasoning_effort(prompt))
                 .as_setting()
                 .to_string(),
         )
     } else {
-        runtime.reasoning_effort.clone()
+        runtime
+            .reasoning_effort
+            .as_deref()
+            .map(ReasoningEffort::from_setting)
+            .map(normalize)
+            .map(|effort| effort.as_setting().to_string())
     }
 }
 
 fn auto_subagent_reasoning_effort(prompt: &str) -> ReasoningEffort {
-    match crate::auto_reasoning::select(false, prompt) {
-        ReasoningEffort::Low | ReasoningEffort::Medium => ReasoningEffort::High,
-        other => other,
-    }
+    crate::auto_reasoning::select(false, prompt)
 }
 
 fn parse_optional_subagent_model(input: &Value, key: &str) -> Result<Option<String>, ToolError> {

@@ -194,6 +194,25 @@ const DEFAULT_CLIENT_RATE_LIMIT_RPS: f64 = 8.0;
 const DEFAULT_CLIENT_RATE_LIMIT_BURST: f64 = 16.0;
 const ALLOW_INSECURE_HTTP_ENV: &str = "DEEPSEEK_ALLOW_INSECURE_HTTP";
 
+fn client_user_agent(api_provider: ApiProvider) -> &'static str {
+    // The ChatGPT Codex backend is the sole route with a documented
+    // compatibility exception. Kimi Code, including K3, must keep the normal
+    // Codewhale identity rather than impersonating a Kimi CLI.
+    if api_provider == ApiProvider::OpenaiCodex {
+        concat!(
+            "codex_cli_rs/0.137.0 (CodeWhale ",
+            env!("CARGO_PKG_VERSION"),
+            ")"
+        )
+    } else {
+        concat!(
+            "Mozilla/5.0 (compatible; codewhale/",
+            env!("CARGO_PKG_VERSION"),
+            "; +https://github.com/Hmbown/CodeWhale)"
+        )
+    }
+}
+
 /// Upper bound on a single sleep inside the provider-wide rate-limit pause
 /// loop in `send_with_retry`. The pause window lives in process-global state
 /// (`retry_status`), so waiting requests re-poll it on this cadence instead
@@ -1039,25 +1058,9 @@ impl DeepSeekClient {
             base_url,
             auth_disabled,
         )?;
-        // The ChatGPT Codex backend sits behind Cloudflare bot protection that
-        // only admits the Codex CLI's user agent; present a codex_cli_rs UA on
-        // that path so the request is handled like the official client.
-        let user_agent: &str = if api_provider == ApiProvider::OpenaiCodex {
-            concat!(
-                "codex_cli_rs/0.137.0 (CodeWhale ",
-                env!("CARGO_PKG_VERSION"),
-                ")"
-            )
-        } else {
-            concat!(
-                "Mozilla/5.0 (compatible; codewhale/",
-                env!("CARGO_PKG_VERSION"),
-                "; +https://github.com/Hmbown/CodeWhale)"
-            )
-        };
         let mut builder = crate::tls::reqwest_client_builder()
             .default_headers(headers)
-            .user_agent(user_agent)
+            .user_agent(client_user_agent(api_provider))
             .connect_timeout(Duration::from_secs(30))
             .tcp_keepalive(Some(Duration::from_secs(30)))
             .http2_keep_alive_interval(Some(Duration::from_secs(15)))
@@ -4674,6 +4677,15 @@ mod tests {
         let mut body = json!({});
         apply_reasoning_effort(&mut body, Some("off"), ApiProvider::Moonshot);
         assert_eq!(body, json!({ "thinking": { "type": "disabled" } }));
+    }
+
+    #[test]
+    fn moonshot_uses_codewhale_user_agent_not_kimi_cli_identity() {
+        let user_agent = client_user_agent(ApiProvider::Moonshot);
+
+        assert!(user_agent.contains("codewhale/"));
+        assert!(!user_agent.to_ascii_lowercase().contains("kimi_cli"));
+        assert!(!user_agent.to_ascii_lowercase().contains("kimi-code-cli"));
     }
 
     #[test]

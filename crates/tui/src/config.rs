@@ -4895,8 +4895,13 @@ impl Config {
                 .provider_config_for(provider)
                 .is_some_and(provider_config_uses_kimi_imported_token)
         {
+            let credential_help =
+                credential_help_for_provider_route(provider, &self.deepseek_base_url());
             anyhow::bail!(
-                "Kimi CLI credential import is unsupported. Codewhale does not impersonate or reuse Kimi OAuth clients; configure a Kimi API key from https://platform.kimi.ai/console/api-keys instead."
+                "Kimi CLI credential import is unsupported. Codewhale does not impersonate or reuse Kimi OAuth clients; configure an API key from {} instead.",
+                credential_help
+                    .credential_url
+                    .unwrap_or("the selected provider's API-key console")
             );
         }
 
@@ -5039,17 +5044,31 @@ impl Config {
                 provider.env_vars_label(),
                 provider_config_table_name(provider)?
             ),
-            ApiProvider::Moonshot => anyhow::bail!(
-                "Moonshot/Kimi API key not found. Get a key: {}. Run 'codewhale auth set --provider moonshot', \
-                 set {}, or add [{}] api_key. \
-                 For a Kimi Code plan key, set [providers.moonshot] base_url = \
-                 \"https://api.kimi.com/coding/v1\" and model = \"kimi-for-coding\".",
-                provider
-                    .credential_url()
-                    .unwrap_or("https://platform.kimi.ai/console/api-keys"),
-                provider.env_vars_label(),
-                provider_config_table_name(provider)?
-            ),
+            ApiProvider::Moonshot => {
+                let credential_help =
+                    credential_help_for_provider_route(provider, &self.deepseek_base_url());
+                if moonshot_base_url_is_exact_kimi_code(&self.deepseek_base_url()) {
+                    anyhow::bail!(
+                        "Kimi Code membership-plan API key not found. Get a plan key: {}. This route uses api.kimi.com/coding/v1 and does not import Kimi CLI credentials. Run 'codewhale auth set --provider moonshot', set {}, or add [{}] api_key.",
+                        credential_help
+                            .credential_url
+                            .unwrap_or(KIMI_CODE_MEMBERSHIP_PLAN_CONSOLE_URL),
+                        provider.env_vars_label(),
+                        provider_config_table_name(provider)?
+                    );
+                }
+                anyhow::bail!(
+                    "Moonshot/Kimi API key not found. Get a key: {}. Run 'codewhale auth set --provider moonshot', \
+                     set {}, or add [{}] api_key. \
+                     For a Kimi Code plan key, set [providers.moonshot] base_url = \
+                     \"https://api.kimi.com/coding/v1\" and model = \"kimi-for-coding\".",
+                    credential_help
+                        .credential_url
+                        .unwrap_or("https://platform.kimi.ai/console/api-keys"),
+                    provider.env_vars_label(),
+                    provider_config_table_name(provider)?
+                );
+            }
             ApiProvider::Anthropic | ApiProvider::Openmodel => {
                 anyhow::bail!("{}", missing_provider_api_key_message(provider)?)
             }
@@ -7094,6 +7113,49 @@ fn moonshot_base_url_uses_kimi_code(base_url: &str) -> bool {
     normalized == DEFAULT_KIMI_CODE_BASE_URL
         || normalized == "https://api.kimi.com/coding"
         || normalized.starts_with("https://api.kimi.com/coding/")
+}
+
+/// The Kimi Code API endpoint, normalized only for insignificant trailing
+/// slashes. This must stay stricter than `moonshot_base_url_uses_kimi_code`:
+/// route-specific K3 capability and request shaping are not safe for arbitrary
+/// Kimi-hosted paths.
+pub(crate) fn moonshot_base_url_is_exact_kimi_code(base_url: &str) -> bool {
+    codewhale_config::provider::is_exact_kimi_code_route(
+        codewhale_config::ProviderKind::Moonshot,
+        base_url,
+    )
+}
+
+/// Whether a route is exactly the Kimi Code K3 membership-plan route.
+///
+/// Keep the bare `k3` identifier route-owned. In particular, do not infer a
+/// Kimi Code plan entitlement for direct Moonshot `kimi-k3`, generic `k3`, or
+/// `kimi-for-coding` routes.
+pub(crate) fn is_exact_kimi_code_k3_route(
+    provider: ApiProvider,
+    base_url: &str,
+    model: &str,
+) -> bool {
+    provider == ApiProvider::Moonshot
+        && moonshot_base_url_is_exact_kimi_code(base_url)
+        && model.trim().eq_ignore_ascii_case(KIMI_CODE_K3_MODEL)
+}
+
+/// Credential help for a concrete provider route.
+///
+/// `ProviderKind::Moonshot` intentionally retains its generic direct-API
+/// metadata in `codewhale-config`: that remains correct for Moonshot's own
+/// platform route. The Kimi Code membership endpoint is a distinct route and
+/// must not send its users to the generic API console or imply CLI credential
+/// import support.
+pub(crate) fn credential_help_for_provider_route(
+    provider: ApiProvider,
+    base_url: &str,
+) -> codewhale_config::provider::CredentialHelp {
+    provider.kind().map_or_else(
+        || provider.credential_help(),
+        |kind| codewhale_config::provider::credential_help_for_route(kind, base_url),
+    )
 }
 
 pub(crate) fn provider_config_uses_kimi_imported_token(config: &ProviderConfig) -> bool {

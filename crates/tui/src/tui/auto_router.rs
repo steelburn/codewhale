@@ -13,7 +13,7 @@ use anyhow::Result;
 use crate::config::Config;
 use crate::model_routing;
 use crate::models::{ContentBlock, Message};
-use crate::tui::app::{App, QueuedMessage, ReasoningEffort};
+use crate::tui::app::{App, QueuedMessage};
 
 /// Whether the next turn should consult the auto-route flash model.
 pub(super) fn should_resolve_auto_model_selection(app: &App) -> bool {
@@ -43,11 +43,6 @@ pub(super) async fn resolve_auto_model_selection(
             .as_setting_for_provider(app.api_provider),
     )
     .await
-}
-
-/// Normalize the heuristic effort to the canonical auto-route effort.
-pub(super) fn normalize_auto_routed_effort(effort: ReasoningEffort) -> ReasoningEffort {
-    model_routing::normalize_auto_route_effort(effort)
 }
 
 /// Build a compact recent-context summary for the auto-route prompt.

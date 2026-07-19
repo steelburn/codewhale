@@ -327,6 +327,56 @@ fn reasoning_effort_api_values_are_provider_aware_for_codex() {
 }
 
 #[test]
+fn reasoning_effort_uses_one_strict_alias_table_and_legacy_fallback() {
+    for raw in ["off", "none", "disabled", "false"] {
+        assert_eq!(ReasoningEffort::parse_strict(raw), Ok(ReasoningEffort::Off));
+    }
+    for raw in ["low", "minimum", "minimal", "light"] {
+        assert_eq!(ReasoningEffort::parse_strict(raw), Ok(ReasoningEffort::Low));
+    }
+    for raw in ["medium", "mid"] {
+        assert_eq!(
+            ReasoningEffort::parse_strict(raw),
+            Ok(ReasoningEffort::Medium)
+        );
+    }
+    for raw in ["xhigh", "ultra", "max", "maximum", "ultracode"] {
+        assert_eq!(ReasoningEffort::parse_strict(raw), Ok(ReasoningEffort::Max));
+    }
+    assert!(ReasoningEffort::parse_strict("surprise").is_err());
+    assert_eq!(
+        ReasoningEffort::from_setting("surprise"),
+        ReasoningEffort::Max
+    );
+}
+
+#[test]
+fn reasoning_effort_preserves_kimi_code_low_and_medium_only_on_exact_route() {
+    let kimi_base = crate::config::DEFAULT_KIMI_CODE_BASE_URL;
+    let moonshot_base = crate::config::DEFAULT_MOONSHOT_BASE_URL;
+    assert_eq!(
+        ReasoningEffort::Low.normalize_for_route(ApiProvider::Moonshot, kimi_base, "k3"),
+        ReasoningEffort::Low
+    );
+    assert_eq!(
+        ReasoningEffort::Medium.normalize_for_route(ApiProvider::Moonshot, kimi_base, "k3"),
+        ReasoningEffort::Medium
+    );
+    assert_eq!(
+        ReasoningEffort::Low.normalize_for_route(ApiProvider::Moonshot, moonshot_base, "k3"),
+        ReasoningEffort::High
+    );
+    assert_eq!(
+        ReasoningEffort::Medium.normalize_for_route(
+            ApiProvider::Moonshot,
+            kimi_base,
+            "kimi-for-coding",
+        ),
+        ReasoningEffort::High
+    );
+}
+
+#[test]
 fn set_model_selection_normalizes_codex_fixed_model_effort() {
     let mut app = App::new(test_options(false), &Config::default());
     app.api_provider = ApiProvider::OpenaiCodex;

@@ -1,10 +1,55 @@
+use chrono::{DateTime, Duration, Utc};
 use codewhale_config::route::{
     LogicalModelRef, ReadyRouteCandidate, RouteLimits, RouteRequest, RouteResolver, WireModelId,
 };
+use serde::Serialize;
 
 use crate::client::DeepSeekClient;
 use crate::codex_model_cache::{CodexModelCacheFreshness, model_roster};
-use crate::config::{ApiProvider, Config, DEFAULT_NVIDIA_NIM_BASE_URL, ProviderIdentity};
+use crate::config::{
+    ApiProvider, Config, DEFAULT_NVIDIA_NIM_BASE_URL, KIMI_CODE_K3_CONTEXT_WINDOW_TOKENS,
+    ProviderIdentity, is_exact_kimi_code_k3_route,
+};
+
+/// Why a route is using its effective context-window value.  Keep this
+/// receipt separate from the numeric route limits so every consumer can state
+/// whether the number is operator-configured, freshly provider-reported, a
+/// Kimi Code safety floor, catalog data, or a conservative fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ContextWindowSource {
+    Configured,
+    ProviderReported,
+    StaticKimiCodeSafeFloor,
+    Catalog,
+    Fallback,
+}
+
+/// Context window carried alongside an exact runtime route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub(crate) struct ContextWindowResolution {
+    pub(crate) tokens: u32,
+    pub(crate) source: ContextWindowSource,
+}
+
+/// Authenticated Kimi Code `/models` metadata that a caller has already
+/// validated.  This is intentionally route-scoped: generic Moonshot metadata
+/// can never promote a bare `k3` route.  The current runtime has no implicit
+/// network probe; an authenticated model-listing consumer may pass this value
+/// to [`resolve_route_candidate_with_context_metadata`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProviderReportedKimiCodeContext {
+    pub(crate) context_tokens: u32,
+    pub(crate) observed_at: DateTime<Utc>,
+}
+
+const KIMI_CODE_REPORTED_CONTEXT_MAX_AGE_HOURS: i64 = 24;
+
+#[derive(Debug)]
+pub(crate) struct RouteCandidateResolution {
+    pub(crate) candidate: ReadyRouteCandidate,
+    pub(crate) context_window: ContextWindowResolution,
+}
 
 #[derive(Clone)]
 pub(crate) struct ResolvedRuntimeRoute {
@@ -12,6 +57,7 @@ pub(crate) struct ResolvedRuntimeRoute {
     pub(crate) candidate: ReadyRouteCandidate,
     pub(crate) config: Box<Config>,
     pub(crate) model: String,
+    pub(crate) context_window: ContextWindowResolution,
     preflighted_client: Option<DeepSeekClient>,
 }
 
@@ -35,6 +81,7 @@ pub(crate) struct ValidatedRuntimeRoute {
     pub(crate) candidate: ReadyRouteCandidate,
     pub(crate) config: Box<Config>,
     pub(crate) model: String,
+    pub(crate) context_window: ContextWindowResolution,
     pub(crate) client: DeepSeekClient,
 }
 
@@ -80,6 +127,7 @@ impl ResolvedRuntimeRoute {
             candidate: self.candidate,
             config: self.config,
             model: self.model,
+            context_window: self.context_window,
             client,
         })
     }
@@ -98,6 +146,7 @@ impl ValidatedRuntimeRoute {
             candidate: self.candidate,
             config: self.config,
             model: self.model,
+            context_window: self.context_window,
             preflighted_client: Some(self.client),
         }
     }
@@ -110,6 +159,30 @@ pub(crate) fn resolve_route_candidate(
     base_url_override: Option<String>,
     context_window_override: Option<u32>,
 ) -> Result<ReadyRouteCandidate, String> {
+    resolve_route_candidate_with_context_metadata(
+        provider,
+        model_selector,
+        saved_provider_model,
+        base_url_override,
+        context_window_override,
+        None,
+    )
+    .map(|resolution| resolution.candidate)
+}
+
+/// Resolve a candidate together with a non-secret context-window provenance
+/// receipt.  `provider_reported_context` is accepted only for the exact Kimi
+/// Code bare-K3 endpoint, only at the documented 1M entitlement, and only
+/// while fresh; this prevents generic Moonshot or stale metadata from being
+/// inherited by a membership-plan route.
+pub(crate) fn resolve_route_candidate_with_context_metadata(
+    provider: ApiProvider,
+    model_selector: Option<&str>,
+    saved_provider_model: Option<&str>,
+    base_url_override: Option<String>,
+    context_window_override: Option<u32>,
+    provider_reported_context: Option<ProviderReportedKimiCodeContext>,
+) -> Result<RouteCandidateResolution, String> {
     let route_request = RouteRequest {
         explicit_provider: provider.kind(),
         model_selector: model_selector.map(|model| LogicalModelRef::from(model.to_string())),
@@ -120,14 +193,16 @@ pub(crate) fn resolve_route_candidate(
     let mut candidate = RouteResolver::new()
         .resolve(&route_request)
         .map_err(|err| err.to_string())?;
-    apply_context_window_override(&mut candidate.limits, context_window_override);
     if provider == ApiProvider::OpenaiCodex {
         // Models.dev describes the public API offering, not the account-scoped
         // ChatGPT OAuth route. Strip API-only limits, then carry the fresh
         // Codex roster's per-model context into every runtime consumer.
         candidate.limits.input_tokens = None;
         candidate.limits.output_tokens = None;
-        if context_window_override.is_none() {
+        if context_window_override
+            .filter(|window| *window > 0)
+            .is_none()
+        {
             let roster = model_roster();
             candidate.limits.context_tokens = if roster.freshness == CodexModelCacheFreshness::Fresh
             {
@@ -140,7 +215,83 @@ pub(crate) fn resolve_route_candidate(
             };
         }
     }
-    Ok(candidate)
+
+    let configured = context_window_override.filter(|window| *window > 0);
+    if let Some(context_window) = configured {
+        apply_context_window_override(&mut candidate.limits, Some(context_window));
+        return Ok(RouteCandidateResolution {
+            candidate,
+            context_window: ContextWindowResolution {
+                tokens: context_window,
+                source: ContextWindowSource::Configured,
+            },
+        });
+    }
+
+    let is_exact_kimi_code_k3 = is_exact_kimi_code_k3_route(
+        provider,
+        &candidate.endpoint.base_url,
+        candidate.wire_model_id.as_str(),
+    );
+    let now = Utc::now();
+    if is_exact_kimi_code_k3
+        && provider_reported_context.is_some_and(|reported| {
+            reported.context_tokens == 1_048_576
+                && reported.observed_at <= now
+                && now.signed_duration_since(reported.observed_at)
+                    <= Duration::hours(KIMI_CODE_REPORTED_CONTEXT_MAX_AGE_HOURS)
+        })
+    {
+        let reported = provider_reported_context.expect("checked above");
+        candidate.limits.context_tokens = Some(u64::from(reported.context_tokens));
+        return Ok(RouteCandidateResolution {
+            candidate,
+            context_window: ContextWindowResolution {
+                tokens: reported.context_tokens,
+                source: ContextWindowSource::ProviderReported,
+            },
+        });
+    }
+
+    // Kimi Code's bare `k3` is a membership-plan route, not an alias for
+    // Moonshot's public `kimi-k3` catalog entry.  The safe all-plan floor is
+    // the route's next precedence after an explicit config or fresh, scoped
+    // provider report.
+    if is_exact_kimi_code_k3 {
+        candidate.limits.context_tokens = Some(u64::from(KIMI_CODE_K3_CONTEXT_WINDOW_TOKENS));
+        return Ok(RouteCandidateResolution {
+            candidate,
+            context_window: ContextWindowResolution {
+                tokens: KIMI_CODE_K3_CONTEXT_WINDOW_TOKENS,
+                source: ContextWindowSource::StaticKimiCodeSafeFloor,
+            },
+        });
+    }
+
+    if let Some(tokens) = candidate
+        .limits
+        .context_tokens
+        .and_then(|tokens| u32::try_from(tokens).ok())
+    {
+        return Ok(RouteCandidateResolution {
+            candidate,
+            context_window: ContextWindowResolution {
+                tokens,
+                source: ContextWindowSource::Catalog,
+            },
+        });
+    }
+
+    let fallback_tokens =
+        crate::config::provider_capability(provider, candidate.wire_model_id.as_str())
+            .context_window;
+    Ok(RouteCandidateResolution {
+        candidate,
+        context_window: ContextWindowResolution {
+            tokens: fallback_tokens,
+            source: ContextWindowSource::Fallback,
+        },
+    })
 }
 
 fn apply_context_window_override(limits: &mut RouteLimits, context_window: Option<u32>) {
@@ -178,13 +329,15 @@ pub(crate) fn resolve_runtime_route_for_identity(
     let provider = identity.provider;
     let mut route_config = prepared_route_config(config, &identity, model_selector);
     let saved_provider_model = configured_model_for_route(&route_config, provider);
-    let candidate = resolve_route_candidate(
+    let resolution = resolve_route_candidate_with_context_metadata(
         provider,
         model_selector,
         saved_provider_model,
         Some(route_config.deepseek_base_url()),
         route_config.context_window_for_provider_config(provider),
+        None,
     )?;
+    let candidate = resolution.candidate;
     let model = candidate.wire_model_id.as_str().to_string();
     set_model_for_route(&mut route_config, provider, &model);
 
@@ -193,6 +346,7 @@ pub(crate) fn resolve_runtime_route_for_identity(
         candidate,
         config: Box::new(route_config),
         model,
+        context_window: resolution.context_window,
         preflighted_client: None,
     })
 }
@@ -339,6 +493,159 @@ mod tests {
             ),
             1_048_576
         );
+    }
+
+    #[test]
+    fn kimi_code_bare_k3_uses_conservative_route_baseline() {
+        let candidate = resolve_route_candidate(
+            ApiProvider::Moonshot,
+            Some("k3"),
+            None,
+            Some(crate::config::DEFAULT_KIMI_CODE_BASE_URL.to_string()),
+            None,
+        )
+        .expect("Kimi Code K3 route");
+
+        assert_eq!(candidate.wire_model_id.as_str(), "k3");
+        assert_eq!(candidate.limits.context_tokens, Some(262_144));
+    }
+
+    #[test]
+    fn kimi_code_context_resolution_records_precedence_and_rejects_bad_metadata() {
+        let base = Some(crate::config::DEFAULT_KIMI_CODE_BASE_URL.to_string());
+        let static_floor = resolve_route_candidate_with_context_metadata(
+            ApiProvider::Moonshot,
+            Some("k3"),
+            None,
+            base.clone(),
+            None,
+            None,
+        )
+        .expect("Kimi Code route");
+        assert_eq!(static_floor.context_window.tokens, 262_144);
+        assert_eq!(
+            static_floor.context_window.source,
+            ContextWindowSource::StaticKimiCodeSafeFloor
+        );
+
+        let configured = resolve_route_candidate_with_context_metadata(
+            ApiProvider::Moonshot,
+            Some("k3"),
+            None,
+            base.clone(),
+            Some(1_048_576),
+            Some(ProviderReportedKimiCodeContext {
+                context_tokens: 1_048_576,
+                observed_at: Utc::now(),
+            }),
+        )
+        .expect("configured route");
+        assert_eq!(configured.context_window.tokens, 1_048_576);
+        assert_eq!(
+            configured.context_window.source,
+            ContextWindowSource::Configured
+        );
+
+        let reported = resolve_route_candidate_with_context_metadata(
+            ApiProvider::Moonshot,
+            Some("k3"),
+            None,
+            base.clone(),
+            None,
+            Some(ProviderReportedKimiCodeContext {
+                context_tokens: 1_048_576,
+                observed_at: Utc::now(),
+            }),
+        )
+        .expect("fresh documented provider metadata");
+        assert_eq!(reported.context_window.tokens, 1_048_576);
+        assert_eq!(
+            reported.context_window.source,
+            ContextWindowSource::ProviderReported
+        );
+
+        let stale = resolve_route_candidate_with_context_metadata(
+            ApiProvider::Moonshot,
+            Some("k3"),
+            None,
+            base,
+            None,
+            Some(ProviderReportedKimiCodeContext {
+                context_tokens: 1_048_576,
+                observed_at: Utc::now() - Duration::hours(25),
+            }),
+        )
+        .expect("stale metadata falls back safely");
+        assert_eq!(
+            stale.context_window.source,
+            ContextWindowSource::StaticKimiCodeSafeFloor
+        );
+
+        let generic = resolve_route_candidate_with_context_metadata(
+            ApiProvider::Moonshot,
+            Some("k3"),
+            None,
+            Some(crate::config::DEFAULT_MOONSHOT_BASE_URL.to_string()),
+            None,
+            Some(ProviderReportedKimiCodeContext {
+                context_tokens: 1_048_576,
+                observed_at: Utc::now(),
+            }),
+        )
+        .expect("generic Moonshot route");
+        assert_ne!(
+            generic.context_window.source,
+            ContextWindowSource::ProviderReported,
+            "Moonshot metadata may not promote bare K3 outside the exact Kimi Code route"
+        );
+    }
+
+    #[test]
+    fn kimi_code_k3_context_override_wins_over_conservative_baseline() {
+        let candidate = resolve_route_candidate(
+            ApiProvider::Moonshot,
+            Some("k3"),
+            None,
+            Some(crate::config::DEFAULT_KIMI_CODE_BASE_URL.to_string()),
+            Some(1_048_576),
+        )
+        .expect("Kimi Code K3 route");
+
+        assert_eq!(candidate.limits.context_tokens, Some(1_048_576));
+    }
+
+    #[test]
+    fn kimi_code_k3_baseline_does_not_leak_to_other_moonshot_routes() {
+        let exact_endpoint = Some(crate::config::DEFAULT_KIMI_CODE_BASE_URL.to_string());
+        let direct_moonshot = resolve_route_candidate(
+            ApiProvider::Moonshot,
+            Some("kimi-k3"),
+            None,
+            exact_endpoint.clone(),
+            None,
+        )
+        .expect("direct Moonshot K3 route");
+        assert_eq!(direct_moonshot.limits.context_tokens, Some(1_048_576));
+
+        let generic_moonshot = resolve_route_candidate(
+            ApiProvider::Moonshot,
+            Some("k3"),
+            None,
+            Some(crate::config::DEFAULT_MOONSHOT_BASE_URL.to_string()),
+            None,
+        )
+        .expect("generic Moonshot route");
+        assert_ne!(generic_moonshot.limits.context_tokens, Some(262_144));
+
+        let kimi_code_default = resolve_route_candidate(
+            ApiProvider::Moonshot,
+            Some(crate::config::DEFAULT_KIMI_CODE_MODEL),
+            None,
+            exact_endpoint,
+            None,
+        )
+        .expect("Kimi Code default route");
+        assert_ne!(kimi_code_default.limits.context_tokens, Some(262_144));
     }
 
     #[test]
