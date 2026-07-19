@@ -5,6 +5,7 @@
 
 pub(crate) mod backend;
 pub(crate) mod cache;
+pub(crate) mod citations;
 pub(crate) mod contract;
 pub(crate) mod extract;
 pub(crate) mod fetch;

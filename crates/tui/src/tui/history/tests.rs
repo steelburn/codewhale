@@ -2,7 +2,7 @@ use super::{
     ASSISTANT_GLYPH, ExecCell, ExecSource, GenericToolCell, HistoryCell, PlanUpdateCell,
     REASONING_CURSOR, REASONING_OPENER, REASONING_RAIL, TOOL_RUNNING_SYMBOLS,
     TOOL_STATUS_SYMBOL_MS, ToolCell, ToolStatus, TranscriptRenderOptions, USER_GLYPH,
-    assistant_label_style_for, extract_reasoning_summary, render_thinking,
+    WebSearchCell, assistant_label_style_for, extract_reasoning_summary, render_thinking,
     running_status_label_with_elapsed,
 };
 use crate::deepseek_theme::Theme;
@@ -12,6 +12,30 @@ use crate::tools::plan::{PlanSnapshot, StepStatus};
 use crate::tui::ui_text::{line_to_plain, slice_text, text_display_width};
 use ratatui::style::Modifier;
 use std::time::{Duration, Instant};
+
+#[test]
+fn web_search_cell_renders_receipt_source_degradation_and_citations() {
+    let cell = WebSearchCell {
+        query: "current release".to_string(),
+        status: ToolStatus::Success,
+        summary: Some("Found 2 results".to_string()),
+        source: Some("provider-native/xai/grok-4.5".to_string()),
+        degraded: Some("provider_native -> duckduckgo".to_string()),
+        ref_count: 2,
+    };
+    let rendered = cell
+        .lines_with_motion(120, true)
+        .iter()
+        .map(line_to_plain)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(rendered.contains("source"));
+    assert!(rendered.contains("provider-native/xai/grok-4.5"));
+    assert!(rendered.contains("degraded"));
+    assert!(rendered.contains("provider_native -> duckduckgo"));
+    assert!(rendered.contains("citations"));
+}
 
 // ---- elapsed-seconds badge for long-running tools ----
 //

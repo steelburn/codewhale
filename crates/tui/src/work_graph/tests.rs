@@ -853,3 +853,59 @@ fn evidence_ref_rejects_paths_and_key_material() {
     assert_eq!(ok.raw_bytes(), Some(4096));
     assert!(ok.truncated());
 }
+
+#[test]
+fn web_citation_evidence_is_typed_inspectable_and_fail_closed() {
+    let kind = EvidenceKind::WebCitation {
+        ref_id: "web_0123456789abcdef".to_string(),
+        url: "https://example.com/source".to_string(),
+        retrieved_at: "2026-07-19T18:00:00Z".to_string(),
+    };
+    let evidence = EvidenceRef::new(kind, "web_0123456789abcdef", None, false)
+        .expect("valid web citation evidence");
+    assert_eq!(evidence.kind().tag(), EvidenceKindTag::WebCitation);
+
+    let serialized = serde_json::to_value(&evidence).expect("serialize citation evidence");
+    let restored: EvidenceRef =
+        serde_json::from_value(serialized).expect("deserialize citation evidence");
+    assert_eq!(restored, evidence);
+
+    let mismatched = EvidenceRef::new(
+        EvidenceKind::WebCitation {
+            ref_id: "web_other".to_string(),
+            url: "https://example.com/source".to_string(),
+            retrieved_at: "2026-07-19T18:00:00Z".to_string(),
+        },
+        "web_0123456789abcdef",
+        None,
+        false,
+    )
+    .expect_err("mismatched ref must fail");
+    assert_eq!(mismatched, EvidenceRefError::WebCitationReferenceMismatch);
+
+    let credentialed = EvidenceRef::new(
+        EvidenceKind::WebCitation {
+            ref_id: "web_0123456789abcdef".to_string(),
+            url: "https://user:password@example.com/source".to_string(),
+            retrieved_at: "2026-07-19T18:00:00Z".to_string(),
+        },
+        "web_0123456789abcdef",
+        None,
+        false,
+    )
+    .expect_err("credentialed URL must fail");
+    assert_eq!(credentialed, EvidenceRefError::InvalidWebCitationUrl);
+
+    let query_credential = EvidenceRef::new(
+        EvidenceKind::WebCitation {
+            ref_id: "web_0123456789abcdef".to_string(),
+            url: "https://example.com/source?access_token=sensitive".to_string(),
+            retrieved_at: "2026-07-19T18:00:00Z".to_string(),
+        },
+        "web_0123456789abcdef",
+        None,
+        false,
+    )
+    .expect_err("credential-bearing query must fail");
+    assert_eq!(query_credential, EvidenceRefError::InvalidWebCitationUrl);
+}

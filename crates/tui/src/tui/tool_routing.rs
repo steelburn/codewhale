@@ -246,6 +246,9 @@ pub(super) fn handle_tool_call_started(
                 query,
                 status: ToolStatus::Running,
                 summary: None,
+                source: None,
+                degraded: None,
+                ref_count: 0,
             })),
         );
         return;
@@ -700,6 +703,10 @@ pub(super) fn handle_tool_call_complete(
                 match result.as_ref() {
                     Ok(tool_result) => {
                         search.summary = Some(summarize_tool_output(&tool_result.content));
+                        let presentation = web_search_presentation(&tool_result.content);
+                        search.source = presentation.source;
+                        search.degraded = presentation.degraded;
+                        search.ref_count = presentation.ref_count;
                     }
                     Err(err) => {
                         search.summary = Some(err.to_string());
@@ -788,6 +795,100 @@ pub(super) fn handle_tool_call_complete(
         tool_name: name.to_string(),
         summary: evidence_summary,
     });
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct WebSearchPresentation {
+    source: Option<String>,
+    degraded: Option<String>,
+    ref_count: usize,
+}
+
+fn web_search_presentation(content: &str) -> WebSearchPresentation {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(content) else {
+        return WebSearchPresentation::default();
+    };
+    let surfaces = if value.get("receipt").is_some() {
+        vec![&value]
+    } else {
+        value
+            .get("search_query")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| items.iter().collect())
+            .unwrap_or_default()
+    };
+    let source = surfaces
+        .iter()
+        .filter_map(|surface| surface.get("source").and_then(serde_json::Value::as_str))
+        .map(str::to_string)
+        .next();
+    let mut degraded = Vec::new();
+    let mut ref_count = 0usize;
+    for surface in surfaces {
+        if let Some(results) = surface.get("results").and_then(serde_json::Value::as_array) {
+            ref_count = ref_count.saturating_add(
+                results
+                    .iter()
+                    .filter(|result| {
+                        result
+                            .get("ref_id")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|ref_id| !ref_id.is_empty())
+                    })
+                    .count(),
+            );
+        }
+        if let Some(reasons) = surface
+            .pointer("/receipt/degraded")
+            .and_then(serde_json::Value::as_array)
+        {
+            for reason in reasons {
+                if let Some(label) = degraded_reason_label(reason)
+                    && !degraded.contains(&label)
+                {
+                    degraded.push(label);
+                }
+            }
+        }
+    }
+    WebSearchPresentation {
+        source,
+        degraded: (!degraded.is_empty()).then(|| degraded.join("; ")),
+        ref_count,
+    }
+}
+
+fn degraded_reason_label(reason: &serde_json::Value) -> Option<String> {
+    let kind = reason.get("kind")?.as_str()?;
+    let backend = |field: &str| {
+        reason
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+    };
+    Some(match kind {
+        "backend_unavailable" => format!("{} unavailable", backend("backend")),
+        "no_usable_results" => format!("{} returned no usable results", backend("backend")),
+        "backend_fallback" => format!("{} -> {}", backend("from"), backend("to")),
+        "challenge_detected" => format!("{} challenge", backend("backend")),
+        "scrape_fallback" => format!("{} -> {} scrape", backend("from"), backend("to")),
+        "knob_ignored" => format!(
+            "{} ignored",
+            reason
+                .get("knob")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("filter")
+        ),
+        "post_filtered" => format!(
+            "{} post-filtered",
+            reason
+                .get("knob")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("results")
+        ),
+        "synthesized_results" => "synthesized results".to_string(),
+        other => other.replace('_', " "),
+    })
 }
 
 /// Hydrate or advance the WorkflowPanel from a workflow tool JSON payload.
@@ -1554,6 +1655,56 @@ mod tests {
     use super::*;
     use crate::tools::plan::StepStatus;
     use serde_json::json;
+
+    #[test]
+    fn web_search_presentation_reads_source_degradation_and_citation_count() {
+        let presentation = web_search_presentation(
+            &json!({
+                "source": "provider-native/xai/grok-4.5",
+                "results": [
+                    {"ref_id": "web_a", "url": "https://example.com/a"},
+                    {"ref_id": "web_b", "url": "https://example.com/b"}
+                ],
+                "receipt": {
+                    "degraded": [
+                        {"kind": "backend_unavailable", "backend": "provider_native"},
+                        {"kind": "backend_fallback", "from": "provider_native", "to": "tavily"}
+                    ]
+                }
+            })
+            .to_string(),
+        );
+
+        assert_eq!(
+            presentation.source.as_deref(),
+            Some("provider-native/xai/grok-4.5")
+        );
+        assert_eq!(
+            presentation.degraded.as_deref(),
+            Some("provider_native unavailable; provider_native -> tavily")
+        );
+        assert_eq!(presentation.ref_count, 2);
+    }
+
+    #[test]
+    fn web_run_presentation_reads_nested_search_receipts() {
+        let presentation = web_search_presentation(
+            &json!({
+                "search_query": [{
+                    "source": "duckduckgo",
+                    "results": [{"ref_id": "web_a"}],
+                    "receipt": {
+                        "degraded": [{"kind": "knob_ignored", "knob": "recency"}]
+                    }
+                }]
+            })
+            .to_string(),
+        );
+
+        assert_eq!(presentation.source.as_deref(), Some("duckduckgo"));
+        assert_eq!(presentation.degraded.as_deref(), Some("recency ignored"));
+        assert_eq!(presentation.ref_count, 1);
+    }
 
     #[test]
     fn parse_plan_input_accepts_legacy_payload() {

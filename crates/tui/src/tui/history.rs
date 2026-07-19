@@ -1248,6 +1248,9 @@ pub struct WebSearchCell {
     pub query: String,
     pub status: ToolStatus,
     pub summary: Option<String>,
+    pub source: Option<String>,
+    pub degraded: Option<String>,
+    pub ref_count: usize,
 }
 
 impl WebSearchCell {
@@ -1268,6 +1271,30 @@ impl WebSearchCell {
             tool_value_style(),
             width,
         ));
+        if let Some(source) = self.source.as_ref() {
+            lines.extend(render_compact_kv(
+                "source",
+                source,
+                tool_value_style(),
+                width,
+            ));
+        }
+        if let Some(degraded) = self.degraded.as_ref() {
+            lines.extend(render_compact_kv(
+                "degraded",
+                degraded,
+                tool_value_style(),
+                width,
+            ));
+        }
+        if self.ref_count > 0 {
+            lines.extend(render_compact_kv(
+                "citations",
+                &self.ref_count.to_string(),
+                tool_value_style(),
+                width,
+            ));
+        }
         if let Some(summary) = self.summary.as_ref() {
             lines.extend(render_compact_kv(
                 "result",

@@ -150,17 +150,27 @@ pub enum EvidenceKindTag {
     Receipt,
     Approval,
     Route,
+    WebCitation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EvidenceKind {
     ToolRun,
-    Artifact { digest: String },
+    Artifact {
+        digest: String,
+    },
     TestSummary,
-    Receipt { owner: String },
+    Receipt {
+        owner: String,
+    },
     Approval,
     Route,
+    WebCitation {
+        ref_id: String,
+        url: String,
+        retrieved_at: String,
+    },
 }
 
 impl EvidenceKind {
@@ -173,6 +183,7 @@ impl EvidenceKind {
             EvidenceKind::Receipt { .. } => EvidenceKindTag::Receipt,
             EvidenceKind::Approval => EvidenceKindTag::Approval,
             EvidenceKind::Route => EvidenceKindTag::Route,
+            EvidenceKind::WebCitation { .. } => EvidenceKindTag::WebCitation,
         }
     }
 }
@@ -186,6 +197,9 @@ pub enum EvidenceRefError {
     HomeRelativePath,
     ContainsWhitespaceOrControl,
     LooksLikeKeyMaterial,
+    WebCitationReferenceMismatch,
+    InvalidWebCitationUrl,
+    InvalidWebCitationTimestamp,
 }
 
 impl std::fmt::Display for EvidenceRefError {
@@ -210,6 +224,15 @@ impl std::fmt::Display for EvidenceRefError {
             EvidenceRefError::LooksLikeKeyMaterial => {
                 write!(f, "evidence reference must not embed key material")
             }
+            EvidenceRefError::WebCitationReferenceMismatch => {
+                write!(f, "web citation reference must match its ref_id")
+            }
+            EvidenceRefError::InvalidWebCitationUrl => {
+                write!(f, "web citation URL must be HTTP(S) without credentials")
+            }
+            EvidenceRefError::InvalidWebCitationTimestamp => {
+                write!(f, "web citation retrieved_at must be RFC 3339")
+            }
         }
     }
 }
@@ -217,6 +240,31 @@ impl std::fmt::Display for EvidenceRefError {
 impl std::error::Error for EvidenceRefError {}
 
 const EVIDENCE_REFERENCE_MAX_LEN: usize = 512;
+
+fn web_citation_url_has_sensitive_query(url: &reqwest::Url) -> bool {
+    url.query_pairs().any(|(name, _)| {
+        let name = name.to_ascii_lowercase();
+        matches!(
+            name.as_ref(),
+            "access_token"
+                | "api_key"
+                | "authorization"
+                | "auth"
+                | "credential"
+                | "key"
+                | "session"
+                | "session_id"
+                | "sig"
+                | "signature"
+                | "token"
+                | "x-amz-credential"
+                | "x-amz-signature"
+                | "x-goog-credential"
+                | "x-goog-signature"
+        ) || name.ends_with("_token")
+            || name.ends_with("_key")
+    })
+}
 
 /// Summary/reference-only pointer to evidence: a logical artifact ID, run ID,
 /// or receipt handle — never absolute paths, never secrets, never raw logs or
@@ -277,6 +325,28 @@ impl EvidenceRef {
         }
         if reference.contains("-----BEGIN") {
             return Err(EvidenceRefError::LooksLikeKeyMaterial);
+        }
+        if let EvidenceKind::WebCitation {
+            ref_id,
+            url,
+            retrieved_at,
+        } = &kind
+        {
+            if ref_id != &reference {
+                return Err(EvidenceRefError::WebCitationReferenceMismatch);
+            }
+            let parsed = reqwest::Url::parse(url)
+                .ok()
+                .filter(|url| matches!(url.scheme(), "http" | "https"))
+                .filter(|url| url.host_str().is_some())
+                .filter(|url| url.username().is_empty() && url.password().is_none())
+                .filter(|url| !web_citation_url_has_sensitive_query(url));
+            if parsed.is_none() {
+                return Err(EvidenceRefError::InvalidWebCitationUrl);
+            }
+            if chrono::DateTime::parse_from_rfc3339(retrieved_at).is_err() {
+                return Err(EvidenceRefError::InvalidWebCitationTimestamp);
+            }
         }
         Ok(Self {
             kind,

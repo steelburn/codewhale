@@ -100,7 +100,7 @@ impl ToolSpec for WebSearchTool {
     }
 
     fn description(&self) -> &'static str {
-        "Search the web and return ranked results with URLs, snippets, and an execution receipt. When the exact active route reports a documented first-party server-side search tool, it is tried first; otherwise the default backend is DuckDuckGo with Bing fallback. Configured API backends visibly degrade through DuckDuckGo then Bing when unavailable, and every hop is recorded. Configuration and network-policy errors fail closed. Explicit Bing and private DuckDuckGo-compatible routes do not cross providers. Set `[search] provider = \"bing\" | \"tavily\" | \"bocha\" | \"metaso\" | \"searxng\" | \"baidu\" | \"volcengine\" | \"sofya\"` in config.toml, or `[search] base_url` for a private DuckDuckGo-compatible endpoint or trusted SearXNG instance. For a known canonical URL, prefer `fetch_url` directly."
+        "Search the web and return ranked results with URLs, snippets, session-scoped ref_ids, and an execution receipt. Open a result ref_id with `web.run` when the short summary is not enough; fetch only the few sources needed. When the exact active route reports a documented first-party server-side search tool, it is tried first; otherwise the default backend is DuckDuckGo with Bing fallback. Configured API backends visibly degrade through DuckDuckGo then Bing when unavailable, and every hop is recorded. Configuration and network-policy errors fail closed. Explicit Bing and private DuckDuckGo-compatible routes do not cross providers. Set `[search] provider = \"bing\" | \"tavily\" | \"bocha\" | \"metaso\" | \"searxng\" | \"baidu\" | \"volcengine\" | \"sofya\"` in config.toml, or `[search] base_url` for a private DuckDuckGo-compatible endpoint or trusted SearXNG instance. For a known canonical URL, prefer `fetch_url` directly."
     }
 
     fn input_schema(&self) -> Value {
@@ -749,6 +749,7 @@ pub(crate) async fn execute_search(
         &query,
     ) {
         validate_cached_search_policy(&cached, context)?;
+        register_search_citations(&mut cached, context);
         cached.receipt.cache_hit = true;
         cached.receipt.latency_ms = 0;
         return Ok(cached);
@@ -764,8 +765,9 @@ pub(crate) async fn execute_search(
     };
     let deadline = started + total_timeout;
     let chained = chain.search(&query, deadline, first_attempt_budget).await?;
-    let response =
+    let mut response =
         finalize_search_response(query.clone(), chained.capabilities, chained.raw, started);
+    register_search_citations(&mut response, context);
     cache::insert_search(
         &context.state_namespace,
         initial_backend,
@@ -774,6 +776,31 @@ pub(crate) async fn execute_search(
         response.clone(),
     );
     Ok(response)
+}
+
+fn register_search_citations(response: &mut SearchResponse, context: &ToolContext) {
+    let mut seen = std::collections::HashSet::new();
+    response.results.retain_mut(|result| {
+        let Some(citation) = super::web::citations::register(
+            &context.state_namespace,
+            &result.url,
+            Some(&result.title),
+        ) else {
+            return false;
+        };
+        result.ref_id = citation.ref_id;
+        result.url = citation.url;
+        seen.insert(result.ref_id.clone())
+    });
+    if response.count != response.results.len() {
+        rerank(&mut response.results);
+        response.count = response.results.len();
+        response.message = if response.count == 0 {
+            "No usable web citations found".to_string()
+        } else {
+            format!("Found {} result(s)", response.count)
+        };
+    }
 }
 
 fn preflight_search_provider(context: &ToolContext) -> Result<(), ToolError> {
@@ -1855,8 +1882,8 @@ mod tests {
         bocha_error_message, duckduckgo_search_url, extract_search_query, finalize_search_response,
         optional_search_max_results, parse_baidu_results, parse_bocha_results,
         parse_metaso_results, parse_searxng_results, parse_sofya_results, parse_tavily_results,
-        parse_volcengine_results, run_scrape_search_with_endpoints, sanitize_error_body,
-        searxng_search_url, truncate_error_body, volcengine_extract_text,
+        parse_volcengine_results, register_search_citations, run_scrape_search_with_endpoints,
+        sanitize_error_body, searxng_search_url, truncate_error_body, volcengine_extract_text,
     };
     use crate::tools::web::contract::{
         BackendId, BackendSearch, CapabilityState, DegradedReason, QueryCapabilities, QueryKnob,
@@ -2802,6 +2829,63 @@ mod tests {
                 knob: QueryKnob::Domains
             }
         )));
+    }
+
+    #[test]
+    fn search_results_receive_session_scoped_refs_and_sanitize_credential_urls() {
+        let query = SearchQuery::new("sources".to_string(), 5, None, Vec::new(), None);
+        let raw = BackendSearch {
+            backend: BackendId::DuckDuckGo,
+            source: "duckduckgo".to_string(),
+            backend_detail: None,
+            results: vec![
+                SearchResult::new(
+                    1,
+                    "Valid".to_string(),
+                    "https://example.com/source#section".to_string(),
+                    None,
+                    None,
+                ),
+                SearchResult::new(
+                    2,
+                    "Protected".to_string(),
+                    "https://example.com/protected?access_token=sensitive&view=full".to_string(),
+                    None,
+                    None,
+                ),
+            ],
+            degraded: Vec::new(),
+            note: None,
+        };
+        let mut response =
+            finalize_search_response(query, QueryCapabilities::count_only(), raw, Instant::now());
+        let context = crate::tools::spec::ToolContext::new(std::path::PathBuf::from("."))
+            .with_state_namespace("search-citation-session");
+
+        register_search_citations(&mut response, &context);
+
+        assert_eq!(response.count, 2);
+        assert_eq!(response.results[0].url, "https://example.com/source");
+        assert_eq!(
+            response.results[1].url,
+            "https://example.com/protected?view=full"
+        );
+        assert!(!response.results[1].url.contains("sensitive"));
+        assert!(response.results[0].ref_id.starts_with("web_"));
+        assert!(
+            crate::tools::web::citations::resolve(
+                "search-citation-session",
+                &response.results[0].ref_id
+            )
+            .is_some()
+        );
+        assert!(
+            crate::tools::web::citations::resolve(
+                "foreign-search-citation-session",
+                &response.results[0].ref_id
+            )
+            .is_none()
+        );
     }
 
     #[tokio::test]

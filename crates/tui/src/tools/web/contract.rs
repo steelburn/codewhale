@@ -219,6 +219,9 @@ impl DegradedReason {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SearchResult {
     pub(crate) rank: u8,
+    /// Session-scoped citation handle. Backends leave this empty; the shared
+    /// execution surface mints it before any result crosses the tool boundary.
+    pub(crate) ref_id: String,
     pub(crate) title: String,
     pub(crate) url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -243,6 +246,7 @@ impl SearchResult {
             .unwrap_or_default();
         Self {
             rank: u8::try_from(rank.clamp(1, 255)).unwrap_or(u8::MAX),
+            ref_id: String::new(),
             title,
             url,
             snippet,

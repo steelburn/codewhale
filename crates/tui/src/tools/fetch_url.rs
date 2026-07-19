@@ -53,6 +53,7 @@ impl Format {
 
 #[derive(Debug, Serialize)]
 struct FetchResponse {
+    ref_id: String,
     url: String,
     status: u16,
     headers: BTreeMap<String, String>,
@@ -91,7 +92,7 @@ impl ToolSpec for FetchUrlTool {
     }
 
     fn description(&self) -> &'static str {
-        "Fetch a known URL directly (HTTP GET) and return its content. Use this instead of `curl` in `exec_shell` — sandboxed, network-policy aware, and properly decoded. Plain-text endpoints (`.md`, `.txt`, `.json`, `.yaml`, `raw.githubusercontent.com`, public APIs) prefer this over the browser/automation stack. For unknown queries, use `web_search` first."
+        "Fetch a known URL directly (HTTP GET) and return its content with a session-scoped citation ref_id. Use this instead of `curl` in `exec_shell` — sandboxed, network-policy aware, and properly decoded. Plain-text endpoints (`.md`, `.txt`, `.json`, `.yaml`, `raw.githubusercontent.com`, public APIs) prefer this over the browser/automation stack. For unknown queries, use `web_search` first. If a login or authorization wall is returned, treat the wall as the result; do not claim the protected page was read."
     }
 
     fn input_schema(&self) -> Value {
@@ -209,6 +210,7 @@ impl ToolSpec for FetchUrlTool {
                 Err(error) => return Err(error),
             };
 
+        let citation_title = extracted.title.clone();
         let (processed, artifact_write) = render_extracted(
             &fetched.url,
             &fetched.content_type,
@@ -221,8 +223,15 @@ impl ToolSpec for FetchUrlTool {
             .as_ref()
             .map(|write| crate::artifacts::format_artifact_relative_path(&write.relative_path));
 
+        let citation = super::web::citations::register(
+            &context.state_namespace,
+            &fetched.url,
+            citation_title.as_deref(),
+        )
+        .ok_or_else(|| ToolError::execution_failed("fetched URL could not be registered"))?;
         let response = FetchResponse {
-            url: fetched.url,
+            ref_id: citation.ref_id,
+            url: citation.url,
             status: fetched.status,
             headers: fetched.headers,
             content_type: fetched.content_type,

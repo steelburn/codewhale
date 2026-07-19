@@ -546,6 +546,7 @@ fn acceptance_label(requirement: &AcceptanceRequirement) -> String {
                 EvidenceKindTag::Receipt => "receipt",
                 EvidenceKindTag::Approval => "approval",
                 EvidenceKindTag::Route => "route",
+                EvidenceKindTag::WebCitation => "web citation",
             };
             format!("evidence of kind {kind}")
         }
@@ -655,12 +656,15 @@ fn last_output_ref(snapshot: &WorkGraphSnapshot, node: &WorkNode) -> Option<Stri
 
 fn format_evidence_ref(evidence: &crate::work_graph::EvidenceRef) -> String {
     let kind = match evidence.kind() {
-        EvidenceKind::ToolRun => "tool run",
-        EvidenceKind::Artifact { .. } => "artifact",
-        EvidenceKind::TestSummary => "test summary",
-        EvidenceKind::Receipt { .. } => "receipt",
-        EvidenceKind::Approval => "approval",
-        EvidenceKind::Route => "route",
+        EvidenceKind::ToolRun => "tool run".to_string(),
+        EvidenceKind::Artifact { .. } => "artifact".to_string(),
+        EvidenceKind::TestSummary => "test summary".to_string(),
+        EvidenceKind::Receipt { .. } => "receipt".to_string(),
+        EvidenceKind::Approval => "approval".to_string(),
+        EvidenceKind::Route => "route".to_string(),
+        EvidenceKind::WebCitation {
+            url, retrieved_at, ..
+        } => format!("web citation · {url} · retrieved {retrieved_at}"),
     };
     let bytes = evidence
         .raw_bytes()

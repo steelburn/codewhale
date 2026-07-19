@@ -301,6 +301,7 @@ struct ScreenshotResult {
 
 #[derive(Debug, Clone, Serialize)]
 struct ImageResultEntry {
+    ref_id: String,
     image: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     thumbnail: Option<String>,
@@ -554,8 +555,20 @@ impl ToolSpec for WebRunTool {
                     })
                     .unwrap_or_default();
 
-                let (entries, warning) =
+                let (mut entries, warning) =
                     run_image_search(&query, max_results, timeout_ms, &domains).await?;
+                entries.retain_mut(|entry| {
+                    let canonical_url = entry.url.as_deref().unwrap_or(&entry.image);
+                    let Some(citation) = super::web::citations::register(
+                        &context.state_namespace,
+                        canonical_url,
+                        entry.title.as_deref(),
+                    ) else {
+                        return false;
+                    };
+                    entry.ref_id = citation.ref_id;
+                    true
+                });
 
                 let mut warnings = Vec::new();
                 if recency > 0 {
@@ -733,6 +746,12 @@ fn scoped_ref_prefix(namespace: &str) -> String {
 }
 
 fn store_page(namespace: &str, ref_id: &str, page: WebPage) {
+    let _ = super::web::citations::register_with_ref(
+        namespace,
+        ref_id,
+        &page.url,
+        page.title.as_deref(),
+    );
     with_state(|state| {
         state.store_page(namespace, ref_id, page);
     });
@@ -775,6 +794,11 @@ async fn resolve_or_fetch_page(
 ) -> Result<Arc<WebPage>, ToolError> {
     if let Some(page) = get_page(&context.state_namespace, ref_id) {
         return Ok(page);
+    }
+    if let Some(citation) = super::web::citations::resolve(&context.state_namespace, ref_id) {
+        return fetch_page(&citation.url, timeout_ms, context)
+            .await
+            .map(Arc::new);
     }
     if looks_like_url(ref_id) {
         return fetch_page(ref_id, timeout_ms, context).await.map(Arc::new);
@@ -924,6 +948,7 @@ async fn run_image_search(
         .into_iter()
         .filter(|item| !item.image.trim().is_empty())
         .map(|item| ImageResultEntry {
+            ref_id: String::new(),
             image: item.image,
             thumbnail: item.thumbnail,
             title: item.title,
@@ -1944,6 +1969,29 @@ mod tests {
             format!("{err}").contains("restricted address"),
             "expected restricted-address error; got {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn open_resolves_shared_citation_refs_only_in_their_session() {
+        let namespace = "shared-citation-open-session";
+        let citation = crate::tools::web::citations::register(
+            namespace,
+            "http://127.0.0.1/private",
+            Some("Private target"),
+        )
+        .expect("valid HTTP citation metadata");
+        let owner_context = ToolContext::new(PathBuf::from(".")).with_state_namespace(namespace);
+        let owner_error = resolve_or_fetch_page(&citation.ref_id, 5_000, &owner_context)
+            .await
+            .expect_err("resolved citation must still use the SSRF guard");
+        assert!(format!("{owner_error}").contains("restricted address"));
+
+        let foreign_context = ToolContext::new(PathBuf::from("."))
+            .with_state_namespace("shared-citation-foreign-session");
+        let foreign_error = resolve_or_fetch_page(&citation.ref_id, 5_000, &foreign_context)
+            .await
+            .expect_err("foreign session must not resolve citation ref");
+        assert!(format!("{foreign_error}").contains("Unknown ref_id"));
     }
 
     #[tokio::test]
