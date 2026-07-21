@@ -2459,6 +2459,7 @@ fn exec_shell_input_starts_detached(input: &serde_json::Value) -> bool {
 async fn execute_foreground_via_background(
     context: &ToolContext,
     command: &str,
+    working_dir: Option<String>,
     timeout_ms: u64,
     stdin_data: Option<&str>,
     tty: bool,
@@ -2474,7 +2475,7 @@ async fn execute_foreground_via_background(
         manager.clear_foreground_background_request();
         manager.execute_with_options_env_for_owner_and_work(
             command,
-            None,
+            working_dir.as_deref(),
             timeout_ms,
             true,
             stdin_data,
@@ -2797,7 +2798,10 @@ impl ToolSpec for BashTool {
                 let resolved = context.resolve_path(dir)?;
                 Some(resolved.to_string_lossy().to_string())
             }
-            None => None,
+            // Default to the tool context's workspace (which reflects the
+            // child agent's worktree when `worktree: true` was used), not the
+            // shared ShellManager's parent-workspace default_workspace.
+            None => Some(context.workspace.display().to_string()),
         };
 
         // #456 — collect env from any configured `shell_env` hooks. Runs
@@ -2977,6 +2981,7 @@ impl ToolSpec for BashTool {
             execute_foreground_via_background(
                 context,
                 command,
+                working_dir,
                 timeout_ms,
                 stdin_data.as_deref(),
                 combined_output,
