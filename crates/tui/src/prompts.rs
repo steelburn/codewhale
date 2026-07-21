@@ -1481,7 +1481,7 @@ mod tests {
     use crate::tools::apply_patch::ApplyPatchTool;
     use crate::tools::file::{EditFileTool, WriteFileTool};
     use crate::tools::handle::HandleReadTool;
-    use crate::tools::rlm::{RlmCloseTool, RlmConfigureTool, RlmEvalTool, RlmOpenTool};
+    use crate::tools::rlm::RlmTool;
     use crate::tools::shell::BashTool;
     use crate::tools::spec::ToolSpec;
     use tempfile::tempdir;
@@ -3284,10 +3284,18 @@ mod tests {
         }
 
         let descriptions = [
-            RlmOpenTool.description().to_string(),
-            RlmEvalTool::new(None).description().to_string(),
-            RlmConfigureTool.description().to_string(),
-            RlmCloseTool.description().to_string(),
+            RlmTool::alias("rlm_open", "open", None)
+                .description()
+                .to_string(),
+            RlmTool::alias("rlm_eval", "eval", None)
+                .description()
+                .to_string(),
+            RlmTool::alias("rlm_configure", "configure", None)
+                .description()
+                .to_string(),
+            RlmTool::alias("rlm_close", "close", None)
+                .description()
+                .to_string(),
             HandleReadTool.description().to_string(),
         ]
         .join("\n");

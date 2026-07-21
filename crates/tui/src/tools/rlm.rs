@@ -4,6 +4,12 @@
 //! `rlm_open` creates a named Python kernel over a large context,
 //! `rlm_eval` runs bounded probes against it, `rlm_configure` adjusts runtime
 //! feedback, and `rlm_close` tears it down.
+//!
+//! Unified surface (piagent phase B): the model sees one tool, `rlm`, with an
+//! `action` parameter routing to the per-action logic. The legacy `rlm_*`
+//! names stay registered as hidden compat aliases that force the action so
+//! saved transcripts replay correctly — the pattern `BashTool` established
+//! for `exec_shell*` in #4625.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -34,41 +40,276 @@ const FULL_STDOUT_TAIL_CHARS: usize = 1_024;
 const STDOUT_HANDLE_THRESHOLD_CHARS: usize = 1_000;
 const HARD_SUB_RLM_DEPTH_CAP: u32 = 3;
 
-pub struct RlmSessionObjectsTool;
+const ALL_ACTIONS: &[&str] = &["session_objects", "open", "eval", "configure", "close"];
+
+/// Unified RLM session tool.
+///
+/// One struct, one input schema: the canonical `rlm` tool plus hidden legacy
+/// aliases carrying a `forced_action`. `client` is only exercised by the
+/// `eval` action (child sub-RLM queries); other actions ignore it.
+pub struct RlmTool {
+    name: &'static str,
+    forced_action: Option<&'static str>,
+    client: Option<DeepSeekClient>,
+}
+
+impl RlmTool {
+    #[must_use]
+    pub fn new(name: &'static str, client: Option<DeepSeekClient>) -> Self {
+        Self {
+            name,
+            forced_action: None,
+            client,
+        }
+    }
+
+    #[must_use]
+    pub fn alias(name: &'static str, action: &'static str, client: Option<DeepSeekClient>) -> Self {
+        Self {
+            name,
+            forced_action: Some(action),
+            client,
+        }
+    }
+
+    fn resolve_action<'a>(&'a self, input: &'a Value) -> Result<&'a str, ToolError> {
+        let action = match self.forced_action {
+            Some(action) => action,
+            None => input
+                .get("action")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    ToolError::invalid_input(format!(
+                        "rlm: missing `action` (one of: {})",
+                        ALL_ACTIONS.join(", ")
+                    ))
+                })?,
+        };
+        if ALL_ACTIONS.contains(&action) {
+            Ok(action)
+        } else {
+            Err(ToolError::invalid_input(format!(
+                "rlm: invalid action `{action}` (one of: {})",
+                ALL_ACTIONS.join(", ")
+            )))
+        }
+    }
+
+    /// Mirror of the legacy per-tool approval contract: only `rlm_eval`
+    /// required approval (it is the non-bypassable code-eval surface, #3866).
+    fn action_requires_approval(action: &str) -> bool {
+        action == "eval"
+    }
+
+    /// Mirror of the legacy per-tool read-only contract (capability-derived):
+    /// `rlm_open` carries `ExecutesCode`, so only session_objects / configure /
+    /// close counted as read-only.
+    fn action_is_read_only(action: &str) -> bool {
+        matches!(action, "session_objects" | "configure" | "close")
+    }
+
+    fn action_capabilities(action: &str) -> Vec<ToolCapability> {
+        match action {
+            "session_objects" => vec![ToolCapability::ReadOnly],
+            "open" => vec![
+                ToolCapability::ReadOnly,
+                ToolCapability::Network,
+                ToolCapability::ExecutesCode,
+            ],
+            "eval" => vec![
+                ToolCapability::Network,
+                ToolCapability::ExecutesCode,
+                ToolCapability::RequiresApproval,
+            ],
+            // configure / close
+            _ => vec![ToolCapability::ReadOnly],
+        }
+    }
+}
 
 #[async_trait]
-impl ToolSpec for RlmSessionObjectsTool {
+impl ToolSpec for RlmTool {
     fn name(&self) -> &'static str {
-        "rlm_session_objects"
+        self.name
+    }
+
+    fn model_visible(&self) -> bool {
+        self.forced_action.is_none()
     }
 
     fn description(&self) -> &'static str {
-        "List active prompt/history/session symbolic objects as compact cards. \
-         Pass one of the returned `id` values to `rlm_open` as \
-         `session_object` to inspect it inside an RLM REPL without copying the \
-         full prompt or transcript into the parent context."
+        match self.forced_action {
+            Some("session_objects") => {
+                "List active prompt/history/session symbolic objects as compact cards. \
+                 Pass one of the returned `id` values to `rlm_open` as \
+                 `session_object` to inspect it inside an RLM REPL without copying the \
+                 full prompt or transcript into the parent context."
+            }
+            Some("open") => {
+                "Open a persistent RLM context. Loads `file_path`, `content`, `url`, \
+                 or `session_object` into a named Python kernel and returns only \
+                 metadata: name, length, preview, and sha256. Use this for large or \
+                 unfamiliar inputs so the parent transcript holds a handle, not the \
+                 body."
+            }
+            Some("eval") => {
+                "Run one Python REPL block against a named RLM context. Returns a \
+                 bounded projection of stdout/stderr plus metadata. If the code calls \
+                 FINAL/finalize, the final value is stored as a var_handle retrievable \
+                 with handle_read instead of copied unbounded into the parent context. \
+                 Large stdout/stderr payloads (>1k chars) are also stored as \
+                 var_handles (returned in stdout_handle / stderr_handle) to keep the \
+                 parent transcript lean. Batch child helpers require \
+                 dependency_mode='independent'; use sub_query_sequence or a \
+                 sequential loop for dependent work."
+            }
+            Some("configure") => {
+                "Configure a named RLM context: output feedback, child query timeout, \
+                 recursive sub-RLM depth, and explicit session sharing."
+            }
+            Some("close") => {
+                "Close a named RLM context, tear down its Python kernel, and return \
+                 usage/lifecycle metadata."
+            }
+            _ => {
+                "Persistent RLM sessions over large contexts. Actions: \"session_objects\" \
+                 (list active prompt/history/session symbolic objects as compact cards), \
+                 \"open\" (load file_path/content/url/session_object into a named Python \
+                 kernel; returns only metadata so the parent transcript holds a handle, \
+                 not the body), \"eval\" (run one bounded Python REPL block against a \
+                 named context; approval required; FINAL/finalize values and large \
+                 stdout/stderr become var_handles retrievable with handle_read), \
+                 \"configure\" (output feedback, child timeout, sub-RLM depth, session \
+                 sharing), \"close\" (tear down the kernel and return usage metadata)."
+            }
+        }
     }
 
     fn input_schema(&self) -> Value {
+        if let Some(action) = self.forced_action {
+            return legacy_action_schema(action);
+        }
         json!({
             "type": "object",
-            "properties": {}
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ALL_ACTIONS,
+                    "description": "Action to perform."
+                },
+                "name": {
+                    "type": "string",
+                    "description": "RLM context name, unique within this parent session (action=open: optional, defaults to a slug from the source). Required for action=eval/configure/close."
+                },
+                "file_path": {
+                    "type": "string",
+                    "description": "Workspace-relative file to load (action=open; exactly one of file_path/content/url/session_object)."
+                },
+                "content": {
+                    "type": "string",
+                    "description": "Inline content to load. Capped at 200k chars. (action=open)"
+                },
+                "url": {
+                    "type": "string",
+                    "description": "HTTP/HTTPS URL to fetch through fetch_url and load. (action=open)"
+                },
+                "session_object": {
+                    "type": "string",
+                    "description": "Stable symbolic active-session ref from action=session_objects, for example session://active/system_prompt or session://active/messages/0. (action=open)"
+                },
+                "code": {
+                    "type": "string",
+                    "description": "Raw Python executed against the context (no markdown fences). The loaded source is in scope; call FINAL(value)/finalize(...) to return a result handle. Example: print(len(SOURCE)). (action=eval)"
+                },
+                "output_feedback": {
+                    "type": "string",
+                    "enum": ["full", "metadata"],
+                    "description": "(action=configure)"
+                },
+                "sub_query_timeout_secs": {
+                    "type": "integer",
+                    "description": "(action=configure)"
+                },
+                "sub_rlm_max_depth": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 3,
+                    "description": "(action=configure)"
+                },
+                "share_session": {
+                    "type": "boolean",
+                    "description": "(action=configure)"
+                }
+            },
+            "additionalProperties": false
         })
     }
 
     fn capabilities(&self) -> Vec<ToolCapability> {
-        vec![ToolCapability::ReadOnly]
+        match self.forced_action {
+            Some(action) => Self::action_capabilities(action),
+            None => vec![
+                ToolCapability::Network,
+                ToolCapability::ExecutesCode,
+                ToolCapability::RequiresApproval,
+            ],
+        }
     }
 
     fn approval_requirement(&self) -> ApprovalRequirement {
-        ApprovalRequirement::Auto
+        match self.forced_action {
+            Some(action) if Self::action_requires_approval(action) => {
+                ApprovalRequirement::Required
+            }
+            Some(_) => ApprovalRequirement::Auto,
+            None => ApprovalRequirement::Required,
+        }
+    }
+
+    fn approval_requirement_for(&self, input: &Value) -> ApprovalRequirement {
+        match self.resolve_action(input) {
+            Ok(action) if Self::action_requires_approval(action) => {
+                ApprovalRequirement::Required
+            }
+            Ok(_) => ApprovalRequirement::Auto,
+            Err(_) => self.approval_requirement(),
+        }
+    }
+
+    fn is_read_only_for(&self, input: &Value) -> bool {
+        match self.resolve_action(input) {
+            Ok(action) => Self::action_is_read_only(action),
+            Err(_) => self.is_read_only(),
+        }
     }
 
     fn supports_parallel(&self) -> bool {
-        true
+        matches!(self.forced_action, Some("session_objects"))
     }
 
-    async fn execute(&self, _input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
+    fn supports_parallel_for(&self, input: &Value) -> bool {
+        matches!(self.resolve_action(input), Ok("session_objects"))
+    }
+
+    async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
+        match self.resolve_action(&input)? {
+            "session_objects" => self.execute_session_objects(context).await,
+            "open" => self.execute_open(&input, context).await,
+            "eval" => self.execute_eval(&input, context).await,
+            "configure" => self.execute_configure(&input, context).await,
+            "close" => self.execute_close(&input, context).await,
+            action => Err(ToolError::invalid_input(format!(
+                "rlm: invalid action `{action}`"
+            ))),
+        }
+    }
+}
+
+impl RlmTool {
+    async fn execute_session_objects(
+        &self,
+        context: &ToolContext,
+    ) -> Result<ToolResult, ToolError> {
         let snapshot = context.session_objects.as_ref().ok_or_else(|| {
             ToolError::not_available("rlm_session_objects: active session snapshot unavailable")
         })?;
@@ -86,66 +327,13 @@ impl ToolSpec for RlmSessionObjectsTool {
         }))
         .map_err(|e| ToolError::execution_failed(e.to_string()))
     }
-}
 
-pub struct RlmOpenTool;
-
-#[async_trait]
-impl ToolSpec for RlmOpenTool {
-    fn name(&self) -> &'static str {
-        "rlm_open"
-    }
-
-    fn description(&self) -> &'static str {
-        "Open a persistent RLM context. Loads `file_path`, `content`, `url`, \
-         or `session_object` into a named Python kernel and returns only \
-         metadata: name, length, preview, and sha256. Use this for large or \
-         unfamiliar inputs so the parent transcript holds a handle, not the \
-         body."
-    }
-
-    fn input_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "name": {
-                    "type": "string",
-                    "description": "Caller-chosen context name, unique within this parent session. Defaults to a slug from the source."
-                },
-                "file_path": {
-                    "type": "string",
-                    "description": "Workspace-relative file to load."
-                },
-                "content": {
-                    "type": "string",
-                    "description": "Inline content to load. Capped at 200k chars."
-                },
-                "url": {
-                    "type": "string",
-                    "description": "HTTP/HTTPS URL to fetch through fetch_url and load."
-                },
-                "session_object": {
-                    "type": "string",
-                    "description": "Stable symbolic active-session ref from rlm_session_objects, for example session://active/system_prompt or session://active/messages/0."
-                }
-            }
-        })
-    }
-
-    fn capabilities(&self) -> Vec<ToolCapability> {
-        vec![
-            ToolCapability::ReadOnly,
-            ToolCapability::Network,
-            ToolCapability::ExecutesCode,
-        ]
-    }
-
-    fn approval_requirement(&self) -> ApprovalRequirement {
-        ApprovalRequirement::Auto
-    }
-
-    async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
-        let source_count = rlm_open_source_count(&input);
+    async fn execute_open(
+        &self,
+        input: &Value,
+        context: &ToolContext,
+    ) -> Result<ToolResult, ToolError> {
+        let source_count = rlm_open_source_count(input);
         if source_count != 1 {
             let mut msg = String::from(
                 "rlm_open: provide exactly one of `file_path` (local file), `content` (inline text), `url`, or `session_object`",
@@ -173,7 +361,7 @@ impl ToolSpec for RlmOpenTool {
             return Err(ToolError::invalid_input(msg));
         }
 
-        let (body, source_type, source_hint) = load_source(&input, context).await?;
+        let (body, source_type, source_hint) = load_source(input, context).await?;
         if body.trim().is_empty() {
             return Err(ToolError::invalid_input(
                 "rlm_open: input is empty after loading",
@@ -220,63 +408,14 @@ impl ToolSpec for RlmOpenTool {
         }))
         .map_err(|e| ToolError::execution_failed(e.to_string()))
     }
-}
 
-pub struct RlmEvalTool {
-    client: Option<DeepSeekClient>,
-}
-
-impl RlmEvalTool {
-    #[must_use]
-    pub fn new(client: Option<DeepSeekClient>) -> Self {
-        Self { client }
-    }
-}
-
-#[async_trait]
-impl ToolSpec for RlmEvalTool {
-    fn name(&self) -> &'static str {
-        "rlm_eval"
-    }
-
-    fn description(&self) -> &'static str {
-        "Run one Python REPL block against a named RLM context. Returns a \
-         bounded projection of stdout/stderr plus metadata. If the code calls \
-         FINAL/finalize, the final value is stored as a var_handle retrievable \
-         with handle_read instead of copied unbounded into the parent context. \
-         Large stdout/stderr payloads (>1k chars) are also stored as \
-         var_handles (returned in stdout_handle / stderr_handle) to keep the \
-         parent transcript lean. Batch child helpers require \
-         dependency_mode='independent'; use sub_query_sequence or a \
-         sequential loop for dependent work."
-    }
-
-    fn input_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "required": ["name", "code"],
-            "properties": {
-                "name": { "type": "string", "description": "RLM context name returned by rlm_open." },
-                "code": { "type": "string", "description": "Raw Python executed against the context (no markdown fences). The loaded source is in scope; call FINAL(value)/finalize(...) to return a result handle. Example: print(len(SOURCE))." }
-            }
-        })
-    }
-
-    fn capabilities(&self) -> Vec<ToolCapability> {
-        vec![
-            ToolCapability::Network,
-            ToolCapability::ExecutesCode,
-            ToolCapability::RequiresApproval,
-        ]
-    }
-
-    fn approval_requirement(&self) -> ApprovalRequirement {
-        ApprovalRequirement::Required
-    }
-
-    async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
-        let name = required_non_empty_str(&input, "name")?;
-        let code = required_non_empty_str(&input, "code").map_err(|_| {
+    async fn execute_eval(
+        &self,
+        input: &Value,
+        context: &ToolContext,
+    ) -> Result<ToolResult, ToolError> {
+        let name = required_non_empty_str(input, "name")?;
+        let code = required_non_empty_str(input, "code").map_err(|_| {
             ToolError::invalid_input(
                 "rlm_eval: `code` is required and runs raw Python against the RLM context (no markdown fences). \
                  Example: {\"name\": \"<ctx>\", \"code\": \"print(len(SOURCE))\"}; call FINAL(value) to return a result handle.",
@@ -420,41 +559,13 @@ impl ToolSpec for RlmEvalTool {
             .map_err(|e| ToolError::execution_failed(e.to_string()))?
             .with_metadata(metadata))
     }
-}
 
-pub struct RlmConfigureTool;
-
-#[async_trait]
-impl ToolSpec for RlmConfigureTool {
-    fn name(&self) -> &'static str {
-        "rlm_configure"
-    }
-
-    fn description(&self) -> &'static str {
-        "Configure a named RLM context: output feedback, child query timeout, \
-         recursive sub-RLM depth, and explicit session sharing."
-    }
-
-    fn input_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "required": ["name"],
-            "properties": {
-                "name": { "type": "string" },
-                "output_feedback": { "type": "string", "enum": ["full", "metadata"] },
-                "sub_query_timeout_secs": { "type": "integer" },
-                "sub_rlm_max_depth": { "type": "integer", "minimum": 0, "maximum": 3 },
-                "share_session": { "type": "boolean" }
-            }
-        })
-    }
-
-    fn capabilities(&self) -> Vec<ToolCapability> {
-        vec![ToolCapability::ReadOnly]
-    }
-
-    async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
-        let name = required_non_empty_str(&input, "name")?;
+    async fn execute_configure(
+        &self,
+        input: &Value,
+        context: &ToolContext,
+    ) -> Result<ToolResult, ToolError> {
+        let name = required_non_empty_str(input, "name")?;
         let session = get_session(context, name).await?;
         let mut session = session.lock().await;
 
@@ -485,37 +596,13 @@ impl ToolSpec for RlmConfigureTool {
         }))
         .map_err(|e| ToolError::execution_failed(e.to_string()))
     }
-}
 
-pub struct RlmCloseTool;
-
-#[async_trait]
-impl ToolSpec for RlmCloseTool {
-    fn name(&self) -> &'static str {
-        "rlm_close"
-    }
-
-    fn description(&self) -> &'static str {
-        "Close a named RLM context, tear down its Python kernel, and return \
-         usage/lifecycle metadata."
-    }
-
-    fn input_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "required": ["name"],
-            "properties": {
-                "name": { "type": "string", "description": "RLM context name from rlm_open." }
-            }
-        })
-    }
-
-    fn capabilities(&self) -> Vec<ToolCapability> {
-        vec![ToolCapability::ReadOnly]
-    }
-
-    async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
-        let name = required_non_empty_str(&input, "name")?;
+    async fn execute_close(
+        &self,
+        input: &Value,
+        context: &ToolContext,
+    ) -> Result<ToolResult, ToolError> {
+        let name = required_non_empty_str(input, "name")?;
         let removed = {
             let mut sessions = context.runtime.rlm_sessions.lock().await;
             sessions.remove(name)
@@ -544,6 +631,69 @@ impl ToolSpec for RlmCloseTool {
         }
 
         ToolResult::json(&output).map_err(|e| ToolError::execution_failed(e.to_string()))
+    }
+}
+
+/// The exact schema the legacy per-action tool exposed, kept so hidden alias
+/// registrations report an identical contract to the pre-unification tools.
+fn legacy_action_schema(action: &str) -> Value {
+    match action {
+        "session_objects" => json!({
+            "type": "object",
+            "properties": {}
+        }),
+        "open" => json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Caller-chosen context name, unique within this parent session. Defaults to a slug from the source."
+                },
+                "file_path": {
+                    "type": "string",
+                    "description": "Workspace-relative file to load."
+                },
+                "content": {
+                    "type": "string",
+                    "description": "Inline content to load. Capped at 200k chars."
+                },
+                "url": {
+                    "type": "string",
+                    "description": "HTTP/HTTPS URL to fetch through fetch_url and load."
+                },
+                "session_object": {
+                    "type": "string",
+                    "description": "Stable symbolic active-session ref from rlm_session_objects, for example session://active/system_prompt or session://active/messages/0."
+                }
+            }
+        }),
+        "eval" => json!({
+            "type": "object",
+            "required": ["name", "code"],
+            "properties": {
+                "name": { "type": "string", "description": "RLM context name returned by rlm_open." },
+                "code": { "type": "string", "description": "Raw Python executed against the context (no markdown fences). The loaded source is in scope; call FINAL(value)/finalize(...) to return a result handle. Example: print(len(SOURCE))." }
+            }
+        }),
+        "configure" => json!({
+            "type": "object",
+            "required": ["name"],
+            "properties": {
+                "name": { "type": "string" },
+                "output_feedback": { "type": "string", "enum": ["full", "metadata"] },
+                "sub_query_timeout_secs": { "type": "integer" },
+                "sub_rlm_max_depth": { "type": "integer", "minimum": 0, "maximum": 3 },
+                "share_session": { "type": "boolean" }
+            }
+        }),
+        // close
+        _ => json!({
+            "type": "object",
+            "required": ["name"],
+            "properties": {
+                "name": { "type": "string", "description": "RLM context name from rlm_open." }
+            }
+        }),
     }
 }
 
@@ -702,21 +852,106 @@ mod tests {
 
     #[test]
     fn schema_uses_new_tool_names() {
-        assert_eq!(RlmSessionObjectsTool.name(), "rlm_session_objects");
-        assert_eq!(RlmOpenTool.name(), "rlm_open");
-        assert_eq!(RlmEvalTool::new(None).name(), "rlm_eval");
-        assert_eq!(RlmConfigureTool.name(), "rlm_configure");
-        assert_eq!(RlmCloseTool.name(), "rlm_close");
+        assert_eq!(
+            RlmTool::alias("rlm_session_objects", "session_objects", None).name(),
+            "rlm_session_objects"
+        );
+        assert_eq!(RlmTool::alias("rlm_open", "open", None).name(), "rlm_open");
+        assert_eq!(RlmTool::alias("rlm_eval", "eval", None).name(), "rlm_eval");
+        assert_eq!(
+            RlmTool::alias("rlm_configure", "configure", None).name(),
+            "rlm_configure"
+        );
+        assert_eq!(RlmTool::alias("rlm_close", "close", None).name(), "rlm_close");
+    }
+
+    #[test]
+    fn canonical_tool_is_the_visible_surface() {
+        let canonical = RlmTool::new("rlm", None);
+        assert!(canonical.model_visible());
+        assert_eq!(canonical.name(), "rlm");
+        let actions = canonical.input_schema()["properties"]["action"]["enum"]
+            .as_array()
+            .expect("action enum")
+            .clone();
+        for action in ["session_objects", "open", "eval", "configure", "close"] {
+            assert!(
+                actions.iter().any(|value| value.as_str() == Some(action)),
+                "canonical schema must offer action {action}"
+            );
+        }
+
+        for alias in [
+            RlmTool::alias("rlm_session_objects", "session_objects", None),
+            RlmTool::alias("rlm_open", "open", None),
+            RlmTool::alias("rlm_eval", "eval", None),
+            RlmTool::alias("rlm_configure", "configure", None),
+            RlmTool::alias("rlm_close", "close", None),
+        ] {
+            assert!(
+                !alias.model_visible(),
+                "legacy alias {} must stay hidden",
+                alias.name()
+            );
+        }
     }
 
     #[test]
     fn rlm_eval_requires_approval() {
-        let tool = RlmEvalTool::new(None);
+        let tool = RlmTool::alias("rlm_eval", "eval", None);
         assert_eq!(tool.approval_requirement(), ApprovalRequirement::Required);
         assert!(
             tool.capabilities()
                 .contains(&ToolCapability::RequiresApproval)
         );
+
+        // Approval routing on the canonical tool: only eval requires it.
+        let canonical = RlmTool::new("rlm", None);
+        assert_eq!(
+            canonical.approval_requirement_for(&json!({"action": "eval"})),
+            ApprovalRequirement::Required
+        );
+        assert_eq!(
+            canonical.approval_requirement_for(&json!({"action": "open"})),
+            ApprovalRequirement::Auto
+        );
+        assert_eq!(
+            canonical.approval_requirement_for(&json!({"action": "session_objects"})),
+            ApprovalRequirement::Auto
+        );
+    }
+
+    #[test]
+    fn read_only_and_parallel_flags_match_legacy_contract() {
+        // Legacy: session_objects was parallel-friendly read-only; open carried
+        // ExecutesCode (not read-only) with Auto approval; eval required approval.
+        let session_objects = RlmTool::alias("rlm_session_objects", "session_objects", None);
+        assert!(session_objects.supports_parallel());
+        assert!(session_objects.is_read_only_for(&json!({})));
+
+        let open = RlmTool::alias("rlm_open", "open", None);
+        assert!(!open.is_read_only_for(&json!({})));
+        assert_eq!(open.approval_requirement(), ApprovalRequirement::Auto);
+
+        let canonical = RlmTool::new("rlm", None);
+        assert!(canonical.supports_parallel_for(&json!({"action": "session_objects"})));
+        assert!(!canonical.supports_parallel_for(&json!({"action": "eval"})));
+        assert!(canonical.is_read_only_for(&json!({"action": "configure"})));
+        assert!(!canonical.is_read_only_for(&json!({"action": "open"})));
+        assert!(!canonical.is_read_only_for(&json!({"action": "eval"})));
+    }
+
+    #[test]
+    fn canonical_rejects_unknown_or_missing_action() {
+        let tool = RlmTool::new("rlm", None);
+        let err = tool
+            .resolve_action(&json!({}))
+            .expect_err("missing action must fail");
+        assert!(err.to_string().contains("missing `action`"));
+        let err = tool
+            .resolve_action(&json!({"action": "explode"}))
+            .expect_err("unknown action must fail");
+        assert!(err.to_string().contains("invalid action"));
     }
 
     #[test]
@@ -748,7 +983,7 @@ mod tests {
     #[tokio::test]
     async fn rlm_session_objects_lists_active_prompt_object() {
         let ctx = ctx_with_session_objects();
-        let result = RlmSessionObjectsTool
+        let result = RlmTool::alias("rlm_session_objects", "session_objects", None)
             .execute(json!({}), &ctx)
             .await
             .expect("list session objects");
@@ -766,7 +1001,7 @@ mod tests {
     #[tokio::test]
     async fn rlm_open_loads_active_session_prompt_object() {
         let ctx = ctx_with_session_objects();
-        let open = RlmOpenTool
+        let open = RlmTool::alias("rlm_open", "open", None)
             .execute(
                 json!({"name": "active_prompt", "session_object": "session://active/system_prompt"}),
                 &ctx,
@@ -782,7 +1017,7 @@ mod tests {
                 .contains("CodeWhale")
         );
 
-        RlmCloseTool
+        RlmTool::alias("rlm_close", "close", None)
             .execute(json!({"name": "active_prompt"}), &ctx)
             .await
             .expect("close");
@@ -791,7 +1026,7 @@ mod tests {
     #[tokio::test]
     async fn rlm_open_loads_transcript_message_object() {
         let ctx = ctx_with_session_objects();
-        let open = RlmOpenTool
+        let open = RlmTool::alias("rlm_open", "open", None)
             .execute(
                 json!({"name": "first_message", "session_object": "session://active/messages/0"}),
                 &ctx,
@@ -807,7 +1042,7 @@ mod tests {
                 .contains("RLM surface")
         );
 
-        RlmCloseTool
+        RlmTool::alias("rlm_close", "close", None)
             .execute(json!({"name": "first_message"}), &ctx)
             .await
             .expect("close");
@@ -816,7 +1051,7 @@ mod tests {
     #[tokio::test]
     async fn rlm_open_ignores_blank_source_defaults_from_schema_fillers() {
         let ctx = ctx();
-        RlmOpenTool
+        RlmTool::alias("rlm_open", "open", None)
             .execute(
                 json!({"name": "blank-defaults", "file_path": "", "content": "body", "url": ""}),
                 &ctx,
@@ -824,7 +1059,7 @@ mod tests {
             .await
             .expect("open with blank sibling source fields");
 
-        RlmCloseTool
+        RlmTool::alias("rlm_close", "close", None)
             .execute(json!({"name": "blank-defaults"}), &ctx)
             .await
             .expect("close");
@@ -835,7 +1070,7 @@ mod tests {
         // #2655: a wrong source field name yields actionable guidance, not just
         // the canonical "provide exactly one" message.
         let ctx = ctx();
-        let err = RlmOpenTool
+        let err = RlmTool::alias("rlm_open", "open", None)
             .execute(json!({"name": "doc", "prompt": "summarize this"}), &ctx)
             .await
             .expect_err("misnamed source field should fail");
@@ -852,7 +1087,7 @@ mod tests {
     async fn rlm_eval_missing_code_explains_raw_python() {
         // #2655: the missing-code error should teach the tool, with an example.
         let ctx = ctx();
-        let err = RlmEvalTool::new(None)
+        let err = RlmTool::alias("rlm_eval", "eval", None)
             .execute(json!({"name": "doc"}), &ctx)
             .await
             .expect_err("missing code should fail");
@@ -867,7 +1102,7 @@ mod tests {
     #[tokio::test]
     async fn rlm_session_open_eval_close_lifecycle() {
         let ctx = ctx();
-        RlmOpenTool
+        RlmTool::alias("rlm_open", "open", None)
             .execute(
                 json!({"name": "sample", "content": "alpha\nbeta\ngamma"}),
                 &ctx,
@@ -875,7 +1110,7 @@ mod tests {
             .await
             .expect("open");
 
-        let eval = RlmEvalTool::new(None)
+        let eval = RlmTool::alias("rlm_eval", "eval", None)
             .execute(json!({"name": "sample", "code": "print('ok')"}), &ctx)
             .await
             .expect("eval");
@@ -886,7 +1121,7 @@ mod tests {
             .replace("\r\n", "\n");
         assert_eq!(stdout_preview, "ok\n");
 
-        let close = RlmCloseTool
+        let close = RlmTool::alias("rlm_close", "close", None)
             .execute(json!({"name": "sample"}), &ctx)
             .await
             .expect("close");
@@ -894,14 +1129,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rlm_canonical_action_routing_runs_full_lifecycle() {
+        // The visible surface: one `rlm` tool, action-parameterized.
+        let ctx = ctx();
+        let tool = RlmTool::new("rlm", None);
+        tool.execute(
+            json!({"action": "open", "name": "canonical", "content": "body"}),
+            &ctx,
+        )
+        .await
+        .expect("open via canonical action");
+
+        let eval = tool
+            .execute(
+                json!({"action": "eval", "name": "canonical", "code": "print('ok')"}),
+                &ctx,
+            )
+            .await
+            .expect("eval via canonical action");
+        let eval_json: Value = serde_json::from_str(&eval.content).expect("eval json");
+        let stdout_preview = eval_json["stdout_preview"]
+            .as_str()
+            .expect("stdout_preview")
+            .replace("\r\n", "\n");
+        assert_eq!(stdout_preview, "ok\n");
+
+        let close = tool
+            .execute(json!({"action": "close", "name": "canonical"}), &ctx)
+            .await
+            .expect("close via canonical action");
+        assert!(close.content.contains("canonical"));
+    }
+
+    #[tokio::test]
     async fn rlm_eval_final_returns_handle() {
         let ctx = ctx();
-        RlmOpenTool
+        RlmTool::alias("rlm_open", "open", None)
             .execute(json!({"name": "finals", "content": "body"}), &ctx)
             .await
             .expect("open");
 
-        let eval = RlmEvalTool::new(None)
+        let eval = RlmTool::alias("rlm_eval", "eval", None)
             .execute(
                 json!({"name": "finals", "code": "finalize('done', confidence=0.8)"}),
                 &ctx,
@@ -913,7 +1181,7 @@ mod tests {
         assert_eq!(eval_json["final"]["name"], "final_1");
         assert_eq!(eval_json["confidence"], 0.8);
 
-        RlmCloseTool
+        RlmTool::alias("rlm_close", "close", None)
             .execute(json!({"name": "finals"}), &ctx)
             .await
             .expect("close");
@@ -922,12 +1190,12 @@ mod tests {
     #[tokio::test]
     async fn rlm_eval_final_preserves_json_handle() {
         let ctx = ctx();
-        RlmOpenTool
+        RlmTool::alias("rlm_open", "open", None)
             .execute(json!({"name": "json-final", "content": "body"}), &ctx)
             .await
             .expect("open");
 
-        let eval = RlmEvalTool::new(None)
+        let eval = RlmTool::alias("rlm_eval", "eval", None)
             .execute(
                 json!({"name": "json-final", "code": "finalize({'answer': 42, 'items': ['a', 'b']})"}),
                 &ctx,
@@ -949,7 +1217,7 @@ mod tests {
         let read_json: Value = serde_json::from_str(&read.content).expect("read json");
         assert_eq!(read_json["matches"], json!(["a", "b"]));
 
-        RlmCloseTool
+        RlmTool::alias("rlm_close", "close", None)
             .execute(json!({"name": "json-final"}), &ctx)
             .await
             .expect("close");
@@ -958,11 +1226,11 @@ mod tests {
     #[tokio::test]
     async fn rlm_configure_metadata_omits_stdout() {
         let ctx = ctx();
-        RlmOpenTool
+        RlmTool::alias("rlm_open", "open", None)
             .execute(json!({"name": "quiet", "content": "body"}), &ctx)
             .await
             .expect("open");
-        RlmConfigureTool
+        RlmTool::alias("rlm_configure", "configure", None)
             .execute(
                 json!({"name": "quiet", "output_feedback": "metadata", "sub_rlm_max_depth": 99}),
                 &ctx,
@@ -970,14 +1238,14 @@ mod tests {
             .await
             .expect("configure");
 
-        let eval = RlmEvalTool::new(None)
+        let eval = RlmTool::alias("rlm_eval", "eval", None)
             .execute(json!({"name": "quiet", "code": "print('hidden')"}), &ctx)
             .await
             .expect("eval");
         let eval_json: Value = serde_json::from_str(&eval.content).expect("eval json");
         assert!(eval_json.get("stdout_preview").is_none());
 
-        RlmCloseTool
+        RlmTool::alias("rlm_close", "close", None)
             .execute(json!({"name": "quiet"}), &ctx)
             .await
             .expect("close");

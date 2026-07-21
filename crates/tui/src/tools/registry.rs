@@ -893,16 +893,27 @@ impl ToolRegistryBuilder {
     }
 
     /// Include persistent RLM session tools.
+    ///
+    /// The model sees one tool, `rlm`, with an `action` parameter; the legacy
+    /// `rlm_*` names stay registered as hidden compat aliases (#4625 pattern,
+    /// piagent phase B).
     #[must_use]
     pub fn with_rlm_tool(self, client: Option<DeepSeekClient>, _root_model: String) -> Self {
-        use super::rlm::{
-            RlmCloseTool, RlmConfigureTool, RlmEvalTool, RlmOpenTool, RlmSessionObjectsTool,
-        };
-        self.with_tool(Arc::new(RlmSessionObjectsTool))
-            .with_tool(Arc::new(RlmOpenTool))
-            .with_tool(Arc::new(RlmEvalTool::new(client)))
-            .with_tool(Arc::new(RlmConfigureTool))
-            .with_tool(Arc::new(RlmCloseTool))
+        use super::rlm::RlmTool;
+        self.with_tool(Arc::new(RlmTool::new("rlm", client.clone())))
+            .with_tool(Arc::new(RlmTool::alias(
+                "rlm_session_objects",
+                "session_objects",
+                client.clone(),
+            )))
+            .with_tool(Arc::new(RlmTool::alias("rlm_open", "open", client.clone())))
+            .with_tool(Arc::new(RlmTool::alias("rlm_eval", "eval", client.clone())))
+            .with_tool(Arc::new(RlmTool::alias(
+                "rlm_configure",
+                "configure",
+                client.clone(),
+            )))
+            .with_tool(Arc::new(RlmTool::alias("rlm_close", "close", client)))
     }
 
     /// Include `handle_read`, the bounded projection reader for symbolic
