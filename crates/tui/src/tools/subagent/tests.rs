@@ -212,13 +212,19 @@ fn headless_worker_record_tracks_lifecycle_without_tui_projection() {
         None,
         None,
     );
-    manager.record_worker_progress(
+    manager.record_worker_event(
         "agent_worker_contract",
-        "step 1: requesting model response".to_string(),
+        AgentWorkerStatus::ModelWait,
+        Some("step 1: requesting model response".to_string()),
+        Some(1),
+        None,
     );
-    manager.record_worker_progress(
+    manager.record_worker_event(
         "agent_worker_contract",
-        "step 1: running tool 'read_file'".to_string(),
+        AgentWorkerStatus::RunningTool,
+        Some("step 1: running tool 'read_file'".to_string()),
+        Some(1),
+        Some("read_file".to_string()),
     );
 
     let mut result = make_snapshot(SubAgentStatus::Completed);
@@ -466,6 +472,7 @@ fn agent_progress_preserves_event_channel_headroom_under_load() {
         Some(&tx),
         "agent_busy",
         "step 1: requesting model response".to_string(),
+        AgentProgressEventMeta::new(AgentWorkerStatus::ModelWait).with_step(1),
         None,
         1,
     );
@@ -479,6 +486,7 @@ fn agent_progress_preserves_event_channel_headroom_under_load() {
         Some(&tx),
         "agent_waiting",
         "waiting for user input".to_string(),
+        AgentProgressEventMeta::new(AgentWorkerStatus::WaitingForUser),
         None,
         1,
     );
@@ -493,8 +501,10 @@ fn agent_progress_preserves_event_channel_headroom_under_load() {
     }
     assert!(matches!(
         rx.try_recv(),
-        Ok(Event::AgentProgress { id, status, .. })
-            if id == "agent_waiting" && status == "waiting for user input"
+        Ok(Event::AgentProgress { id, status, activity, .. })
+            if id == "agent_waiting"
+                && status == "waiting for user input"
+                && activity.worker_status == AgentWorkerStatus::WaitingForUser
     ));
     assert!(rx.try_recv().is_err());
 }
@@ -507,6 +517,7 @@ fn agent_progress_uses_small_event_channels_without_headroom_reservation() {
         Some(&tx),
         "agent_small_channel",
         "step 1: requesting model response".to_string(),
+        AgentProgressEventMeta::new(AgentWorkerStatus::ModelWait).with_step(1),
         None,
         1,
     );
@@ -514,8 +525,11 @@ fn agent_progress_uses_small_event_channels_without_headroom_reservation() {
     assert_eq!(tx.capacity(), 7);
     assert!(matches!(
         rx.try_recv(),
-        Ok(Event::AgentProgress { id, status, .. })
-            if id == "agent_small_channel" && status == "step 1: requesting model response"
+        Ok(Event::AgentProgress { id, status, activity, .. })
+            if id == "agent_small_channel"
+                && status == "step 1: requesting model response"
+                && activity.worker_status == AgentWorkerStatus::ModelWait
+                && activity.step == Some(1)
     ));
 }
 
@@ -1140,6 +1154,35 @@ fn implementer_prompt_is_not_forced_into_explorer_cap() {
     assert!(prompt.contains("not limited to an explorer-style 3-5 tool-call cap"));
     assert!(prompt.contains("Checkpoint before expanding scope"));
     assert!(!prompt.contains("Default to `EFFORT: quick`"));
+}
+
+#[test]
+fn role_prompts_use_canonical_file_action_contract() {
+    let explore = SubAgentType::Explore.system_prompt();
+    assert!(
+        explore.contains("`File` with actions `list`, `search_name`, `search_content`, and `read`")
+    );
+
+    let implementer = SubAgentType::Implementer.system_prompt();
+    assert!(implementer.contains("`File` action `read`"));
+    assert!(implementer.contains("action `edit`"));
+    assert!(implementer.contains("action `patch`"));
+
+    for prompt in [&explore, &implementer] {
+        for legacy_name in [
+            "list_dir",
+            "file_search",
+            "grep_files",
+            "read_file",
+            "edit_file",
+            "apply_patch",
+        ] {
+            assert!(
+                !prompt.contains(legacy_name),
+                "live role prompt must not teach legacy File alias {legacy_name}: {prompt}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -2416,8 +2459,13 @@ async fn agent_tool_status_returns_running_child_projection() {
         let mut manager_guard = manager.write().await;
         manager_guard.agents.insert(agent_id.clone(), agent);
         manager_guard.register_worker(make_worker_spec(&agent_id, tmp.path().to_path_buf()));
-        manager_guard
-            .record_worker_progress(&agent_id, "step 1: requesting model response".to_string());
+        manager_guard.record_worker_event(
+            &agent_id,
+            AgentWorkerStatus::ModelWait,
+            Some("step 1: requesting model response".to_string()),
+            Some(1),
+            None,
+        );
     }
 
     let tool = AgentTool::new(Arc::clone(&manager), stub_runtime());
