@@ -2577,87 +2577,136 @@ fn spawn_tool_lifecycle_screen_fixture(
     let handle = std::thread::spawn(move || -> anyhow::Result<()> {
         let deadline = Instant::now() + Duration::from_secs(75);
         let mut chat_index = 0_usize;
+        let mut contract_errors = Vec::new();
+        let mut connection_errors = Vec::new();
         while chat_index < replies.len() && Instant::now() < deadline {
             let Ok((mut stream, _)) = listener.accept() else {
                 std::thread::sleep(Duration::from_millis(10));
                 continue;
             };
-            let request = read_http_request(&mut stream)?;
+            let request = match read_http_request(&mut stream) {
+                Ok(request) if !request.trim().is_empty() => request,
+                Ok(_) => continue,
+                Err(error) => {
+                    connection_errors.push(format!("request read failed: {error:#}"));
+                    continue;
+                }
+            };
             let request_line = request.lines().next().unwrap_or_default();
-            let (content_type, body) =
-                if request_line.starts_with("GET ") && request_line.contains("/models") {
-                    (
-                        "application/json",
-                        serde_json::json!({
-                            "object": "list",
-                            "data": [{"id": "deepseek-v4-pro", "object": "model"}]
-                        })
-                        .to_string(),
-                    )
-                } else if request_line.starts_with("POST ")
-                    && request_line.contains("/chat/completions")
-                {
-                    let request_body = request
-                        .split_once("\r\n\r\n")
-                        .map(|(_, body)| body)
-                        .unwrap_or_default();
-                    let request_json: serde_json::Value = serde_json::from_str(request_body)?;
-                    let request_contract = request_json.to_string();
-                    match chat_index {
-                        0 => anyhow::ensure!(
-                            request_contract.contains("exercise the real PTY tool lifecycle"),
-                            "initial request omitted the user prompt"
-                        ),
-                        1 => anyhow::ensure!(
-                            request_contract.contains("call_work_pty")
-                                && request_contract.contains("\"role\":\"tool\""),
-                            "second request omitted the work_update result"
-                        ),
-                        2 => {
-                            let bash_result = request_json
-                                .get("messages")
-                                .and_then(serde_json::Value::as_array)
-                                .and_then(|messages| {
-                                    messages.iter().find(|message| {
-                                        message.get("role").and_then(serde_json::Value::as_str)
-                                            == Some("tool")
-                                            && message
-                                                .get("tool_call_id")
-                                                .and_then(serde_json::Value::as_str)
-                                                == Some("call_bash_pty")
-                                    })
-                                })
-                                .and_then(|message| message.get("content"))
-                                .and_then(serde_json::Value::as_str)
-                                .unwrap_or_default();
-                            anyhow::ensure!(
-                                bash_result.contains("Exact evidence retained")
-                                    && bash_result.contains("art_call_bash_pty")
-                                    && !bash_result.contains("PTY-EVIDENCE-DEEP-SENTINEL")
-                                    && !bash_result.contains("/artifacts/"),
-                                "final request omitted the bounded session-owned Bash receipt"
-                            )
-                        }
-                        _ => unreachable!("bounded lifecycle fixture"),
+            let mut is_chat_response = false;
+            let (content_type, body) = if request_line.starts_with("GET ")
+                && request_line.contains("/models")
+            {
+                (
+                    "application/json",
+                    serde_json::json!({
+                        "object": "list",
+                        "data": [{"id": "deepseek-v4-pro", "object": "model"}]
+                    })
+                    .to_string(),
+                )
+            } else if request_line.starts_with("POST ")
+                && request_line.contains("/chat/completions")
+            {
+                let request_body = request
+                    .split_once("\r\n\r\n")
+                    .map(|(_, body)| body)
+                    .unwrap_or_default();
+                let request_json: serde_json::Value = match serde_json::from_str(request_body) {
+                    Ok(request_json) => request_json,
+                    Err(error) => {
+                        contract_errors.push(format!(
+                            "chat request JSON parse failed for {request_line}: {error}"
+                        ));
+                        let body = "invalid JSON".to_string();
+                        let response = format!(
+                            "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                        let _ = stream.flush();
+                        continue;
                     }
-                    let body = replies[chat_index].clone();
-                    chat_index += 1;
-                    ("text/event-stream", body)
-                } else {
-                    ("text/plain", "not found".to_string())
                 };
+                let request_contract = request_json.to_string();
+                match chat_index {
+                    0 if !request_contract.contains("exercise the real PTY tool lifecycle") => {
+                        contract_errors.push("initial request omitted the user prompt".into());
+                    }
+                    1 if !(request_contract.contains("call_work_pty")
+                        && request_contract.contains("\"role\":\"tool\"")) =>
+                    {
+                        contract_errors
+                            .push("second request omitted the work_update result".into());
+                    }
+                    2 => {
+                        let bash_result = request_json
+                            .get("messages")
+                            .and_then(serde_json::Value::as_array)
+                            .and_then(|messages| {
+                                messages.iter().find(|message| {
+                                    message.get("role").and_then(serde_json::Value::as_str)
+                                        == Some("tool")
+                                        && message
+                                            .get("tool_call_id")
+                                            .and_then(serde_json::Value::as_str)
+                                            == Some("call_bash_pty")
+                                })
+                            })
+                            .and_then(|message| message.get("content"))
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default();
+                        if !(bash_result.contains("Exact evidence retained")
+                            && bash_result.contains("art_call_bash_pty")
+                            && !bash_result.contains("PTY-EVIDENCE-DEEP-SENTINEL")
+                            && !bash_result.contains("/artifacts/"))
+                        {
+                            contract_errors.push(format!(
+                                    "final request omitted the bounded session-owned Bash receipt (receipt={}, handle={}, deep_sentinel={}, artifact_path={})",
+                                    bash_result.contains("Exact evidence retained"),
+                                    bash_result.contains("art_call_bash_pty"),
+                                    bash_result.contains("PTY-EVIDENCE-DEEP-SENTINEL"),
+                                    bash_result.contains("/artifacts/"),
+                                ));
+                        }
+                    }
+                    0 | 1 => {}
+                    _ => unreachable!("bounded lifecycle fixture"),
+                }
+                let body = replies[chat_index].clone();
+                is_chat_response = true;
+                ("text/event-stream", body)
+            } else {
+                ("text/plain", "not found".to_string())
+            };
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             );
-            stream.write_all(response.as_bytes())?;
-            stream.flush()?;
+            if let Err(error) = stream
+                .write_all(response.as_bytes())
+                .and_then(|()| stream.flush())
+            {
+                connection_errors
+                    .push(format!("response write failed for {request_line}: {error}"));
+                continue;
+            }
+            if is_chat_response {
+                chat_index += 1;
+            }
         }
         anyhow::ensure!(
             chat_index == replies.len(),
-            "fixture served {chat_index}/{} chat requests",
-            replies.len()
+            "fixture served {chat_index}/{} chat requests; ignored connection errors: {}",
+            replies.len(),
+            connection_errors.join(" | ")
         );
+        if !contract_errors.is_empty() {
+            anyhow::bail!(
+                "tool lifecycle fixture contract errors:\n{}",
+                contract_errors.join("\n")
+            );
+        }
         Ok(())
     });
     Ok((format!("http://{address}"), handle))
@@ -2713,12 +2762,21 @@ fn spawn_semantic_activity_motion_fixture(
     let handle = std::thread::spawn(move || -> anyhow::Result<()> {
         let deadline = Instant::now() + Duration::from_secs(90);
         let mut chat_index = 0_usize;
+        let mut contract_errors = Vec::new();
+        let mut connection_errors = Vec::new();
         while chat_index < 3 && Instant::now() < deadline {
             let Ok((mut stream, _)) = listener.accept() else {
                 std::thread::sleep(Duration::from_millis(10));
                 continue;
             };
-            let request = read_http_request(&mut stream)?;
+            let request = match read_http_request(&mut stream) {
+                Ok(request) if !request.trim().is_empty() => request,
+                Ok(_) => continue,
+                Err(error) => {
+                    connection_errors.push(format!("request read failed: {error:#}"));
+                    continue;
+                }
+            };
             let request_line = request.lines().next().unwrap_or_default();
             if request_line.starts_with("GET ") && request_line.contains("/models") {
                 let body = serde_json::json!({
@@ -2730,37 +2788,76 @@ fn spawn_semantic_activity_motion_fixture(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
-                stream.write_all(response.as_bytes())?;
-                stream.flush()?;
+                if let Err(error) = stream
+                    .write_all(response.as_bytes())
+                    .and_then(|()| stream.flush())
+                {
+                    connection_errors.push(format!(
+                        "model response write failed for {request_line}: {error}"
+                    ));
+                }
                 continue;
             }
-            anyhow::ensure!(
-                request_line.starts_with("POST ") && request_line.contains("/chat/completions"),
-                "unexpected semantic activity fixture request: {request_line}"
-            );
+            if !(request_line.starts_with("POST ") && request_line.contains("/chat/completions")) {
+                contract_errors.push(format!(
+                    "unexpected semantic activity fixture request: {request_line}"
+                ));
+                let body = "not found";
+                let response = format!(
+                    "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+                continue;
+            }
 
             let request_body = request
                 .split_once("\r\n\r\n")
                 .map(|(_, body)| body)
                 .unwrap_or_default();
-            let request_json: serde_json::Value = serde_json::from_str(request_body)?;
+            let request_json: serde_json::Value = match serde_json::from_str(request_body) {
+                Ok(request_json) => request_json,
+                Err(error) => {
+                    contract_errors.push(format!(
+                        "chat request JSON parse failed for {request_line}: {error}"
+                    ));
+                    let body = "invalid JSON";
+                    let response = format!(
+                        "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
+                    continue;
+                }
+            };
             let request_contract = request_json.to_string();
             match chat_index {
-                0 => anyhow::ensure!(
-                    request_contract.contains("show semantic activity with less chrome"),
-                    "initial request omitted semantic activity prompt"
-                ),
-                1 => anyhow::ensure!(
-                    request_contract.contains("call_read_motion")
-                        && request_contract.contains("MOTION-FIFO-CONTENT")
-                        && request_contract.contains("\"role\":\"tool\""),
-                    "Bash request omitted completed File.read evidence"
-                ),
-                2 => anyhow::ensure!(
-                    request_contract.contains("call_bash_motion")
-                        && request_contract.contains("MOTION-BASH-END"),
-                    "final request omitted completed Bash evidence"
-                ),
+                0 if !request_contract.contains("show semantic activity with less chrome") => {
+                    contract_errors.push("initial request omitted semantic activity prompt".into());
+                }
+                1 if !(request_contract.contains("call_read_motion")
+                    && request_contract.contains("MOTION-FIFO-CONTENT")
+                    && request_contract.contains("\"role\":\"tool\"")) =>
+                {
+                    contract_errors.push(format!(
+                        "Bash request omitted completed File.read evidence (call={}, content={}, tool_role={})",
+                        request_contract.contains("call_read_motion"),
+                        request_contract.contains("MOTION-FIFO-CONTENT"),
+                        request_contract.contains("\"role\":\"tool\""),
+                    ));
+                }
+                2 if !(request_contract.contains("call_bash_motion")
+                    && request_contract.contains("MOTION-BASH-END")) =>
+                {
+                    contract_errors.push(format!(
+                        "final request omitted completed Bash evidence (call={}, completion={})",
+                        request_contract.contains("call_bash_motion"),
+                        request_contract.contains("MOTION-BASH-END"),
+                    ));
+                }
+                0..=2 => {}
                 _ => unreachable!("bounded semantic activity fixture"),
             }
 
@@ -2769,9 +2866,16 @@ fn spawn_semantic_activity_motion_fixture(
                 let headers = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {body_len}\r\nConnection: close\r\n\r\n"
                 );
-                stream.write_all(headers.as_bytes())?;
-                stream.write_all(reasoning_prefix.as_bytes())?;
-                stream.flush()?;
+                if let Err(error) = stream
+                    .write_all(headers.as_bytes())
+                    .and_then(|()| stream.write_all(reasoning_prefix.as_bytes()))
+                    .and_then(|()| stream.flush())
+                {
+                    connection_errors.push(format!(
+                        "reasoning prefix write failed for {request_line}: {error}"
+                    ));
+                    continue;
+                }
 
                 let release_deadline = Instant::now() + Duration::from_secs(30);
                 while !reasoning_release.exists() && Instant::now() < release_deadline {
@@ -2781,8 +2885,15 @@ fn spawn_semantic_activity_motion_fixture(
                     reasoning_release.exists(),
                     "reasoning phase was never released by the PTY test"
                 );
-                stream.write_all(read_tail.as_bytes())?;
-                stream.flush()?;
+                if let Err(error) = stream
+                    .write_all(read_tail.as_bytes())
+                    .and_then(|()| stream.flush())
+                {
+                    connection_errors.push(format!(
+                        "File.read tail write failed for {request_line}: {error}"
+                    ));
+                    continue;
+                }
             } else {
                 let body = if chat_index == 1 {
                     &bash_reply
@@ -2793,15 +2904,29 @@ fn spawn_semantic_activity_motion_fixture(
                     "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
-                stream.write_all(response.as_bytes())?;
-                stream.flush()?;
+                if let Err(error) = stream
+                    .write_all(response.as_bytes())
+                    .and_then(|()| stream.flush())
+                {
+                    connection_errors.push(format!(
+                        "chat response write failed for {request_line}: {error}"
+                    ));
+                    continue;
+                }
             }
             chat_index += 1;
         }
         anyhow::ensure!(
             chat_index == 3,
-            "semantic activity fixture served {chat_index}/3 chat requests"
+            "semantic activity fixture served {chat_index}/3 chat requests; ignored connection errors: {}",
+            connection_errors.join(" | ")
         );
+        if !contract_errors.is_empty() {
+            anyhow::bail!(
+                "semantic activity fixture contract errors:\n{}",
+                contract_errors.join("\n")
+            );
+        }
         Ok(())
     });
     Ok((format!("http://{address}"), handle))
