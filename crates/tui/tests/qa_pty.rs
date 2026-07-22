@@ -3067,11 +3067,24 @@ fn maybe_transcript_marker_before_icon(
         .find(|ch| !ch.is_whitespace())
 }
 
-fn transcript_marker_before_icon(frame: &qa_harness::Frame, needle: &str, icon: &str) -> char {
-    maybe_transcript_marker_before_icon(frame, needle, icon).unwrap_or_else(|| {
-        panic!(
-            "transcript marker before {icon:?} on row {needle:?} missing:\n{}",
-            frame.debug_dump()
+fn wait_for_transcript_marker_before_icon(
+    h: &mut Harness,
+    needle: &str,
+    icon: &str,
+    timeout: Duration,
+) -> anyhow::Result<char> {
+    let mut captured = None;
+    h.wait_for(
+        |frame| {
+            captured = maybe_transcript_marker_before_icon(frame, needle, icon);
+            captured.is_some()
+        },
+        timeout,
+    )?;
+    captured.ok_or_else(|| {
+        anyhow::anyhow!(
+            "transcript marker before {icon:?} on row {needle:?} missing after wait:\n{}",
+            h.frame().debug_dump()
         )
     })
 }
@@ -4108,7 +4121,8 @@ fn semantic_activity_motion_crosses_reasoning_reading_and_tool_use_in_a_real_uni
                 h.frame().debug_dump()
             );
         } else if !case.ascii_safe {
-            let initial_tool_marker = transcript_marker_before_icon(h.frame(), "run running", "▶");
+            let initial_tool_marker =
+                wait_for_transcript_marker_before_icon(&mut h, "run running", "▶", KEY_TIMEOUT)?;
             assert_eq!(
                 Some(initial_tool_marker),
                 case.static_marker,
@@ -4118,8 +4132,10 @@ fn semantic_activity_motion_crosses_reasoning_reading_and_tool_use_in_a_real_uni
             );
             std::thread::sleep(Duration::from_millis(320));
             h.pump();
+            let marker_after_delay =
+                wait_for_transcript_marker_before_icon(&mut h, "run running", "▶", KEY_TIMEOUT)?;
             assert_eq!(
-                transcript_marker_before_icon(h.frame(), "run running", "▶"),
+                marker_after_delay,
                 initial_tool_marker,
                 "static transcript tool marker moved in {}:\n{}",
                 case.name,
@@ -4139,8 +4155,10 @@ fn semantic_activity_motion_crosses_reasoning_reading_and_tool_use_in_a_real_uni
                 |frame| frame.contains("using tool") && frame.contains("run running"),
                 KEY_TIMEOUT,
             )?;
+            let marker_after_resize =
+                wait_for_transcript_marker_before_icon(&mut h, "run running", "▶", KEY_TIMEOUT)?;
             assert_eq!(
-                transcript_marker_before_icon(h.frame(), "run running", "▶"),
+                marker_after_resize,
                 initial_tool_marker,
                 "state-change redraw moved a static transcript marker in {}:\n{}",
                 case.name,
