@@ -13,7 +13,8 @@
 #      notice and must stay private.)
 #   4. Internal `codewhale-*` path dependency pins match the workspace version.
 #   5. The TUI crate's packaged changelog copy matches root `CHANGELOG.md`.
-#   6. The current release has a dated Keep a Changelog entry and compare link.
+#   6. The current version has either an explicit source-candidate entry or a
+#      dated Keep a Changelog release entry and a matching compare link.
 #   7. README contributor additions are mentioned in the current release entry.
 #   8. `SECURITY.md` keeps the dedicated security contact.
 #   9. Generated website facts carry the workspace version.
@@ -23,6 +24,16 @@
 #  12. `Cargo.lock` is in sync with the manifests (`cargo metadata --locked`
 #      fails if not).
 set -euo pipefail
+
+require_dated_release=0
+if [[ "${1:-}" == "--require-dated-release" ]]; then
+  require_dated_release=1
+  shift
+fi
+if [[ "$#" -ne 0 ]]; then
+  echo "Usage: $0 [--require-dated-release]" >&2
+  exit 2
+fi
 
 cd "$(dirname "$0")/../.."
 
@@ -95,7 +106,10 @@ if ! ./scripts/sync-changelog.sh --check >/dev/null 2>&1; then
   fail=1
 fi
 
-# 6) Current release-note shape.
+# 6) Current candidate/release-note shape. Normal branch and release-candidate
+# CI must accept an honest source candidate. Tag creation and public release
+# workflows pass --require-dated-release so publication cannot proceed until
+# the same entry has a real release date and tag-based compare link.
 current_section="$(
   awk -v version="${workspace_version}" '
     index($0, "## [" version "] - ") == 1 { in_section = 1; print; next }
@@ -107,8 +121,15 @@ if [[ -z "${current_section}" ]]; then
   echo "::error::CHANGELOG.md must contain a section for ${workspace_version}." >&2
   fail=1
 else
-  if ! grep -qE "^## \\[${workspace_version}\\] - [0-9]{4}-[0-9]{2}-[0-9]{2}$" <<<"${current_section}"; then
-    echo "::error::CHANGELOG.md section ${workspace_version} must use '## [${workspace_version}] - YYYY-MM-DD'." >&2
+  dated_heading="## [${workspace_version}] - YYYY-MM-DD"
+  candidate_heading="## [${workspace_version}] - Unreleased candidate"
+  if [[ "${require_dated_release}" == "1" ]]; then
+    if ! grep -qE "^## \\[${workspace_version}\\] - [0-9]{4}-[0-9]{2}-[0-9]{2}$" <<<"${current_section}"; then
+      echo "::error::Publication requires CHANGELOG.md section ${workspace_version} to use '${dated_heading}'." >&2
+      fail=1
+    fi
+  elif ! grep -qE "^## \\[${workspace_version}\\] - ([0-9]{4}-[0-9]{2}-[0-9]{2}|Unreleased candidate)$" <<<"${current_section}"; then
+    echo "::error::CHANGELOG.md section ${workspace_version} must use '${candidate_heading}' or '${dated_heading}'." >&2
     fail=1
   fi
   if ! grep -qE "^### (Added|Changed|Deprecated|Removed|Fixed|Security)$" <<<"${current_section}"; then
@@ -120,6 +141,10 @@ fi
 compare_line="$(grep -E "^\\[${workspace_version}\\]: " CHANGELOG.md || true)"
 if [[ -z "${compare_line}" ]]; then
   echo "::error::CHANGELOG.md must include a compare link for ${workspace_version}." >&2
+  fail=1
+elif [[ "${require_dated_release}" == "1" ]] &&
+  ! grep -qE "^\\[${workspace_version}\\]: https://github.com/Hmbown/CodeWhale/compare/v[0-9]+\\.[0-9]+\\.[0-9]+\\.\\.\\.v${workspace_version}$" <<<"${compare_line}"; then
+  echo "::error::Publication requires the ${workspace_version} compare link to end at v${workspace_version}." >&2
   fail=1
 fi
 

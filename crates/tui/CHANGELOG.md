@@ -7,9 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.9.1] - 2026-07-20
+## [0.9.1] - Unreleased candidate
 
-Codewhale v0.9.1 ships a first-class local web client over the Runtime API,
+The Codewhale v0.9.1 source candidate includes a first-class local web client over the Runtime API,
 first-class OpenCode Go and restored xAI device login on the provider surface,
 calendar-correct hourly automations, a buildable OpenHarmony workflow-js
 target, and hardening for Auto routing, remote-terminal clipboard transport,
@@ -34,7 +34,7 @@ restart recovery, and the community site's content boundaries.
   of this narrow route until Codewhale supports per-model wire selection
   (#1481 by @seanthefuturegorilla; implementation harvested from PR #773 by
   @zhangweiii and PR #1050 by @sternelee).
-- Publish native Windows ARM64 `codewhale`, `codew`, and `codewhale-tui`
+- Prepare native Windows ARM64 `codewhale`, `codew`, and `codewhale-tui`
   binaries, npm selection, updater support, and standard/portable release
   archives. Build and smoke them on GitHub's native Windows 11 ARM runner,
   and move Linux ARM64 release builds to the native Ubuntu ARM runner to
@@ -86,6 +86,11 @@ restart recovery, and the community site's content boundaries.
 
 ### Fixed
 
+- Default canonical `Bash` runs with no explicit `cwd` to the active
+  `ToolContext.workspace`, including an isolated sub-agent worktree, instead of
+  falling through to the shared shell manager's parent workspace. The regression
+  test detects the selected workspace through marker files so it remains
+  meaningful across PowerShell path spellings (#4674, PR #4673 by @fleitz).
 - Generate QuickJS bindings for `aarch64-unknown-linux-ohos` with the native
   SDK's libclang and sysroot, carry the OHOS target and sysroot through final
   linking, and keep unsupported persistent PTY dependencies out of the target
@@ -265,6 +270,9 @@ Thank you to the contributors whose code, reports, and reviews shaped v0.9.1:
   contract (PRs #4475 and #4476).
 - [@dmitri-0](https://github.com/dmitri-0) — configurable cache-hit visibility
   in the phase strip (PR #4474).
+- [@fleitz](https://github.com/fleitz) — the canonical `Bash` no-`cwd`
+  workspace fix and regression test that keep isolated sub-agent commands in
+  their own worktree (PR #4673, closing #4674).
 - [@SparkofSpike](https://github.com/SparkofSpike) — the Windows Ctrl+O
   reproduction that exposed pre-pager result truncation and conflicting composer
   shortcut routing (#4482), and the exact Vim-space regression reproduction

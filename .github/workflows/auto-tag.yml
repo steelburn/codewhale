@@ -99,7 +99,7 @@ jobs:
       - name: Verify version consistency
         if: steps.check.outputs.exists == 'false'
         run: |
-          ./scripts/release/check-versions.sh || {
+          ./scripts/release/check-versions.sh --require-dated-release || {
             echo "::error::Version consistency check failed. Aborting tag creation." >&2
             exit 1
           }

@@ -99,7 +99,7 @@ jobs:
               exit 1
             fi
           done
-          ./scripts/release/check-versions.sh
+          ./scripts/release/check-versions.sh --require-dated-release
       - name: Require release source on main
         run: ./scripts/release/ensure-release-on-main.sh "${{ steps.release.outputs.sha }}"
       - name: Refuse an existing public asset set
