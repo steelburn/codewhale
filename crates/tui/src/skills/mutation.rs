@@ -40,14 +40,12 @@ impl SkillTargetScope {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // ReplaceConfirmed used by manager confirmation flow (phase 4)
 pub enum ConflictPolicy {
     Reject,
     ReplaceConfirmed,
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Id-based variants used by SkillsManagerView (phase 4)
 pub enum SkillMutationRequest {
     InstallRemote {
         source: InstallSource,
@@ -103,13 +101,16 @@ pub enum SkillMutationOutcome {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // full receipt fields consumed by manager UI / receipts (phase 4)
 pub struct SkillMutationReceipt {
+    #[allow(dead_code)] // surfaced by manager detail / future receipt toast
     pub action: SkillActionKind,
     pub name: String,
+    #[allow(dead_code)] // surfaced by manager detail / future receipt toast
     pub scope: SkillScope,
     pub safe_target_path: String,
+    #[allow(dead_code)] // reserved for digest-diff UI
     pub before_digest: Option<String>,
+    #[allow(dead_code)] // reserved for digest-diff UI
     pub after_digest: Option<String>,
     pub outcome: SkillMutationOutcome,
 }

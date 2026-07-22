@@ -28,6 +28,7 @@ use crate::tui::widgets::agent_card::AgentLifecycle;
 pub mod fleet_roster;
 pub mod fleet_setup;
 pub mod mode_picker;
+pub mod skills_manager;
 pub mod status_picker;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +57,7 @@ pub enum ModalKind {
     ThemePicker,
     ContextMenu,
     ContextInspector,
+    SkillsManager,
 }
 
 /// Clear and paint a modal popup with an opaque surface.
@@ -904,6 +906,14 @@ pub enum ViewEvent {
         text: String,
         label: String,
     },
+    /// Emitted by the skills manager when the user confirms an install /
+    /// import / update / remove / trust action. The host runs the mutation
+    /// controller and rebuilds the open manager view.
+    SkillMutationRequested {
+        request: crate::skills::mutation::SkillMutationRequest,
+    },
+    /// Toggle owned-only vs compatible audit scan inside the skills manager.
+    SkillsManagerToggleCompatible,
 }
 
 #[derive(Debug, Clone)]

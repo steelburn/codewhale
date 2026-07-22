@@ -180,6 +180,9 @@ fn list_skills(app: &mut App, arg: Option<&str>) -> CommandResult {
             }
             prefix = Some(trimmed.to_ascii_lowercase());
         }
+    } else {
+        // Bare `/skills` opens the unified manager (owned-only, zero network).
+        return CommandResult::action(AppAction::OpenSkillsManager);
     }
     let skills_dir = app.skills_dir.clone();
     let registry = discover_visible_skills(app);
@@ -901,7 +904,7 @@ pub(in crate::commands) const SKILLS_INFO: crate::commands::traits::CommandInfo 
     crate::commands::traits::CommandInfo {
         name: "skills",
         aliases: &["jinengliebiao"],
-        usage: "/skills [--remote|sync|inspect|<prefix>]",
+        usage: "/skills [--remote|sync|inspect|<prefix>]  (bare opens manager)",
         description_id: crate::localization::MessageId::CmdSkillsDescription,
     };
 
@@ -1099,11 +1102,24 @@ mod tests {
     }
 
     #[test]
-    fn test_list_skills_empty_directory() {
+    fn test_bare_skills_opens_manager() {
         let tmpdir = TempDir::new().unwrap();
         let _home = IsolatedHome::new(&tmpdir);
         let mut app = create_test_app_with_tmpdir(&tmpdir);
         let result = list_skills(&mut app, None);
+        assert!(matches!(
+            result.action,
+            Some(AppAction::OpenSkillsManager)
+        ));
+    }
+
+    #[test]
+    fn test_list_skills_empty_directory() {
+        let tmpdir = TempDir::new().unwrap();
+        let _home = IsolatedHome::new(&tmpdir);
+        let mut app = create_test_app_with_tmpdir(&tmpdir);
+        // Empty arg still uses the legacy text inventory (prefix path).
+        let result = list_skills(&mut app, Some(""));
         assert!(result.message.is_some());
         let msg = result.message.unwrap();
         assert!(msg.contains("No skills found"));
@@ -1124,7 +1140,7 @@ mod tests {
             "---\nname: test-skill\ndescription: A test skill\n---\nDo something",
         );
         let mut app = create_test_app_with_tmpdir(&tmpdir);
-        let result = list_skills(&mut app, None);
+        let result = list_skills(&mut app, Some(""));
         assert!(result.message.is_some());
         let msg = result.message.unwrap();
         assert!(msg.contains("Available skills"));
@@ -1245,7 +1261,7 @@ mod tests {
         );
 
         let mut app = create_test_app_with_tmpdir(&tmpdir);
-        let result = list_skills(&mut app, None);
+        let result = list_skills(&mut app, Some(""));
         let msg = result.message.unwrap();
 
         // User-created skills must appear in their own section so they
@@ -1287,7 +1303,7 @@ mod tests {
         );
 
         let mut app = create_test_app_with_tmpdir(&tmpdir);
-        let result = list_skills(&mut app, None);
+        let result = list_skills(&mut app, Some(""));
         let msg = result.message.unwrap();
 
         assert!(msg.contains("/workspace-skill"), "got: {msg}");
@@ -1364,7 +1380,7 @@ mod tests {
         let mut app = create_test_app_with_tmpdir(&tmpdir);
         app.skills_dir = tmpdir.path().join(".codewhale").join("skills");
         app.skills_scan_codewhale_only = true;
-        let result = list_skills(&mut app, None);
+        let result = list_skills(&mut app, Some(""));
         let msg = result.message.unwrap();
 
         assert!(msg.contains("/codewhale-skill"), "got: {msg}");

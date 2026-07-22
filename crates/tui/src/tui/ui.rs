@@ -10738,6 +10738,13 @@ async fn apply_command_result(
                     );
                 }
             }
+            AppAction::OpenSkillsManager => {
+                if app.view_stack.top_kind() != Some(ModalKind::SkillsManager) {
+                    app.view_stack.push(
+                        crate::tui::views::skills_manager::SkillsManagerView::new(app),
+                    );
+                }
+            }
             AppAction::OpenFleetRoster => {
                 if app.view_stack.top_kind() != Some(ModalKind::FleetRoster) {
                     app.view_stack
@@ -12674,6 +12681,119 @@ fn refresh_config_view_if_open(app: &mut App, focus_key: &str) {
     }
 }
 
+fn refresh_skills_manager_if_open(
+    app: &mut App,
+    status: Option<String>,
+    focus: Option<&crate::skills::audit::AuditedSkillId>,
+) {
+    if app.view_stack.top_kind() != Some(ModalKind::SkillsManager) {
+        return;
+    }
+    let Some(mut boxed) = app.view_stack.pop() else {
+        return;
+    };
+    let rebuilt = if let Some(prev) = boxed
+        .as_any_mut()
+        .downcast_mut::<crate::tui::views::skills_manager::SkillsManagerView>()
+    {
+        crate::tui::views::skills_manager::SkillsManagerView::rebuild_preserving(
+            app, prev, status, focus,
+        )
+    } else {
+        crate::tui::views::skills_manager::SkillsManagerView::new(app)
+    };
+    app.view_stack.push(rebuilt);
+}
+
+async fn handle_skill_mutation_requested(
+    app: &mut App,
+    request: crate::skills::mutation::SkillMutationRequest,
+) {
+    use crate::skills::install::{DEFAULT_MAX_SIZE_BYTES, DEFAULT_REGISTRY_URL};
+    use crate::skills::mutation::{MutationContext, SkillMutationOutcome, SkillMutationRequest};
+
+    let focus = match &request {
+        SkillMutationRequest::ImportExternal { source_id, .. } => Some(source_id.clone()),
+        SkillMutationRequest::Update { skill_id, .. }
+        | SkillMutationRequest::Remove { skill_id, .. }
+        | SkillMutationRequest::Trust { skill_id, .. } => Some(skill_id.clone()),
+        SkillMutationRequest::InstallRemote { .. }
+        | SkillMutationRequest::UpdateByName { .. }
+        | SkillMutationRequest::RemoveByName { .. }
+        | SkillMutationRequest::TrustByName { .. } => None,
+    };
+
+    let workspace = app.workspace.clone();
+    let home = dirs::home_dir();
+    let cfg = crate::config::Config::load(None, None).unwrap_or_default();
+    let network = cfg
+        .network
+        .clone()
+        .map(|policy| policy.into_runtime())
+        .unwrap_or_default();
+    let skills_cfg = cfg.skills.as_ref();
+    let max_size = skills_cfg
+        .and_then(|s| s.max_install_size_bytes)
+        .unwrap_or(DEFAULT_MAX_SIZE_BYTES);
+    let registry_url = skills_cfg
+        .and_then(|s| s.registry_url.clone())
+        .unwrap_or_else(|| DEFAULT_REGISTRY_URL.to_string());
+
+    let skills_dir = app.skills_dir.clone();
+    let result = {
+        let ctx = MutationContext {
+            workspace: &workspace,
+            home: home.as_deref(),
+            configured_skills_dir: Some(skills_dir.as_path()),
+            network: &network,
+            max_size,
+            registry_url: &registry_url,
+        };
+        crate::skills::mutation::execute(request, &ctx).await
+    };
+
+    let (status, refresh_skills) = match result {
+        Ok(receipt) => {
+            let msg = match &receipt.outcome {
+                SkillMutationOutcome::Installed => {
+                    format!("Installed '{}' → {}", receipt.name, receipt.safe_target_path)
+                }
+                SkillMutationOutcome::Updated => format!("Updated '{}'", receipt.name),
+                SkillMutationOutcome::NoChange => {
+                    format!("'{}': no upstream change", receipt.name)
+                }
+                SkillMutationOutcome::Removed => format!("Removed '{}'", receipt.name),
+                SkillMutationOutcome::Trusted => format!("Trusted '{}'", receipt.name),
+                SkillMutationOutcome::Imported => {
+                    format!("Imported '{}' → {}", receipt.name, receipt.safe_target_path)
+                }
+                SkillMutationOutcome::AlreadyPresent => {
+                    format!("'{}' already present (exact duplicate)", receipt.name)
+                }
+                SkillMutationOutcome::NeedsApproval(host) => {
+                    format!("Needs network approval for {host}")
+                }
+                SkillMutationOutcome::NetworkDenied(host) => {
+                    format!("Network denied for {host}")
+                }
+            };
+            let refresh = !matches!(
+                receipt.outcome,
+                SkillMutationOutcome::NeedsApproval(_) | SkillMutationOutcome::NetworkDenied(_)
+            );
+            (msg, refresh)
+        }
+        Err(err) => (format!("Skill mutation failed: {err:#}"), false),
+    };
+
+    app.status_message = Some(status.clone());
+    if refresh_skills {
+        app.refresh_skill_cache();
+    }
+    refresh_skills_manager_if_open(app, Some(status), focus.as_ref());
+    app.needs_redraw = true;
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_config_updated(
     terminal: &mut AppTerminal,
@@ -13592,6 +13712,22 @@ async fn handle_view_events(
                 }
             }
             ViewEvent::ContextMenuSelected { action } => handle_context_menu_action(app, action),
+            ViewEvent::SkillMutationRequested { request } => {
+                handle_skill_mutation_requested(app, request).await;
+            }
+            ViewEvent::SkillsManagerToggleCompatible => {
+                if app.view_stack.top_kind() == Some(ModalKind::SkillsManager)
+                    && let Some(mut boxed) = app.view_stack.pop()
+                {
+                    if let Some(view) = boxed
+                        .as_any_mut()
+                        .downcast_mut::<crate::tui::views::skills_manager::SkillsManagerView>()
+                    {
+                        crate::tui::views::skills_manager::apply_toggle_compatible(view, app);
+                    }
+                    app.view_stack.push_boxed(boxed);
+                }
+            }
         }
     }
 
