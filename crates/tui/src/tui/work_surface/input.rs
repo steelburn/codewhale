@@ -3,7 +3,10 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use crate::tui::app::{App, SidebarRowAction};
 
 use super::interaction::{activate_primary, claim_focus, close_opened, release_focus};
-use super::model::{WorkRow, WorkRowId, project};
+use super::model::{
+    SIDE_WIDTH_MAX, SIDE_WIDTH_MIN, TOP_HEIGHT_MAX, TOP_HEIGHT_MIN, WorkRow, WorkRowId,
+    WorkSurfacePlacement, project_visible,
+};
 
 #[derive(Debug, Default)]
 pub struct MouseOutcome {
@@ -16,7 +19,7 @@ pub struct MouseOutcome {
 /// a local stop arm / open detail first). Plain printable input always returns
 /// ownership to the composer instead of becoming a hidden panel shortcut.
 pub fn handle_key(app: &mut App, key: KeyEvent) -> Option<Option<SidebarRowAction>> {
-    let rows = project(app);
+    let rows = project_visible(app);
     if rows.is_empty() {
         return None;
     }
@@ -85,6 +88,87 @@ pub fn handle_mouse(app: &mut App, mouse: MouseEvent) -> MouseOutcome {
     let Some(area) = app.work_surface.last_area else {
         return MouseOutcome::default();
     };
+    let placement = app.work_surface.effective_placement;
+    let on_divider = match placement {
+        WorkSurfacePlacement::Top => {
+            mouse.row == area.bottom().saturating_sub(1)
+                && mouse.column >= area.x
+                && mouse.column < area.right()
+        }
+        WorkSurfacePlacement::Left => {
+            mouse.column == area.right().saturating_sub(1)
+                && mouse.row >= area.y
+                && mouse.row < area.bottom()
+        }
+        WorkSurfacePlacement::Right => {
+            mouse.column == area.x && mouse.row >= area.y && mouse.row < area.bottom()
+        }
+    };
+
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) if on_divider => {
+            app.work_surface.resizing = true;
+            app.work_surface.resize_anchor_column = mouse.column;
+            app.work_surface.resize_anchor_row = mouse.row;
+            app.work_surface.resize_anchor_size = match placement {
+                WorkSurfacePlacement::Top => area.height,
+                WorkSurfacePlacement::Left | WorkSurfacePlacement::Right => area.width,
+            };
+            app.needs_redraw = true;
+            return MouseOutcome {
+                consumed: true,
+                action: None,
+            };
+        }
+        MouseEventKind::Drag(MouseButton::Left) if app.work_surface.resizing => {
+            let anchor = i32::from(app.work_surface.resize_anchor_size);
+            match placement {
+                WorkSurfacePlacement::Top => {
+                    let delta =
+                        i32::from(mouse.row) - i32::from(app.work_surface.resize_anchor_row);
+                    app.work_surface.top_height = (anchor + delta)
+                        .clamp(i32::from(TOP_HEIGHT_MIN), i32::from(TOP_HEIGHT_MAX))
+                        as u16;
+                }
+                WorkSurfacePlacement::Left => {
+                    let delta =
+                        i32::from(mouse.column) - i32::from(app.work_surface.resize_anchor_column);
+                    app.work_surface.side_width = (anchor + delta)
+                        .clamp(i32::from(SIDE_WIDTH_MIN), i32::from(SIDE_WIDTH_MAX))
+                        as u16;
+                }
+                WorkSurfacePlacement::Right => {
+                    let delta =
+                        i32::from(app.work_surface.resize_anchor_column) - i32::from(mouse.column);
+                    app.work_surface.side_width = (anchor + delta)
+                        .clamp(i32::from(SIDE_WIDTH_MIN), i32::from(SIDE_WIDTH_MAX))
+                        as u16;
+                }
+            }
+            app.needs_redraw = true;
+            return MouseOutcome {
+                consumed: true,
+                action: None,
+            };
+        }
+        MouseEventKind::Up(MouseButton::Left) if app.work_surface.resizing => {
+            app.work_surface.resizing = false;
+            if let Ok(mut settings) = crate::settings::Settings::load_persisted() {
+                settings.work_surface_top_height = app.work_surface.top_height;
+                settings.work_surface_side_width = app.work_surface.side_width;
+                if let Err(error) = settings.save() {
+                    app.status_message =
+                        Some(format!("Failed to save To-do/Sub-agent bar size: {error}"));
+                }
+            }
+            app.needs_redraw = true;
+            return MouseOutcome {
+                consumed: true,
+                action: None,
+            };
+        }
+        _ => {}
+    }
     let inside = mouse.column >= area.x
         && mouse.column < area.right()
         && mouse.row >= area.y

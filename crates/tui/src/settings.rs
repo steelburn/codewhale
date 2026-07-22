@@ -265,6 +265,10 @@ pub struct Settings {
     /// Ocean Tasks / To-do / Workers rail placement: top, left, or right.
     /// The lower edge remains owned by the composer and phase footer.
     pub work_surface_placement: String,
+    /// Remembered total height (content plus divider) for top Work placement.
+    pub work_surface_top_height: u16,
+    /// Remembered total width (content plus divider) for side Work placement.
+    pub work_surface_side_width: u16,
     /// Runtime-only 30 FPS cap for terminals that flicker at high redraw
     /// rates. Separate from accessibility motion and text delivery.
     #[serde(skip)]
@@ -438,6 +442,8 @@ impl Default for Settings {
             fancy_animations: true,
             ocean_treatment: "ombre".to_string(),
             work_surface_placement: "top".to_string(),
+            work_surface_top_height: 3,
+            work_surface_side_width: 30,
             constrained_frame_rate: false,
             bracketed_paste: true,
             paste_burst_detection: true,
@@ -651,6 +657,8 @@ impl Settings {
             s.ocean_treatment = normalize_ocean_treatment(&s.ocean_treatment).to_string();
             s.work_surface_placement =
                 normalize_work_surface_placement(&s.work_surface_placement).to_string();
+            s.work_surface_top_height = s.work_surface_top_height.clamp(2, 16);
+            s.work_surface_side_width = s.work_surface_side_width.clamp(26, 80);
             s.inline_diffs = normalize_inline_diffs(&s.inline_diffs).to_string();
             s.synchronized_output =
                 normalize_synchronized_output(&s.synchronized_output).to_string();
@@ -878,6 +886,14 @@ impl Settings {
                     );
                 }
                 self.work_surface_placement = normalized;
+            }
+            "work_surface_top_height" | "work_top_height" => {
+                self.work_surface_top_height =
+                    parse_u16_range("work_surface_top_height", value, 2, 16)?;
+            }
+            "work_surface_side_width" | "work_side_width" => {
+                self.work_surface_side_width =
+                    parse_u16_range("work_surface_side_width", value, 26, 80)?;
             }
             "bracketed_paste" | "paste" => {
                 self.bracketed_paste = parse_bool(value)?;
@@ -1143,6 +1159,14 @@ impl Settings {
             "  work_surface:       {}",
             self.work_surface_placement
         ));
+        lines.push(format!(
+            "  work_top_height:    {}",
+            self.work_surface_top_height
+        ));
+        lines.push(format!(
+            "  work_side_width:    {}",
+            self.work_surface_side_width
+        ));
         lines.push(format!("  bracketed_paste:    {}", self.bracketed_paste));
         lines.push(format!(
             "  paste_burst_detect: {}",
@@ -1264,6 +1288,14 @@ impl Settings {
             (
                 "work_surface_placement",
                 "Ocean Tasks/To-do/Workers rail placement: top/left/right",
+            ),
+            (
+                "work_surface_top_height",
+                "Resizable To-do/Sub-agent top bar height: 2-16 rows",
+            ),
+            (
+                "work_surface_side_width",
+                "Resizable To-do/Sub-agent side bar width: 26-80 columns",
             ),
             (
                 "bracketed_paste",
@@ -1600,6 +1632,17 @@ fn parse_usize_setting(key: &str, value: &str) -> Result<usize> {
     })
 }
 
+fn parse_u16_range(key: &str, value: &str, min: u16, max: u16) -> Result<u16> {
+    let parsed = value
+        .trim()
+        .parse::<u16>()
+        .map_err(|_| anyhow::anyhow!("Invalid {key} '{value}': expected {min}-{max}"))?;
+    if !(min..=max).contains(&parsed) {
+        anyhow::bail!("Invalid {key} '{value}': expected {min}-{max}");
+    }
+    Ok(parsed)
+}
+
 fn parse_percent_setting(key: &str, value: &str) -> Result<f64> {
     let trimmed = value.trim().trim_end_matches('%').trim();
     let percent = trimmed.parse::<f64>().map_err(|_| {
@@ -1841,6 +1884,19 @@ mod tests {
             .expect_err("bottom is owned by composer/footer");
         assert!(err.to_string().contains("top, left, or right"));
         assert_eq!(settings.work_surface_placement, "top");
+    }
+
+    #[test]
+    fn work_surface_drag_sizes_round_trip_with_bounded_values() {
+        let mut settings = Settings::default();
+        settings.set("work_surface_top_height", "9").unwrap();
+        settings.set("work_surface_side_width", "54").unwrap();
+        let body = toml::to_string(&settings).expect("serialize settings");
+        let restored: Settings = toml::from_str(&body).expect("restore settings");
+        assert_eq!(restored.work_surface_top_height, 9);
+        assert_eq!(restored.work_surface_side_width, 54);
+        assert!(settings.set("work_surface_top_height", "17").is_err());
+        assert!(settings.set("work_surface_side_width", "25").is_err());
     }
 
     #[test]

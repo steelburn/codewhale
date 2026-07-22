@@ -63,6 +63,10 @@ pub struct SettingsSection {
     pub fancy_animations: bool,
     pub ocean_treatment: OceanTreatmentValue,
     pub work_surface_placement: WorkSurfacePlacementValue,
+    #[schemars(range(min = 2, max = 16))]
+    pub work_surface_top_height: u16,
+    #[schemars(range(min = 26, max = 80))]
+    pub work_surface_side_width: u16,
     pub paste_burst_detection: bool,
     pub show_thinking: bool,
     pub show_tool_details: bool,
@@ -378,6 +382,8 @@ pub fn build_document(app: &App, config: &Config) -> Result<ConfigUiDocument> {
             fancy_animations: settings.fancy_animations,
             ocean_treatment: settings.ocean_treatment.as_str().into(),
             work_surface_placement: settings.work_surface_placement.as_str().into(),
+            work_surface_top_height: settings.work_surface_top_height,
+            work_surface_side_width: settings.work_surface_side_width,
             paste_burst_detection: settings.paste_burst_detection,
             show_thinking: settings.show_thinking,
             show_tool_details: settings.show_tool_details,
@@ -559,6 +565,14 @@ pub fn apply_document(
         (
             "work_surface_placement",
             doc.settings.work_surface_placement.as_setting(),
+        ),
+        (
+            "work_surface_top_height",
+            &doc.settings.work_surface_top_height.to_string(),
+        ),
+        (
+            "work_surface_side_width",
+            &doc.settings.work_surface_side_width.to_string(),
         ),
         (
             "paste_burst_detection",
@@ -912,6 +926,7 @@ impl UiThemeValue {
             Some("dracula") => Ok(Self::Dracula),
             Some("gruvbox-dark") => Ok(Self::GruvboxDark),
             Some("matrix") => Ok(Self::Matrix),
+            Some("uwu") => Ok(Self::Uwu),
             Some(other) => bail!("unsupported theme '{other}'"),
             None => bail!("invalid theme '{value}'"),
         }

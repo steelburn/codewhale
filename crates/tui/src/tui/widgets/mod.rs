@@ -1200,9 +1200,9 @@ impl<'a> ComposerWidget<'a> {
 
     fn mode_color(&self) -> Color {
         match self.app.mode {
-            AppMode::Agent | AppMode::Auto | AppMode::Yolo => palette::MODE_AGENT,
-            AppMode::Plan => palette::MODE_PLAN,
-            AppMode::Operate => palette::MODE_OPERATE,
+            AppMode::Agent | AppMode::Auto | AppMode::Yolo => self.app.ui_theme.mode_agent,
+            AppMode::Plan => self.app.ui_theme.mode_plan,
+            AppMode::Operate => self.app.ui_theme.mode_operate,
         }
     }
 
@@ -1350,9 +1350,9 @@ impl Renderable for ComposerWidget<'_> {
             // and Full Access is coral. The bottom edge independently carries
             // the cool Plan -> Act -> Operate mode ramp.
             let permission_color = match self.app.approval_mode {
-                ApprovalMode::Suggest | ApprovalMode::Never => palette::TEXT_REASONING,
-                ApprovalMode::Auto => palette::WHALE_HUMAN,
-                ApprovalMode::Bypass => palette::STATUS_WARNING,
+                ApprovalMode::Suggest | ApprovalMode::Never => self.app.ui_theme.permission_ask,
+                ApprovalMode::Auto => self.app.ui_theme.permission_auto_review,
+                ApprovalMode::Bypass => self.app.ui_theme.permission_full_access,
             };
             let mut top_border = Block::default()
                 .borders(Borders::TOP)
@@ -5932,54 +5932,48 @@ mod tests {
         let mention_menu_entries = Vec::<String>::new();
         let area = Rect::new(0, 0, 40, 5);
 
-        // Shift-Tab cycle order must stay amber -> Signal Gold -> coral.
-        for (approval_mode, expected) in [
-            (ApprovalMode::Suggest, palette::TEXT_REASONING),
-            (ApprovalMode::Auto, palette::WHALE_HUMAN),
-            (ApprovalMode::Bypass, palette::STATUS_WARNING),
-        ] {
-            let mut app = create_test_app();
-            app.approval_mode = approval_mode;
-            let widget = ComposerWidget::new(&app, 5, &slash_menu_entries, &mention_menu_entries);
-            let mut buf = Buffer::empty(area);
+        for theme_id in palette::SELECTABLE_THEMES {
+            let theme = theme_id.ui_theme();
+            for (approval_mode, expected) in [
+                (ApprovalMode::Suggest, theme.permission_ask),
+                (ApprovalMode::Never, theme.permission_ask),
+                (ApprovalMode::Auto, theme.permission_auto_review),
+                (ApprovalMode::Bypass, theme.permission_full_access),
+            ] {
+                let mut app = create_test_app();
+                app.ui_theme = theme;
+                app.approval_mode = approval_mode;
+                let widget =
+                    ComposerWidget::new(&app, 5, &slash_menu_entries, &mention_menu_entries);
+                let mut buf = Buffer::empty(area);
+                widget.render(area, &mut buf);
+                assert_eq!(
+                    buf[(1, area.top())].fg,
+                    expected,
+                    "{} {approval_mode:?}",
+                    theme_id.name()
+                );
+            }
 
-            widget.render(area, &mut buf);
-
-            assert_eq!(buf[(1, area.top())].fg, expected, "{approval_mode:?}");
-        }
-
-        // Never is a fail-closed Ask-family posture, so it keeps Ask amber and
-        // never enters the three-step user-facing permission cycle.
-        let mut never_app = create_test_app();
-        never_app.approval_mode = ApprovalMode::Never;
-        let never_widget =
-            ComposerWidget::new(&never_app, 5, &slash_menu_entries, &mention_menu_entries);
-        let mut never_buf = Buffer::empty(area);
-        never_widget.render(area, &mut never_buf);
-        assert_eq!(
-            never_buf[(1, area.top())].fg,
-            palette::TEXT_REASONING,
-            "Never must keep the fail-closed Ask-family amber"
-        );
-
-        // The bottom edge remains the independent icy -> blue -> violet ramp.
-        for (mode, expected) in [
-            (AppMode::Plan, palette::MODE_PLAN),
-            (AppMode::Agent, palette::MODE_AGENT),
-            (AppMode::Operate, palette::MODE_OPERATE),
-        ] {
-            let mut app = create_test_app();
-            app.mode = mode;
-            let widget = ComposerWidget::new(&app, 5, &slash_menu_entries, &mention_menu_entries);
-            let mut buf = Buffer::empty(area);
-
-            widget.render(area, &mut buf);
-
-            assert_eq!(
-                buf[(1, area.bottom().saturating_sub(1))].fg,
-                expected,
-                "{mode:?}"
-            );
+            for (mode, expected) in [
+                (AppMode::Plan, theme.mode_plan),
+                (AppMode::Agent, theme.mode_agent),
+                (AppMode::Operate, theme.mode_operate),
+            ] {
+                let mut app = create_test_app();
+                app.ui_theme = theme;
+                app.mode = mode;
+                let widget =
+                    ComposerWidget::new(&app, 5, &slash_menu_entries, &mention_menu_entries);
+                let mut buf = Buffer::empty(area);
+                widget.render(area, &mut buf);
+                assert_eq!(
+                    buf[(1, area.bottom().saturating_sub(1))].fg,
+                    expected,
+                    "{} {mode:?}",
+                    theme_id.name()
+                );
+            }
         }
     }
 

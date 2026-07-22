@@ -11,11 +11,9 @@ use unicode_width::UnicodeWidthStr;
 use crate::tui::app::{App, SidebarHoverRow, SidebarHoverSection};
 use crate::tui::ui_text::truncate_line_to_width;
 
-use super::model::{WorkHitbox, WorkRow, WorkSurfacePlacement, WorkTone, project};
+use super::model::{WorkHitbox, WorkRow, WorkSurfacePlacement, WorkTone, project_visible};
 
 const SIDE_RAIL_MIN_HOST_WIDTH: u16 = 72;
-const SIDE_RAIL_MIN_WIDTH: u16 = 26;
-const SIDE_RAIL_MAX_WIDTH: u16 = 40;
 const SIDE_RAIL_MIN_CHAT_WIDTH: u16 = 40;
 
 fn effective_placement(
@@ -32,8 +30,10 @@ fn effective_placement(
 
 /// Responsive work-surface height. The component owns a bounded window; long
 /// work lists scroll instead of consuming the transcript.
-pub fn height(app: &mut App, width: u16, _terminal_height: u16, classic_shell: bool) -> u16 {
-    let rows = project(app);
+pub fn height(app: &mut App, width: u16, terminal_height: u16, classic_shell: bool) -> u16 {
+    app.work_surface.effective_placement =
+        effective_placement(app.work_surface.placement, width, classic_shell);
+    let rows = project_visible(app);
     if rows.is_empty() {
         app.work_surface.focused = false;
         app.work_surface.selected = None;
@@ -45,20 +45,16 @@ pub fn height(app: &mut App, width: u16, _terminal_height: u16, classic_shell: b
         app.work_surface.visible_rows = 0;
         app.work_surface.total_rows = 0;
         app.work_surface.scroll_offset = 0;
+        app.work_surface.resizing = false;
         return 0;
     }
-    app.work_surface.effective_placement =
-        effective_placement(app.work_surface.placement, width, classic_shell);
     if app.work_surface.effective_placement != WorkSurfacePlacement::Top {
         return 0;
     }
-    // Live top-area budget: at most two auxiliary content rows below the
-    // fixed route header (#4690), plus the panel-owned divider.
-    let content_cap = u16::try_from(super::model::LIVE_AUX_ROW_BUDGET).unwrap_or(2);
-    let content_height = u16::try_from(rows.len())
-        .unwrap_or(u16::MAX)
-        .min(content_cap);
-    content_height.saturating_add(1)
+    let terminal_cap = terminal_height
+        .saturating_div(2)
+        .clamp(super::model::TOP_HEIGHT_MIN, super::model::TOP_HEIGHT_MAX);
+    app.work_surface.top_height.min(terminal_cap)
 }
 
 /// Split the transcript slot for a side rail. Top placement consumes its own
@@ -71,11 +67,12 @@ pub fn split_chat(app: &mut App, area: Rect, classic_shell: bool) -> (Rect, Opti
         return (area, None);
     }
 
-    let proportional = area.width.saturating_mul(30) / 100;
-    let rail_width = proportional
-        .clamp(SIDE_RAIL_MIN_WIDTH, SIDE_RAIL_MAX_WIDTH)
+    let rail_width = app
+        .work_surface
+        .side_width
+        .clamp(super::model::SIDE_WIDTH_MIN, super::model::SIDE_WIDTH_MAX)
         .min(area.width.saturating_sub(SIDE_RAIL_MIN_CHAT_WIDTH));
-    if rail_width < SIDE_RAIL_MIN_WIDTH {
+    if rail_width < super::model::SIDE_WIDTH_MIN {
         app.work_surface.effective_placement = WorkSurfacePlacement::Top;
         return (area, None);
     }
@@ -137,22 +134,12 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
         },
     };
 
-    let mut rows = project(app);
-    if body_area.height <= 2 && rows.len() > usize::from(body_area.height) {
-        // Compact fallback spends its two content rows on the first actionable
-        // Task and To-do/worker objects instead of section chrome.
-        let mut compact = Vec::new();
-        for prefix in ["task:", "todo:", "worker:"] {
-            if let Some(row) = rows.iter().find(|row| row.id.0.starts_with(prefix)) {
-                compact.push(row.clone());
-            }
-        }
-        for row in rows.iter().filter(|row| row.selectable) {
-            if !compact.iter().any(|candidate| candidate.id == row.id) {
-                compact.push(row.clone());
-            }
-        }
-        rows = compact;
+    let mut rows = project_visible(app);
+    if placement == WorkSurfacePlacement::Top {
+        // The top bar is the literal list: to-dos first, then sub-agents.
+        // Section summaries belong to the optional side/detail surface and
+        // must not spend scarce transcript rows on generic chrome.
+        rows.retain(|row| row.selectable);
     }
     let body_height = usize::from(body_area.height);
     let overflow = rows.len() > body_height;
@@ -197,12 +184,12 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
         let hovered = app.work_surface.hovered.as_ref() == Some(&row.id);
         let opened = app.work_surface.opened.as_ref() == Some(&row.id);
         let style = row_style(app, row, selected, hovered, opened);
-        let compact_owner = if body_area.height <= 2 {
+        let compact_owner = if placement == WorkSurfacePlacement::Top {
             row.id
                 .0
                 .split_once(':')
                 .map(|(kind, _)| match kind {
-                    "graph" => "Work · ".to_string(),
+                    "graph" => "To-do · ".to_string(),
                     _ => String::new(),
                 })
                 .unwrap_or_default()

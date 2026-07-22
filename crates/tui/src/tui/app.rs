@@ -3117,6 +3117,8 @@ impl App {
         let ocean_treatment = crate::tui::ocean::OceanTreatment::parse(&settings.ocean_treatment);
         let work_surface_placement =
             crate::tui::work_surface::WorkSurfacePlacement::parse(&settings.work_surface_placement);
+        let work_surface_top_height = settings.work_surface_top_height;
+        let work_surface_side_width = settings.work_surface_side_width;
         let synchronized_output_enabled = settings.synchronized_output_enabled();
         let status_indicator = settings.status_indicator.clone();
         let show_thinking = settings.show_thinking;
@@ -3430,8 +3432,10 @@ impl App {
                 selection_anchor: None,
             },
             viewport: ViewportState::default(),
-            work_surface: crate::tui::work_surface::WorkSurfaceState::with_placement(
+            work_surface: crate::tui::work_surface::WorkSurfaceState::with_layout(
                 work_surface_placement,
+                work_surface_top_height,
+                work_surface_side_width,
             ),
             hunt: HuntState::default(),
             session: SessionState::default(),

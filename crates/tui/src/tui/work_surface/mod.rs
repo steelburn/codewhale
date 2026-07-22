@@ -15,6 +15,7 @@ pub use render::{height, render, split_chat};
 
 #[cfg(test)]
 mod tests {
+    use super::WorkSurfacePlacement;
     use std::path::PathBuf;
 
     use crossterm::event::{
@@ -284,6 +285,8 @@ mod tests {
         );
         assert!(!body.contains("PRIVATE-TRANSCRIPT-MARKER"), "{body}");
 
+        app.work_surface.placement = WorkSurfacePlacement::Right;
+        app.work_surface.effective_placement = WorkSurfacePlacement::Right;
         let narrow = render_text(&mut app, 32, 4);
         assert!(narrow.contains("Coordination Work"), "{narrow}");
         let _ = super::handle_key(
@@ -580,7 +583,7 @@ mod tests {
             .iter()
             .find(|row| row.id.0 == "worker:agent_worker")
             .expect("agent work row");
-        assert_eq!(row.label, "Agent Blue Whale · worker");
+        assert_eq!(row.label, "Sub-agent Blue Whale · worker");
         assert!(row.detail.contains("Wire settled file activity"));
         assert!(row.detail.contains("using File.apply_patch"));
         assert!(row.detail.contains("step 2"));
@@ -909,6 +912,8 @@ mod tests {
     #[test]
     fn work_rows_open_graph_inspector_without_inline_controls() {
         let mut app = app();
+        app.work_surface.placement = WorkSurfacePlacement::Right;
+        app.work_surface.effective_placement = WorkSurfacePlacement::Right;
         let graph = operation_graph(NodeState::Active);
         restore_graph(&mut app, &graph);
         app.runtime_services
@@ -1027,6 +1032,8 @@ mod tests {
             },
         );
 
+        app.work_surface.placement = WorkSurfacePlacement::Right;
+        app.work_surface.effective_placement = WorkSurfacePlacement::Right;
         let text = render_text(&mut app, 80, 6);
         assert!(text.contains("Wrote 4 files"), "{text}");
     }
@@ -1207,6 +1214,99 @@ mod tests {
                     .any(|row| row.label == "work item 1")
             );
         }
+    }
+
+    #[test]
+    fn divider_drag_resizes_top_left_and_right_surfaces() {
+        let mut top = app();
+        add_todos(&mut top, 3);
+        let _ = render_text(&mut top, 80, 3);
+        let down = super::handle_mouse(
+            &mut top,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 20,
+                row: 2,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert!(down.consumed);
+        let _ = super::handle_mouse(
+            &mut top,
+            MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: 20,
+                row: 7,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert_eq!(top.work_surface.top_height, 8);
+
+        for (placement, drag_column, expected_width) in [
+            (WorkSurfacePlacement::Left, 39, 40),
+            (WorkSurfacePlacement::Right, 10, 26),
+        ] {
+            let mut side = app();
+            add_todos(&mut side, 2);
+            side.work_surface.placement = placement;
+            side.work_surface.effective_placement = placement;
+            let _ = render_text(&mut side, 30, 8);
+            let divider_column = if placement == WorkSurfacePlacement::Left {
+                29
+            } else {
+                0
+            };
+            let _ = super::handle_mouse(
+                &mut side,
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: divider_column,
+                    row: 2,
+                    modifiers: KeyModifiers::NONE,
+                },
+            );
+            let _ = super::handle_mouse(
+                &mut side,
+                MouseEvent {
+                    kind: MouseEventKind::Drag(MouseButton::Left),
+                    column: drag_column,
+                    row: 2,
+                    modifiers: KeyModifiers::NONE,
+                },
+            );
+            assert_eq!(
+                side.work_surface.side_width, expected_width,
+                "{placement:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn top_bar_excludes_generic_operations() {
+        let mut operation_app = app();
+        let graph = operation_graph(NodeState::Failed);
+        restore_graph(&mut operation_app, &graph);
+
+        assert_eq!(super::height(&mut operation_app, 100, 24, false), 0);
+        assert!(operation_app.work_surface.latest_rows.is_empty());
+
+        let mut todo_app = app();
+        add_todos(&mut todo_app, 2);
+        assert!(super::height(&mut todo_app, 100, 24, false) > 0);
+        assert!(
+            todo_app
+                .work_surface
+                .latest_rows
+                .iter()
+                .all(|row| row.id.0.starts_with("graph:") || row.id.0.starts_with("worker:"))
+        );
+        assert!(
+            todo_app
+                .work_surface
+                .latest_rows
+                .iter()
+                .all(|row| !row.label.starts_with("Work ·"))
+        );
     }
 
     #[test]

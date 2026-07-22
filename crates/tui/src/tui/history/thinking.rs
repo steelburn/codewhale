@@ -18,8 +18,8 @@ pub(super) const REASONING_RAIL: &str = "\u{254E} "; // ╎ + space
 pub(super) const REASONING_CURSOR: &str = "\u{258E}"; // ▎
 
 const THINKING_SUMMARY_LINE_LIMIT: usize = 4;
-const THINKING_COMPLETED_PREVIEW_LINE_LIMIT: usize = 6;
-const THINKING_STREAMING_PREVIEW_LINE_LIMIT: usize = 8;
+const THINKING_COMPLETED_PREVIEW_LINE_LIMIT: usize = 10;
+const THINKING_STREAMING_PREVIEW_LINE_LIMIT: usize = 12;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ThinkingVisualState {
@@ -261,7 +261,7 @@ pub(super) fn render_thinking(
         let label = if streaming {
             "More reasoning in Ctrl+O"
         } else {
-            "Space to expand · Full reasoning in Ctrl+O"
+            "Space: expand here · Ctrl+O: full reasoning"
         };
         lines.push(Line::from(vec![
             Span::styled(REASONING_RAIL.to_string(), rail_style),

@@ -102,13 +102,21 @@ impl WorkSourceState {
 pub(super) const RECENT_ONLY_TTL_MS: u64 = 4_000;
 /// Settled file/search/write receipt lifetime in the live strip (#4690).
 pub(super) const ACTIVITY_RECEIPT_TTL_MS: u64 = 3_000;
-/// Bound live top-area content rows below the fixed route header (#4690).
-pub(super) const LIVE_AUX_ROW_BUDGET: usize = 2;
+pub(super) const TOP_HEIGHT_MIN: u16 = 2;
+pub(super) const TOP_HEIGHT_MAX: u16 = 16;
+pub(super) const SIDE_WIDTH_MIN: u16 = 26;
+pub(super) const SIDE_WIDTH_MAX: u16 = 80;
 
 #[derive(Debug, Clone)]
 pub struct WorkSurfaceState {
     pub placement: WorkSurfacePlacement,
     pub(super) effective_placement: WorkSurfacePlacement,
+    pub top_height: u16,
+    pub side_width: u16,
+    pub(super) resizing: bool,
+    pub(super) resize_anchor_column: u16,
+    pub(super) resize_anchor_row: u16,
+    pub(super) resize_anchor_size: u16,
     /// Focus owner axis — distinct from selection and detail-open.
     pub focused: bool,
     /// Keyboard/mouse selection highlight.
@@ -153,9 +161,20 @@ impl Default for WorkSurfaceState {
 impl WorkSurfaceState {
     #[must_use]
     pub fn with_placement(placement: WorkSurfacePlacement) -> Self {
+        Self::with_layout(placement, 3, 30)
+    }
+
+    #[must_use]
+    pub fn with_layout(placement: WorkSurfacePlacement, top_height: u16, side_width: u16) -> Self {
         Self {
             placement,
             effective_placement: placement,
+            top_height: top_height.clamp(TOP_HEIGHT_MIN, TOP_HEIGHT_MAX),
+            side_width: side_width.clamp(SIDE_WIDTH_MIN, SIDE_WIDTH_MAX),
+            resizing: false,
+            resize_anchor_column: 0,
+            resize_anchor_row: 0,
+            resize_anchor_size: 0,
             focused: false,
             selected: None,
             opened: None,
@@ -317,6 +336,53 @@ pub(super) fn project(app: &mut App) -> Vec<WorkRow> {
         app.work_surface.opened = None;
     }
     rows
+}
+
+/// Projection used by the live surface. The full Work catalog remains intact
+/// for explicit inspectors, while persistent chrome stays literal: plan-step
+/// to-dos first, then current sub-agents. Tool operations, coordination
+/// receipts, file activity, and generic graph headings never enter this list.
+pub(super) fn project_visible(app: &mut App) -> Vec<WorkRow> {
+    let rows = project(app);
+    if app.work_surface.effective_placement != WorkSurfacePlacement::Top {
+        return rows;
+    }
+
+    let todo_ids = app
+        .work_surface
+        .cached_graph
+        .as_ref()
+        .map(|snapshot| {
+            snapshot
+                .nodes
+                .iter()
+                .filter(|node| node.kind == NodeKind::PlanStep)
+                .map(|node| format!("graph:{}", node.id.as_str()))
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default();
+    let mut todos = Vec::new();
+    let mut agents = Vec::new();
+    for row in rows {
+        if todo_ids.contains(&row.id.0) {
+            todos.push(row);
+        } else if row.id.0.starts_with("worker:") {
+            agents.push(row);
+        }
+    }
+
+    let has_live_item = todos
+        .iter()
+        .chain(agents.iter())
+        .any(|row| !matches!(row.tone, WorkTone::Success));
+    if !has_live_item {
+        app.work_surface.latest_rows.clear();
+        return Vec::new();
+    }
+
+    todos.extend(agents);
+    app.work_surface.latest_rows = todos.clone();
+    todos
 }
 
 fn graph_rows(
@@ -524,7 +590,6 @@ fn ordered_rows(
         .iter()
         .find(|item| item.bucket.is_actionable())
         .map(|item| (item.bucket, sanitize_summary_title(&item.row.label)));
-
     let heading_label = match (actionable > 0, subject.as_ref()) {
         (true, Some((WorkBucket::Attention, title))) => {
             format!("Work · Needs input: {title} · {attention} blocked{source}")
@@ -671,6 +736,7 @@ fn coordination_row(app: &App) -> Option<RankedWorkRow> {
 fn node_bucket(node: &WorkNode) -> WorkBucket {
     match node.state {
         NodeState::Initializing | NodeState::Active => WorkBucket::Active,
+        NodeState::Failed if is_transient_failed_operation(node) => WorkBucket::Recent,
         NodeState::Waiting | NodeState::Blocked | NodeState::Stale | NodeState::Failed => {
             WorkBucket::Attention
         }
@@ -681,6 +747,16 @@ fn node_bucket(node: &WorkNode) -> WorkBucket {
         | NodeState::Superseded
         | NodeState::Cancelled => WorkBucket::Recent,
     }
+}
+
+fn is_transient_failed_operation(node: &WorkNode) -> bool {
+    node.kind == NodeKind::Operation
+        && node
+            .binding
+            .as_ref()
+            .is_some_and(|binding| !binding.durable)
+        && node.acceptance.is_empty()
+        && node.state == NodeState::Failed
 }
 
 fn agent_rows(app: &App) -> Vec<RankedWorkRow> {
@@ -745,7 +821,7 @@ fn agent_rows(app: &App) -> Vec<RankedWorkRow> {
                 row: WorkRow {
                     id: WorkRowId(format!("worker:{}", agent.agent_id)),
                     mark: agent_mark(bucket),
-                    label: format!("Agent {name} · {role}"),
+                    label: format!("Sub-agent {name} · {role}"),
                     detail: facts.join(" · "),
                     tone: bucket_tone(bucket),
                     selectable: true,
@@ -807,7 +883,7 @@ fn agent_rows(app: &App) -> Vec<RankedWorkRow> {
                     row: WorkRow {
                         id: WorkRowId(format!("worker:{id}")),
                         mark: agent_mark(bucket),
-                        label: format!("Agent {name}"),
+                        label: format!("Sub-agent {name}"),
                         detail: facts.join(" · "),
                         tone: bucket_tone(bucket),
                         selectable: true,
@@ -1755,10 +1831,11 @@ mod tests {
     }
 
     #[test]
-    fn projection_keeps_durable_and_attention_terminal_operations() {
+    fn projection_keeps_durable_and_evidence_gated_terminal_operations() {
         let mut durable = operation(NodeState::Completed, "durable");
         durable.binding.as_mut().expect("binding").durable = true;
-        let failed = operation(NodeState::Failed, "failed");
+        let mut failed = operation(NodeState::Failed, "failed");
+        failed.binding.as_mut().expect("binding").durable = true;
         let mut evidence_pending = operation(NodeState::Completed, "evidence-pending");
         evidence_pending.acceptance = vec![AcceptanceRequirement::EvidenceOfKind {
             kind: EvidenceKindTag::ToolRun,
@@ -1786,6 +1863,16 @@ mod tests {
         ] {
             assert!(labels.contains(&expected), "missing {expected}: {labels:?}");
         }
+    }
+
+    #[test]
+    fn transient_failed_operation_is_recent_while_durable_failure_needs_input() {
+        let transient = operation(NodeState::Failed, "shell transient");
+        let mut durable = operation(NodeState::Failed, "durable");
+        durable.binding.as_mut().expect("binding").durable = true;
+
+        assert_eq!(node_bucket(&transient), WorkBucket::Recent);
+        assert_eq!(node_bucket(&durable), WorkBucket::Attention);
     }
 
     #[test]

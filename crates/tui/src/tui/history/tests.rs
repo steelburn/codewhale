@@ -1035,7 +1035,7 @@ fn render_thinking_collapsed_shows_details_affordance() {
         .iter()
         .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
         .collect::<String>();
-    assert!(text.contains("Full reasoning in Ctrl+O"));
+    assert!(text.contains("Ctrl+O: full reasoning"));
     // Pin the actual header shape ("… reasoning done") — a bare
     // `contains("reasoning")` is already satisfied by the Ctrl+O
     // affordance line above and would never fail on its own.
@@ -1142,7 +1142,7 @@ fn render_thinking_streaming_truncated_shows_continues_affordance() {
     // #861 RC4: when a streaming thinking block exceeds the line cap,
     // surface a live affordance pointing at Ctrl+O. The earlier code
     // suppressed the affordance unless `!streaming`.
-    let long = (1..=12)
+    let long = (1..=16)
         .map(|i| format!("Reasoning line {i}"))
         .collect::<Vec<_>>()
         .join("\n");
@@ -1157,7 +1157,7 @@ fn render_thinking_streaming_truncated_shows_continues_affordance() {
     );
     // The most recent line must be the visible tail (head dropped).
     assert!(
-        text.contains("Reasoning line 12"),
+        text.contains("Reasoning line 16"),
         "tail line missing, got: {text}"
     );
     assert!(
@@ -2319,7 +2319,9 @@ fn long_thinking_display_is_shorter_than_transcript() {
                 Third paragraph: even more reasoning.\n\
                 With another line.\n\n\
                 Fourth paragraph: the conclusion.\n\
-                And one more line for good measure.";
+                And one more line for good measure.\n\n\
+                Fifth paragraph: final verification.\n\
+                One last supporting detail.";
     let cell = HistoryCell::Thinking {
         content: body.to_string(),
         streaming: false,
@@ -2354,19 +2356,19 @@ fn long_thinking_display_is_shorter_than_transcript() {
         "live thinking should preview completed reasoning: {live_text}"
     );
     assert!(
-        transcript_text.contains("Fourth paragraph"),
+        transcript_text.contains("Fifth paragraph"),
         "transcript thinking must keep the full body"
     );
     assert!(
-        !live_text.contains("Fourth paragraph"),
+        !live_text.contains("Fifth paragraph"),
         "live thinking must drop the tail when collapsed"
     );
     assert!(
-        live_text.contains("Full reasoning in Ctrl+O"),
+        live_text.contains("Ctrl+O: full reasoning"),
         "live thinking must offer the pager affordance"
     );
     assert!(
-        !transcript_text.contains("Full reasoning in Ctrl+O"),
+        !transcript_text.contains("Ctrl+O: full reasoning"),
         "transcript thinking must not include the live affordance"
     );
 }
@@ -2403,7 +2405,7 @@ fn completed_short_thinking_without_summary_stays_visible_in_live_view() {
         "transcript thinking must keep the full reasoning body"
     );
     assert!(
-        !live_text.contains("Full reasoning in Ctrl+O"),
+        !live_text.contains("Ctrl+O: full reasoning"),
         "complete short reasoning should not need the detail affordance: {live_text}"
     );
 }
@@ -2438,7 +2440,7 @@ fn completed_reasoning_receipt_hides_internal_function_names_until_expanded() {
         "surrounding prose must still read: {collapsed_text}"
     );
     assert!(
-        collapsed_text.contains("Full reasoning in Ctrl+O"),
+        collapsed_text.contains("Ctrl+O: full reasoning"),
         "collapsed receipt must offer the expand affordance: {collapsed_text}"
     );
 

@@ -1572,6 +1572,20 @@ impl ConfigView {
             },
             ConfigRow {
                 section: ConfigSection::Sidebar,
+                key: "work_surface_top_height".to_string(),
+                value: settings.work_surface_top_height.to_string(),
+                editable: true,
+                scope: ConfigScope::Saved,
+            },
+            ConfigRow {
+                section: ConfigSection::Sidebar,
+                key: "work_surface_side_width".to_string(),
+                value: settings.work_surface_side_width.to_string(),
+                editable: true,
+                scope: ConfigScope::Saved,
+            },
+            ConfigRow {
+                section: ConfigSection::Sidebar,
                 key: "sidebar_width".to_string(),
                 value: settings.sidebar_width_percent.to_string(),
                 editable: true,
@@ -2410,6 +2424,8 @@ fn config_label_for_key(key: &str) -> String {
         "background_color" => "Background",
         "ocean_treatment" => "Ocean treatment",
         "work_surface_placement" => "Sidebar position",
+        "work_surface_top_height" => "Top bar height",
+        "work_surface_side_width" => "Side bar width",
         "calm_mode" => "Quiet transcript",
         "low_motion" => "Reduce motion",
         "fancy_animations" => "Live UI motion",
@@ -2517,6 +2533,8 @@ fn config_hint_for_key(key: &str) -> &'static str {
         "work_surface_placement" => {
             "top | left | right · side rails require Ocean mode and at least 72 columns"
         }
+        "work_surface_top_height" => "2..=16 rows · also adjustable by dragging the divider",
+        "work_surface_side_width" => "26..=80 columns · also adjustable by dragging the divider",
         "base_url" => "global DeepSeek/root fallback; e.g. https://api.deepseek.com/beta",
         "provider_url" => {
             "current provider endpoint; Xiaomi: token-plan | pay-as-you-go | custom URL"
@@ -5032,6 +5050,8 @@ base_url = "https://api.xiaomimimo.com/v1"
             visible_row_keys(&view),
             vec![
                 "work_surface_placement",
+                "work_surface_top_height",
+                "work_surface_side_width",
                 "sidebar_width",
                 "sidebar_focus",
                 "context_panel",
@@ -5052,6 +5072,8 @@ base_url = "https://api.xiaomimimo.com/v1"
             visible_row_keys(&view),
             vec![
                 "work_surface_placement",
+                "work_surface_top_height",
+                "work_surface_side_width",
                 "sidebar_width",
                 "sidebar_focus",
                 "context_panel",

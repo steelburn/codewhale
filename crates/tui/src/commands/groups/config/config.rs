@@ -307,6 +307,12 @@ fn show_single_setting(app: &App, key: &str) -> CommandResult {
         "work_surface_placement" | "work_surface" | "work_rail" => {
             Some(app.work_surface.placement.as_setting().to_string())
         }
+        "work_surface_top_height" | "work_top_height" => {
+            Some(app.work_surface.top_height.to_string())
+        }
+        "work_surface_side_width" | "work_side_width" => {
+            Some(app.work_surface.side_width.to_string())
+        }
         "tool_collapse" | "tool_collapse_mode" | "collapse" => {
             Some(app.tool_collapse_mode.as_setting().to_string())
         }
@@ -1824,6 +1830,14 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
             );
             app.work_surface.focused = false;
             app.work_surface.last_area = None;
+            app.needs_redraw = true;
+        }
+        "work_surface_top_height" | "work_top_height" => {
+            app.work_surface.top_height = settings.work_surface_top_height;
+            app.needs_redraw = true;
+        }
+        "work_surface_side_width" | "work_side_width" => {
+            app.work_surface.side_width = settings.work_surface_side_width;
             app.needs_redraw = true;
         }
         "bracketed_paste" | "paste" => {

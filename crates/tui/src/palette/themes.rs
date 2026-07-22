@@ -47,6 +47,12 @@ pub struct UiTheme {
     pub mode_yolo: Color,
     pub mode_plan: Color,
     pub mode_operate: Color,
+    // Permission posture colors (Ask / Auto-Review / Full Access). These are
+    // explicit theme slots because the warm permission ramp is independent
+    // from the cool mode ramp.
+    pub permission_ask: Color,
+    pub permission_auto_review: Color,
+    pub permission_full_access: Color,
     // Footer statusline colors
     pub status_ready: Color,
     pub status_working: Color,
@@ -113,6 +119,9 @@ pub const UI_THEME: UiTheme = UiTheme {
     mode_yolo: MODE_YOLO,
     mode_plan: MODE_PLAN,
     mode_operate: MODE_OPERATE,
+    permission_ask: TEXT_REASONING,
+    permission_auto_review: WHALE_HUMAN,
+    permission_full_access: STATUS_WARNING,
     status_ready: TEXT_MUTED,
     status_working: WHALE_LIVE,
     status_warning: STATUS_WARNING,
@@ -160,6 +169,9 @@ pub const LIGHT_UI_THEME: UiTheme = UiTheme {
     mode_yolo: LIGHT_MODE_YOLO,
     mode_plan: LIGHT_MODE_PLAN,
     mode_operate: LIGHT_OPERATE,
+    permission_ask: Color::Rgb(146, 64, 14),
+    permission_auto_review: LIGHT_HUMAN,
+    permission_full_access: LIGHT_WARNING,
     status_ready: LIGHT_TEXT_MUTED,
     status_working: LIGHT_LIVE,
     status_warning: LIGHT_WARNING,
@@ -203,6 +215,9 @@ pub const SOLARIZED_LIGHT_UI_THEME: UiTheme = UiTheme {
     mode_yolo: Color::Rgb(0xDD, 0x32, 0x2F),
     mode_plan: Color::Rgb(0xCC, 0x4B, 0x16),
     mode_operate: Color::Rgb(0x6C, 0x71, 0xC4), // solarized violet
+    permission_ask: SOLARIZED_YELLOW,
+    permission_auto_review: SOLARIZED_ORANGE,
+    permission_full_access: SOLARIZED_RED,
     status_ready: SOLARIZED_CYAN,
     status_working: SOLARIZED_CYAN,
     status_warning: SOLARIZED_YELLOW,
@@ -248,6 +263,9 @@ pub const GRAYSCALE_UI_THEME: UiTheme = UiTheme {
     // Near-white stays unmistakably distinct without claiming arbitrary pure
     // white content as an already-resolved mode slot.
     mode_operate: Color::Rgb(250, 250, 250),
+    permission_ask: Color::Rgb(181, 181, 181),
+    permission_auto_review: Color::Rgb(210, 210, 210),
+    permission_full_access: Color::Rgb(237, 237, 237),
     status_ready: GRAYSCALE_TEXT_MUTED,
     status_working: GRAYSCALE_TEXT_SOFT,
     status_warning: GRAYSCALE_TEXT_BODY,
@@ -284,17 +302,20 @@ pub const CATPPUCCIN_MOCHA_UI_THEME: UiTheme = UiTheme {
     error_surface: Color::Rgb(0x3a, 0x1f, 0x2a),
     error_border: Color::Rgb(0xf3, 0x8b, 0xa8),
     error_text: Color::Rgb(0xf5, 0xc2, 0xd0),
-    warning: Color::Rgb(0xf9, 0xe2, 0xaf),         // yellow
-    success: Color::Rgb(0xa6, 0xe3, 0xa1),         // green
-    info: Color::Rgb(0x89, 0xd9, 0xeb),            // sky
-    mode_agent: Color::Rgb(0x8a, 0xb4, 0xfa),      // blue
-    mode_yolo: Color::Rgb(0xf3, 0x8c, 0xa8),       // red
-    mode_plan: Color::Rgb(0xfa, 0xb4, 0x87),       // peach
-    mode_operate: Color::Rgb(0xcb, 0xa6, 0xf7),    // mauve
-    status_ready: Color::Rgb(0x7f, 0x84, 0x9c),    // overlay1
-    status_working: Color::Rgb(0x74, 0xc7, 0xec),  // sapphire
-    status_warning: Color::Rgb(0xf9, 0xe2, 0xaf),  // yellow
-    diff_added_fg: Color::Rgb(0xa6, 0xe3, 0xa1),   // green
+    warning: Color::Rgb(0xf9, 0xe2, 0xaf),      // yellow
+    success: Color::Rgb(0xa6, 0xe3, 0xa1),      // green
+    info: Color::Rgb(0x89, 0xd9, 0xeb),         // sky
+    mode_agent: Color::Rgb(0x8a, 0xb4, 0xfa),   // blue
+    mode_yolo: Color::Rgb(0xf3, 0x8c, 0xa8),    // red
+    mode_plan: Color::Rgb(0xfa, 0xb4, 0x87),    // peach
+    mode_operate: Color::Rgb(0xcb, 0xa6, 0xf7), // mauve
+    permission_ask: Color::Rgb(0xf9, 0xe2, 0xaf),
+    permission_auto_review: Color::Rgb(0xfa, 0xb3, 0x87),
+    permission_full_access: Color::Rgb(0xf3, 0x8b, 0xa8),
+    status_ready: Color::Rgb(0x7f, 0x84, 0x9c), // overlay1
+    status_working: Color::Rgb(0x74, 0xc7, 0xec), // sapphire
+    status_warning: Color::Rgb(0xf9, 0xe2, 0xaf), // yellow
+    diff_added_fg: Color::Rgb(0xa6, 0xe3, 0xa1), // green
     diff_deleted_fg: Color::Rgb(0xf3, 0x8b, 0xa8), // red
     diff_added_bg: Color::Rgb(0x1f, 0x33, 0x29),
     diff_deleted_bg: Color::Rgb(0x3a, 0x1f, 0x2a),
@@ -327,17 +348,20 @@ pub const TOKYO_NIGHT_UI_THEME: UiTheme = UiTheme {
     error_surface: Color::Rgb(0x33, 0x1c, 0x24),
     error_border: Color::Rgb(0xf7, 0x76, 0x8e),
     error_text: Color::Rgb(0xfa, 0xcc, 0xd4),
-    warning: Color::Rgb(0xe0, 0xaf, 0x68),         // yellow
-    success: Color::Rgb(0x9e, 0xce, 0x6a),         // green
-    info: Color::Rgb(0x7d, 0xcf, 0xff),            // cyan
-    mode_agent: Color::Rgb(0x7b, 0xa2, 0xf7),      // blue
-    mode_yolo: Color::Rgb(0xf7, 0x77, 0x8e),       // red
-    mode_plan: Color::Rgb(0xff, 0x9f, 0x64),       // orange
-    mode_operate: Color::Rgb(0xbb, 0x9a, 0xf7),    // purple
-    status_ready: Color::Rgb(0x56, 0x5f, 0x89),    // comment
-    status_working: Color::Rgb(0x7d, 0xcf, 0xff),  // cyan
-    status_warning: Color::Rgb(0xe0, 0xaf, 0x68),  // yellow
-    diff_added_fg: Color::Rgb(0x9e, 0xce, 0x6a),   // green
+    warning: Color::Rgb(0xe0, 0xaf, 0x68),      // yellow
+    success: Color::Rgb(0x9e, 0xce, 0x6a),      // green
+    info: Color::Rgb(0x7d, 0xcf, 0xff),         // cyan
+    mode_agent: Color::Rgb(0x7b, 0xa2, 0xf7),   // blue
+    mode_yolo: Color::Rgb(0xf7, 0x77, 0x8e),    // red
+    mode_plan: Color::Rgb(0xff, 0x9f, 0x64),    // orange
+    mode_operate: Color::Rgb(0xbb, 0x9a, 0xf7), // purple
+    permission_ask: Color::Rgb(0xe0, 0xaf, 0x68),
+    permission_auto_review: Color::Rgb(0xff, 0x9e, 0x64),
+    permission_full_access: Color::Rgb(0xf7, 0x76, 0x8e),
+    status_ready: Color::Rgb(0x56, 0x5f, 0x89), // comment
+    status_working: Color::Rgb(0x7d, 0xcf, 0xff), // cyan
+    status_warning: Color::Rgb(0xe0, 0xaf, 0x68), // yellow
+    diff_added_fg: Color::Rgb(0x9e, 0xce, 0x6a), // green
     diff_deleted_fg: Color::Rgb(0xf7, 0x76, 0x8e), // red
     diff_added_bg: Color::Rgb(0x1b, 0x2b, 0x1f),
     diff_deleted_bg: Color::Rgb(0x33, 0x1c, 0x24),
@@ -370,17 +394,20 @@ pub const DRACULA_UI_THEME: UiTheme = UiTheme {
     error_surface: Color::Rgb(0x3a, 0x1f, 0x22),
     error_border: Color::Rgb(0xff, 0x55, 0x55),
     error_text: Color::Rgb(0xff, 0xbb, 0xbb),
-    warning: Color::Rgb(0xf1, 0xfa, 0x8c),         // yellow
-    success: Color::Rgb(0x50, 0xfa, 0x7b),         // green
-    info: Color::Rgb(0x8b, 0xe9, 0xfd),            // cyan
-    mode_agent: Color::Rgb(0xbe, 0x93, 0xf9),      // purple
-    mode_yolo: Color::Rgb(0xff, 0x56, 0x55),       // red
-    mode_plan: Color::Rgb(0xff, 0xb9, 0x6c),       // orange
-    mode_operate: Color::Rgb(0x8c, 0xe9, 0xfd),    // cyan
-    status_ready: Color::Rgb(0x62, 0x72, 0xa4),    // comment
-    status_working: Color::Rgb(0x8b, 0xe9, 0xfd),  // cyan
-    status_warning: Color::Rgb(0xf1, 0xfa, 0x8c),  // yellow
-    diff_added_fg: Color::Rgb(0x50, 0xfa, 0x7b),   // green
+    warning: Color::Rgb(0xf1, 0xfa, 0x8c),      // yellow
+    success: Color::Rgb(0x50, 0xfa, 0x7b),      // green
+    info: Color::Rgb(0x8b, 0xe9, 0xfd),         // cyan
+    mode_agent: Color::Rgb(0xbe, 0x93, 0xf9),   // purple
+    mode_yolo: Color::Rgb(0xff, 0x56, 0x55),    // red
+    mode_plan: Color::Rgb(0xff, 0xb9, 0x6c),    // orange
+    mode_operate: Color::Rgb(0x8c, 0xe9, 0xfd), // cyan
+    permission_ask: Color::Rgb(0xf1, 0xfa, 0x8c),
+    permission_auto_review: Color::Rgb(0xff, 0xb8, 0x6c),
+    permission_full_access: Color::Rgb(0xff, 0x55, 0x55),
+    status_ready: Color::Rgb(0x62, 0x72, 0xa4), // comment
+    status_working: Color::Rgb(0x8b, 0xe9, 0xfd), // cyan
+    status_warning: Color::Rgb(0xf1, 0xfa, 0x8c), // yellow
+    diff_added_fg: Color::Rgb(0x50, 0xfa, 0x7b), // green
     diff_deleted_fg: Color::Rgb(0xff, 0x55, 0x55), // red
     diff_added_bg: Color::Rgb(0x21, 0x3a, 0x2a),
     diff_deleted_bg: Color::Rgb(0x3a, 0x1f, 0x22),
@@ -432,6 +459,9 @@ pub const TERMINAL_UI_THEME: UiTheme = UiTheme {
     // render both in the status row.
     mode_plan: Color::Magenta,
     mode_operate: Color::LightCyan,
+    permission_ask: Color::Yellow,
+    permission_auto_review: Color::LightYellow,
+    permission_full_access: Color::LightRed,
     // DarkGray gives "Ready" a low-contrast but still distinguishable hue
     // versus default body text (which is `Color::Reset` on this theme).
     status_ready: Color::DarkGray,
@@ -470,13 +500,16 @@ pub const GRUVBOX_DARK_UI_THEME: UiTheme = UiTheme {
     error_surface: Color::Rgb(0x35, 0x1c, 0x18),
     error_border: Color::Rgb(0xfb, 0x49, 0x34),
     error_text: Color::Rgb(0xfc, 0xc4, 0xb8),
-    warning: Color::Rgb(0xfa, 0xbd, 0x2f),         // yellow
-    success: Color::Rgb(0x8e, 0xc0, 0x7c),         // green
-    info: Color::Rgb(0x83, 0xa5, 0x98),            // blue
-    mode_agent: Color::Rgb(0x84, 0xa5, 0x98),      // blue
-    mode_yolo: Color::Rgb(0xfb, 0x4a, 0x34),       // red
-    mode_plan: Color::Rgb(0xfe, 0x81, 0x19),       // orange
-    mode_operate: Color::Rgb(0xd3, 0x86, 0x9b),    // purple
+    warning: Color::Rgb(0xfa, 0xbd, 0x2f),      // yellow
+    success: Color::Rgb(0x8e, 0xc0, 0x7c),      // green
+    info: Color::Rgb(0x83, 0xa5, 0x98),         // blue
+    mode_agent: Color::Rgb(0x84, 0xa5, 0x98),   // blue
+    mode_yolo: Color::Rgb(0xfb, 0x4a, 0x34),    // red
+    mode_plan: Color::Rgb(0xfe, 0x81, 0x19),    // orange
+    mode_operate: Color::Rgb(0xd3, 0x86, 0x9b), // purple
+    permission_ask: Color::Rgb(0xfa, 0xbd, 0x2f),
+    permission_auto_review: Color::Rgb(0xfe, 0x80, 0x19),
+    permission_full_access: Color::Rgb(0xfb, 0x49, 0x34),
     status_ready: Color::Rgb(0x92, 0x83, 0x74),    // gray
     status_working: Color::Rgb(0x8e, 0xc0, 0x7c),  // aqua
     status_warning: Color::Rgb(0xfa, 0xbd, 0x2f),  // yellow
@@ -526,6 +559,9 @@ pub const CLAUDE_UI_THEME: UiTheme = UiTheme {
     mode_yolo: Color::Rgb(0xc7, 0x45, 0x45),    // red
     mode_plan: Color::Rgb(0xe8, 0xa6, 0x5a),    // amber
     mode_operate: Color::Rgb(0x8a, 0x63, 0xd2), // violet
+    permission_ask: Color::Rgb(0xd4, 0xa0, 0x17),
+    permission_auto_review: Color::Rgb(0xe8, 0xa5, 0x5a),
+    permission_full_access: Color::Rgb(0xe0, 0x60, 0x60),
     // Footer statusline
     status_ready: Color::Rgb(0xa0, 0x9d, 0x96),
     status_working: Color::Rgb(0x5d, 0xb8, 0xa6),
@@ -628,6 +664,9 @@ pub const MATRIX_UI_THEME: UiTheme = UiTheme {
     mode_yolo: Color::Rgb(255, 100, 100),
     mode_plan: Color::Rgb(255, 170, 60),
     mode_operate: Color::Rgb(100, 255, 220),
+    permission_ask: Color::Rgb(204, 204, 0),
+    permission_auto_review: Color::Rgb(255, 170, 60),
+    permission_full_access: Color::Rgb(255, 100, 100),
     status_ready: Color::Rgb(0, 85, 0),
     status_working: Color::Rgb(
         MATRIX_TEXT_BODY_RGB.0,
@@ -675,6 +714,9 @@ pub const UWU_UI_THEME: UiTheme = UiTheme {
     mode_yolo: Color::Rgb(0xff, 0x55, 0x77),
     mode_plan: Color::Rgb(0xff, 0xb4, 0xe8),
     mode_operate: Color::Rgb(0x8a, 0xd4, 0xff),
+    permission_ask: Color::Rgb(0xff, 0xe0, 0x8a),
+    permission_auto_review: Color::Rgb(0xff, 0xd6, 0x9a),
+    permission_full_access: Color::Rgb(0xff, 0x6b, 0x8a),
     status_ready: Color::Rgb(0x8a, 0x7c, 0x98),
     status_working: Color::Rgb(0x9a, 0xec, 0xe0),
     status_warning: Color::Rgb(0xff, 0xe0, 0x8a),
@@ -1019,6 +1061,28 @@ mod tests {
                         mode_color,
                         lane_color,
                         "theme '{}' reuses the {lane_name} color for mode '{mode_name}', erasing render-stage identity",
+                        theme_id.name(),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_selectable_theme_keeps_permission_lanes_distinct() {
+        for theme_id in SELECTABLE_THEMES {
+            let ui = theme_id.ui_theme();
+            let permissions = [
+                ("ask", ui.permission_ask),
+                ("auto-review", ui.permission_auto_review),
+                ("full-access", ui.permission_full_access),
+            ];
+            for (index, (name_a, color_a)) in permissions.iter().enumerate() {
+                for (name_b, color_b) in permissions.iter().skip(index + 1) {
+                    assert_ne!(
+                        color_a,
+                        color_b,
+                        "theme '{}' renders permission lanes '{name_a}' and '{name_b}' identically",
                         theme_id.name(),
                     );
                 }

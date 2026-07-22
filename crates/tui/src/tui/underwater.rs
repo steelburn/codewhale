@@ -19,7 +19,6 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::localization::{Locale, MessageId, tr};
-use crate::palette;
 use crate::tui::{
     app::{App, AppMode, OnboardingState},
     approval::ApprovalMode,
@@ -804,9 +803,9 @@ pub fn render_header(area: Rect, buf: &mut Buffer, app: &App) {
     // Match the composer's warm top edge exactly: Ask amber, Auto-Review
     // Signal Gold, and Full Access coral.
     let permission_color = match app.approval_mode {
-        ApprovalMode::Suggest | ApprovalMode::Never => palette::TEXT_REASONING,
-        ApprovalMode::Auto => palette::WHALE_HUMAN,
-        ApprovalMode::Bypass => palette::STATUS_WARNING,
+        ApprovalMode::Suggest | ApprovalMode::Never => app.ui_theme.permission_ask,
+        ApprovalMode::Auto => app.ui_theme.permission_auto_review,
+        ApprovalMode::Bypass => app.ui_theme.permission_full_access,
     };
     let status_indicator = crate::tui::widgets::header_status_indicator_frame(
         (!app.low_motion && app.fancy_animations)
@@ -1311,13 +1310,18 @@ mod tests {
     #[test]
     fn header_labels_follow_the_ask_amber_auto_gold_full_access_coral_ramp() {
         for width in [40, 100] {
-            for (approval_mode, expected_label, expected_color) in [
-                (ApprovalMode::Suggest, "ask", palette::TEXT_REASONING),
-                (ApprovalMode::Auto, "auto", palette::WHALE_HUMAN),
-                (ApprovalMode::Bypass, "Full Access", palette::STATUS_WARNING),
+            for (approval_mode, expected_label) in [
+                (ApprovalMode::Suggest, "ask"),
+                (ApprovalMode::Auto, "auto"),
+                (ApprovalMode::Bypass, "Full Access"),
             ] {
                 let mut app = test_app();
                 app.approval_mode = approval_mode;
+                let expected_color = match approval_mode {
+                    ApprovalMode::Suggest | ApprovalMode::Never => app.ui_theme.permission_ask,
+                    ApprovalMode::Auto => app.ui_theme.permission_auto_review,
+                    ApprovalMode::Bypass => app.ui_theme.permission_full_access,
+                };
                 let label = permission_label(&app).into_owned();
                 assert_eq!(label, expected_label, "{approval_mode:?}");
                 let area = Rect::new(0, 0, width, 1);
@@ -1326,8 +1330,10 @@ mod tests {
                 render_header(area, &mut buf, &app);
 
                 let rendered = (0..width).map(|x| buf[(x, 0)].symbol()).collect::<String>();
+                // `auto` can also appear earlier as a route/mode label. The
+                // permission posture owns the rightmost occurrence.
                 let label_byte = rendered
-                    .find(&label)
+                    .rfind(&label)
                     .expect("permission label should render");
                 let label_x = rendered[..label_byte].width() as u16;
                 assert_eq!(buf[(label_x, 0)].fg, expected_color, "{approval_mode:?}");
@@ -1702,6 +1708,7 @@ mod tests {
     #[test]
     fn idle_whale_rows_share_one_centered_block_without_losing_authored_offsets() {
         let mut app = test_app();
+        app.ui_theme = crate::palette::ThemeId::Whale.ui_theme();
         app.low_motion = true;
         let width = 60usize;
         let rendered = empty_state_lines(&app, Rect::new(0, 0, width as u16, 16))
