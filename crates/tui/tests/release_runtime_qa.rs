@@ -131,6 +131,66 @@ fn fanout_tool_call_sse_n(count: usize) -> String {
     .join("")
 }
 
+fn fleet_role_tool_call_sse() -> String {
+    let roles = ["worker", "scout", "reviewer", "verifier"];
+    let tool_calls = roles
+        .iter()
+        .enumerate()
+        .map(|(index, role)| {
+            json!({
+                "index": index,
+                "id": format!("call_role_{role}"),
+                "type": "function",
+                "function": {
+                    "name": "agent",
+                    "arguments": serde_json::to_string(&json!({
+                        "action": "start",
+                        "prompt": format!("role-probe-{role}"),
+                        "type": role,
+                        "fork_context": false,
+                        "session_name": format!("qa-{role}"),
+                        "workspace_policy": "shared",
+                        "write_authority": "read_only",
+                        "expected_artifact": "one role launch receipt",
+                        "deliberate": true
+                    }))
+                    .expect("Fleet role arguments")
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+
+    [
+        sse_chunk(json!({
+            "id": "chatcmpl-fleet-roles",
+            "object": "chat.completion.chunk",
+            "model": DEEPSEEK_TEST_MODEL,
+            "choices": [{
+                "index": 0,
+                "delta": { "tool_calls": tool_calls },
+                "finish_reason": null
+            }]
+        })),
+        sse_chunk(json!({
+            "id": "chatcmpl-fleet-roles",
+            "object": "chat.completion.chunk",
+            "model": DEEPSEEK_TEST_MODEL,
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {
+                "prompt_tokens": 20,
+                "completion_tokens": 12,
+                "total_tokens": 32
+            }
+        })),
+        "data: [DONE]\n\n".to_string(),
+    ]
+    .join("")
+}
+
 fn sse_response(body: String) -> ResponseTemplate {
     ResponseTemplate::new(200)
         .insert_header("content-type", "text/event-stream")
@@ -493,6 +553,51 @@ struct FanoutResponder {
     child_requests: Arc<AtomicUsize>,
 }
 
+#[derive(Clone)]
+struct FleetRoleResponder {
+    launched: Arc<AtomicUsize>,
+    canonical_prompts: Arc<AtomicUsize>,
+    worker: Arc<AtomicUsize>,
+    scout: Arc<AtomicUsize>,
+    reviewer: Arc<AtomicUsize>,
+    verifier: Arc<AtomicUsize>,
+}
+
+impl Respond for FleetRoleResponder {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let body = request.body_json::<Value>().unwrap_or(Value::Null);
+        let raw = body.to_string();
+        let role_markers = [
+            ("role-probe-worker", "Fleet worker", &self.worker),
+            ("role-probe-scout", "Fleet scout", &self.scout),
+            ("role-probe-reviewer", "Fleet reviewer", &self.reviewer),
+            ("role-probe-verifier", "Fleet verifier", &self.verifier),
+        ];
+        let matched = role_markers
+            .iter()
+            .filter(|(marker, _, _)| raw.contains(marker))
+            .collect::<Vec<_>>();
+        if matched.len() == 1 {
+            let (_, expected_prompt, counter) = matched[0];
+            self.launched.fetch_add(1, Ordering::SeqCst);
+            counter.fetch_add(1, Ordering::SeqCst);
+            if raw.contains(expected_prompt) {
+                self.canonical_prompts.fetch_add(1, Ordering::SeqCst);
+            }
+            return sse_response(text_sse(DEEPSEEK_TEST_MODEL, "role-launch-complete"));
+        }
+
+        if raw.contains("launch four canonical read-only Fleet roles") {
+            return sse_response(fleet_role_tool_call_sse());
+        }
+
+        sse_response(text_sse(
+            DEEPSEEK_TEST_MODEL,
+            "fleet-role-receipts-complete",
+        ))
+    }
+}
+
 impl Respond for FanoutResponder {
     fn respond(&self, request: &Request) -> ResponseTemplate {
         let body = request.body_json::<Value>().unwrap_or(Value::Null);
@@ -595,6 +700,73 @@ async fn release_six_worker_fanout_keeps_typing_render_and_esc_cancel_live() -> 
     tui.send(keys::key::text("post-cancel-live"))?;
     tui.wait_for_text("post-cancel-live", Duration::from_secs(3))?;
     assert_eq!(child_requests.load(Ordering::SeqCst), 6);
+
+    let _ = tui.shutdown();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn release_four_read_only_fleet_roles_launch_with_canonical_prompts() -> Result<()> {
+    let _guard = RELEASE_RUNTIME_QA_LOCK.lock().await;
+    let server = MockServer::start().await;
+    mount_models(&server, &[DEEPSEEK_TEST_MODEL]).await;
+    let launched = Arc::new(AtomicUsize::new(0));
+    let canonical_prompts = Arc::new(AtomicUsize::new(0));
+    let worker = Arc::new(AtomicUsize::new(0));
+    let scout = Arc::new(AtomicUsize::new(0));
+    let reviewer = Arc::new(AtomicUsize::new(0));
+    let verifier = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(FleetRoleResponder {
+            launched: Arc::clone(&launched),
+            canonical_prompts: Arc::clone(&canonical_prompts),
+            worker: Arc::clone(&worker),
+            scout: Arc::clone(&scout),
+            reviewer: Arc::clone(&reviewer),
+            verifier: Arc::clone(&verifier),
+        })
+        .mount(&server)
+        .await;
+
+    let ws = make_sealed_workspace()?;
+    std::fs::write(
+        ws.home().join(".codewhale").join("config.toml"),
+        "[subagents]\nmax_concurrent = 4\nlaunch_concurrency = 4\nmax_admitted = 4\n",
+    )?;
+    let mut tui = common_tui_builder(&ws)
+        .env("CODEWHALE_PROVIDER", "deepseek")
+        .env("DEEPSEEK_API_KEY", "deepseek-local-test-key")
+        .env("DEEPSEEK_BASE_URL", server.uri())
+        .env("DEEPSEEK_MODEL", DEEPSEEK_TEST_MODEL)
+        .args(["--yolo", "--max-subagents", "4"])
+        .spawn()?;
+    enter_launch_session(&mut tui)?;
+
+    type_and_submit(&mut tui, "launch four canonical read-only Fleet roles")?;
+    wait_for_counter(&mut tui, &launched, 4, INTERACTION_TIMEOUT)?;
+
+    assert_eq!(
+        worker.load(Ordering::SeqCst),
+        1,
+        "worker did not launch once"
+    );
+    assert_eq!(scout.load(Ordering::SeqCst), 1, "scout did not launch once");
+    assert_eq!(
+        reviewer.load(Ordering::SeqCst),
+        1,
+        "reviewer did not launch once"
+    );
+    assert_eq!(
+        verifier.load(Ordering::SeqCst),
+        1,
+        "verifier did not launch once"
+    );
+    assert_eq!(
+        canonical_prompts.load(Ordering::SeqCst),
+        4,
+        "each live child request must contain its canonical Fleet role prompt"
+    );
 
     let _ = tui.shutdown();
     Ok(())
