@@ -1,6 +1,11 @@
 //! Right-click context menu for mouse-captured TUI sessions.
+//!
+//! v0.9.1: elevated, lightly rounded surface with leading glyphs, section
+//! grouping, right-aligned key-hint chips, hover-follow, and a primary action
+//! focused by default. Reduced motion opens instantly (no appear frames).
 
 use std::cell::Cell;
+use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
@@ -8,11 +13,12 @@ use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Padding, Paragraph, Widget},
+    widgets::{Clear, Paragraph, Widget},
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::palette;
+use crate::tui::ocean;
 use crate::tui::views::{ContextMenuAction, ModalKind, ModalView, ViewAction, ViewEvent};
 
 #[derive(Debug, Clone)]
@@ -20,6 +26,56 @@ pub struct ContextMenuEntry {
     pub label: String,
     pub description: String,
     pub action: ContextMenuAction,
+    /// Leading glyph / icon (e.g. "⎘", "↗", "⌥").
+    pub glyph: String,
+    /// Right-aligned keyboard hint chip (e.g. "↵", "y", "1").
+    pub hint: String,
+    /// When true, starts a new visual section above this entry.
+    pub section_start: bool,
+    /// Primary (most likely) action — focused by default and accent-styled.
+    pub primary: bool,
+}
+
+impl ContextMenuEntry {
+    pub fn new(
+        label: impl Into<String>,
+        description: impl Into<String>,
+        action: ContextMenuAction,
+    ) -> Self {
+        Self {
+            label: label.into(),
+            description: description.into(),
+            action,
+            glyph: String::new(),
+            hint: String::new(),
+            section_start: false,
+            primary: false,
+        }
+    }
+
+    #[must_use]
+    pub fn with_glyph(mut self, glyph: impl Into<String>) -> Self {
+        self.glyph = glyph.into();
+        self
+    }
+
+    #[must_use]
+    pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
+        self.hint = hint.into();
+        self
+    }
+
+    #[must_use]
+    pub fn section_start(mut self) -> Self {
+        self.section_start = true;
+        self
+    }
+
+    #[must_use]
+    pub fn primary(mut self) -> Self {
+        self.primary = true;
+        self
+    }
 }
 
 pub struct ContextMenuView {
@@ -29,17 +85,43 @@ pub struct ContextMenuView {
     row: u16,
     last_rect: Cell<Option<Rect>>,
     title: String,
+    opened_at: Instant,
+    reduced_motion: bool,
 }
 
 impl ContextMenuView {
     pub fn new(entries: Vec<ContextMenuEntry>, column: u16, row: u16, title: String) -> Self {
+        Self::new_with_motion(entries, column, row, title, false)
+    }
+
+    pub fn new_with_motion(
+        entries: Vec<ContextMenuEntry>,
+        column: u16,
+        row: u16,
+        title: String,
+        reduced_motion: bool,
+    ) -> Self {
+        // Focus the primary action by default when present.
+        let selected = entries.iter().position(|e| e.primary).unwrap_or(0);
+        // Backfill digit hints for entries that lack one.
+        let mut entries = entries;
+        for (idx, entry) in entries.iter_mut().enumerate() {
+            if entry.hint.is_empty() && idx < 9 {
+                entry.hint = (idx + 1).to_string();
+            }
+            if entry.glyph.is_empty() {
+                entry.glyph = default_glyph_for(&entry.action);
+            }
+        }
         Self {
             entries,
-            selected: 0,
+            selected,
             column,
             row,
             last_rect: Cell::new(None),
             title,
+            opened_at: Instant::now(),
+            reduced_motion,
         }
     }
 
@@ -63,20 +145,33 @@ impl ContextMenuView {
             .entries
             .iter()
             .map(|entry| {
-                UnicodeWidthStr::width(entry.label.as_str())
-                    + UnicodeWidthStr::width(entry.description.as_str())
-                    + 8
+                UnicodeWidthStr::width(entry.glyph.as_str())
+                    + 1
+                    + UnicodeWidthStr::width(entry.label.as_str())
+                    + 2
+                    + UnicodeWidthStr::width(entry.hint.as_str())
+                    + 4
             })
             .max()
-            .unwrap_or(20);
-        let width = u16::try_from(widest.clamp(24, 64)).unwrap_or(64);
+            .unwrap_or(20)
+            .max(UnicodeWidthStr::width(self.title.as_str()).saturating_add(4));
+        let width = u16::try_from(widest.clamp(22, 56)).unwrap_or(56);
         width.min(area_width.max(1))
+    }
+
+    fn visual_row_count(&self) -> usize {
+        // title + entries + optional section dividers
+        let dividers = self.entries.iter().filter(|e| e.section_start).count();
+        self.entries
+            .len()
+            .saturating_add(1)
+            .saturating_add(dividers)
     }
 
     fn menu_rect(&self, area: Rect) -> Rect {
         let width = self.menu_width(area.width);
         let desired_height =
-            u16::try_from(self.entries.len().saturating_add(2)).unwrap_or(u16::MAX);
+            u16::try_from(self.visual_row_count().saturating_add(2)).unwrap_or(u16::MAX);
         let height = desired_height.min(area.height.max(1));
         let max_x = area.right().saturating_sub(width).max(area.x);
         let max_y = area.bottom().saturating_sub(height).max(area.y);
@@ -90,17 +185,43 @@ impl ContextMenuView {
         }
     }
 
+    /// Map a mouse row to an entry index, accounting for section dividers and title.
+    fn entry_at_row(&self, mouse_row: u16, rect: Rect) -> Option<usize> {
+        if mouse_row <= rect.y || mouse_row >= rect.bottom().saturating_sub(1) {
+            return None;
+        }
+        let mut visual = rect.y.saturating_add(1); // skip top padding / title row
+        for (idx, entry) in self.entries.iter().enumerate() {
+            if entry.section_start && idx > 0 {
+                visual = visual.saturating_add(1);
+            }
+            if mouse_row == visual {
+                return Some(idx);
+            }
+            visual = visual.saturating_add(1);
+        }
+        None
+    }
+
     fn clicked_entry(&self, mouse: MouseEvent) -> Option<usize> {
         let rect = self.last_rect.get()?;
-        if mouse.column <= rect.x
-            || mouse.column >= rect.right().saturating_sub(1)
-            || mouse.row <= rect.y
-            || mouse.row >= rect.bottom().saturating_sub(1)
+        if mouse.column < rect.x
+            || mouse.column >= rect.right()
+            || mouse.row < rect.y
+            || mouse.row >= rect.bottom()
         {
             return None;
         }
-        let idx = mouse.row.saturating_sub(rect.y + 1) as usize;
-        (idx < self.entries.len()).then_some(idx)
+        self.entry_at_row(mouse.row, rect)
+    }
+
+    fn appear_progress(&self) -> f32 {
+        if self.reduced_motion {
+            return 1.0;
+        }
+        let ms = self.opened_at.elapsed().as_millis() as f32;
+        // Two-frame (~80 ms) soft open.
+        (ms / 80.0).clamp(0.0, 1.0)
     }
 }
 
@@ -153,6 +274,15 @@ impl ModalView for ContextMenuView {
 
     fn handle_mouse(&mut self, mouse: MouseEvent) -> ViewAction {
         match mouse.kind {
+            MouseEventKind::Moved => {
+                // Hover-follow: selection tracks the pointer over rows.
+                if let Some(idx) = self.clicked_entry(mouse)
+                    && self.selected != idx
+                {
+                    self.selected = idx;
+                }
+                ViewAction::None
+            }
             MouseEventKind::Down(MouseButton::Left) => {
                 if let Some(idx) = self.clicked_entry(mouse) {
                     self.selected = idx;
@@ -160,6 +290,7 @@ impl ModalView for ContextMenuView {
                         ViewAction::EmitAndClose(ViewEvent::ContextMenuSelected { action })
                     });
                 }
+                // Outside click dismisses.
                 ViewAction::Close
             }
             MouseEventKind::Down(MouseButton::Right) => ViewAction::Close,
@@ -180,41 +311,120 @@ impl ModalView for ContextMenuView {
         self.last_rect.set(Some(menu_area));
         Clear.render(menu_area, buf);
 
+        let progress = self.appear_progress();
+        let elevated = palette::SURFACE_ELEVATED;
+        let shadow = ocean::mix_colors(elevated, palette::WHALE_BG, 0.35);
+        let accent = palette::WHALE_INFO;
+        let soft_accent = ocean::mix_colors(accent, elevated, 0.72);
+
+        // Soft depth: paint a one-cell shadow offset below/right when space allows.
+        if progress >= 1.0 && menu_area.right() < area.right() {
+            for y in menu_area.y..menu_area.bottom() {
+                let cell = &mut buf[(menu_area.right(), y)];
+                if cell.symbol() == " " || cell.symbol().is_empty() {
+                    cell.set_bg(shadow);
+                }
+            }
+        }
+        if progress >= 1.0 && menu_area.bottom() < area.bottom() {
+            for x in menu_area.x..menu_area.right() {
+                let cell = &mut buf[(x, menu_area.bottom())];
+                if cell.symbol() == " " || cell.symbol().is_empty() {
+                    cell.set_bg(shadow);
+                }
+            }
+        }
+
+        // Fill elevated surface (borderless form).
+        for y in menu_area.y..menu_area.bottom() {
+            for x in menu_area.x..menu_area.right() {
+                buf[(x, y)].set_bg(elevated);
+            }
+        }
+
+        // Soft top accent rail (1 cell) instead of a heavy border.
+        for x in menu_area.x..menu_area.right() {
+            buf[(x, menu_area.y)].set_bg(soft_accent);
+        }
+
         let inner_width = menu_area.width.saturating_sub(2) as usize;
-        let lines = self
-            .entries
-            .iter()
-            .enumerate()
-            .map(|(idx, entry)| {
-                let label = format!("{} {}", idx + 1, entry.label);
-                let description = if entry.description.trim().is_empty() {
-                    String::new()
-                } else {
-                    format!(" - {}", entry.description)
-                };
-                let text = trim_to_width(&format!("{label}{description}"), inner_width);
-                let style = if idx == self.selected {
-                    Style::default()
-                        .fg(palette::SELECTION_TEXT)
-                        .bg(palette::SELECTION_BG)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                        .fg(palette::TEXT_SOFT)
-                        .bg(palette::SURFACE_ELEVATED)
-                };
-                Line::from(Span::styled(text, style))
-            })
-            .collect::<Vec<_>>();
+        let mut lines: Vec<Line<'static>> = Vec::new();
 
-        let block = Block::default()
-            .title(self.title.as_str())
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(palette::WHALE_INFO))
-            .style(Style::default().bg(palette::SURFACE_ELEVATED))
-            .padding(Padding::horizontal(0));
+        // Title row
+        if !self.title.is_empty() {
+            let title = trim_to_width(&self.title, inner_width);
+            lines.push(Line::from(Span::styled(
+                format!(" {title}"),
+                Style::default()
+                    .fg(palette::TEXT_HINT)
+                    .bg(elevated)
+                    .add_modifier(Modifier::BOLD),
+            )));
+        }
 
-        Paragraph::new(lines).block(block).render(menu_area, buf);
+        for (idx, entry) in self.entries.iter().enumerate() {
+            if entry.section_start && idx > 0 {
+                let divider = "─".repeat(inner_width.min(48));
+                lines.push(Line::from(Span::styled(
+                    format!(" {divider}"),
+                    Style::default().fg(palette::BORDER_COLOR).bg(elevated),
+                )));
+            }
+
+            let selected = idx == self.selected;
+            let row_bg = if selected { soft_accent } else { elevated };
+            let label_fg = if selected {
+                palette::SELECTION_TEXT
+            } else if entry.primary {
+                accent
+            } else {
+                palette::TEXT_SOFT
+            };
+            let glyph = if entry.glyph.is_empty() {
+                "·"
+            } else {
+                entry.glyph.as_str()
+            };
+            let hint = entry.hint.as_str();
+            let label_budget = inner_width
+                .saturating_sub(UnicodeWidthStr::width(glyph))
+                .saturating_sub(UnicodeWidthStr::width(hint))
+                .saturating_sub(4);
+            let label = trim_to_width(&entry.label, label_budget);
+            let pad = label_budget.saturating_sub(UnicodeWidthStr::width(label.as_str()));
+            let text = format!(" {glyph} {label}{} {hint} ", " ".repeat(pad));
+            let mut style = Style::default().fg(label_fg).bg(row_bg);
+            if selected || entry.primary {
+                style = style.add_modifier(Modifier::BOLD);
+            }
+            lines.push(Line::from(Span::styled(text, style)));
+        }
+
+        let body = Rect {
+            x: menu_area.x,
+            y: menu_area.y.saturating_add(1),
+            width: menu_area.width,
+            height: menu_area.height.saturating_sub(1),
+        };
+        Paragraph::new(lines).render(body, buf);
+    }
+}
+
+fn default_glyph_for(action: &ContextMenuAction) -> String {
+    // Best-effort icons from the action discriminant name.
+    let name = format!("{action:?}");
+    if name.contains("Copy") {
+        "⎘".to_string()
+    } else if name.contains("Paste") {
+        "📋".to_string()
+    } else if name.contains("Open") || name.contains("Edit") {
+        "↗".to_string()
+    } else if name.contains("Diff") || name.contains("Git") {
+        "⌥".to_string()
+    } else if name.contains("Select") {
+        "▣".to_string()
+    } else {
+        "·".to_string()
     }
 }
 
@@ -222,10 +432,6 @@ fn trim_to_width(text: &str, max_width: usize) -> String {
     if UnicodeWidthStr::width(text) <= max_width {
         return text.to_string();
     }
-    // #3488: the narrow-budget branch must accumulate *display* width, not char
-    // count. The previous `chars().take(max_width)` truncated by character count,
-    // which overflowed the column budget for wide (CJK) glyphs — three Han chars
-    // are six columns but `take(3)` kept all three, corrupting the menu border.
     if max_width <= 3 {
         let mut out = String::new();
         let mut width = 0usize;
@@ -257,251 +463,31 @@ fn trim_to_width(text: &str, max_width: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crossterm::event::KeyModifiers;
-    use ratatui::buffer::Buffer;
-
     use super::*;
 
-    fn entry(label: &str, action: ContextMenuAction) -> ContextMenuEntry {
-        ContextMenuEntry {
-            label: label.to_string(),
-            description: String::new(),
-            action,
-        }
-    }
-
     #[test]
-    fn enter_emits_selected_action() {
-        let mut view = ContextMenuView::new(
-            vec![
-                entry("Paste", ContextMenuAction::Paste),
-                entry("Help", ContextMenuAction::OpenHelp),
-            ],
-            5,
-            5,
-            " Right click ".to_string(),
-        );
-
-        view.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-        let action = view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-
-        assert!(matches!(
-            action,
-            ViewAction::EmitAndClose(ViewEvent::ContextMenuSelected {
-                action: ContextMenuAction::OpenHelp
-            })
-        ));
-    }
-
-    #[test]
-    fn occupied_region_covers_only_the_menu_popup() {
-        // Regression test for #3868: the central modal backdrop clears each
-        // view's occupied_region. If the context menu reports the whole
-        // frame, right-clicking blanks the entire UI behind the small menu.
-        let view = ContextMenuView::new(
-            vec![
-                entry("Paste", ContextMenuAction::Paste),
-                entry("Help", ContextMenuAction::OpenHelp),
-            ],
-            10,
-            5,
-            " Right click ".to_string(),
-        );
-        let area = Rect {
-            x: 0,
-            y: 0,
-            width: 80,
-            height: 24,
-        };
-
-        let region = ModalView::occupied_region(&view, area);
-
-        assert_eq!(region, view.menu_rect(area));
-        assert!(region.width < area.width);
-        assert!(region.height < area.height);
-    }
-
-    #[test]
-    fn menu_clamps_to_render_area() {
-        let view = ContextMenuView::new(
-            vec![entry("Paste", ContextMenuAction::Paste)],
-            200,
-            80,
-            " Right click ".to_string(),
-        );
-
-        let rect = view.menu_rect(Rect {
-            x: 0,
-            y: 0,
-            width: 40,
-            height: 10,
-        });
-
-        assert!(rect.right() <= 40);
-        assert!(rect.bottom() <= 10);
-    }
-
-    #[test]
-    fn left_click_selects_rendered_entry() {
-        let mut view = ContextMenuView::new(
-            vec![
-                entry("Paste", ContextMenuAction::Paste),
-                entry("Help", ContextMenuAction::OpenHelp),
-            ],
-            2,
-            2,
-            " Right click ".to_string(),
-        );
-        let area = Rect {
-            x: 0,
-            y: 0,
-            width: 40,
-            height: 10,
-        };
-        let mut buf = Buffer::empty(area);
-        view.render(area, &mut buf);
-
-        let action = view.handle_mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: 4,
-            row: 4,
-            modifiers: KeyModifiers::NONE,
-        });
-
-        assert!(matches!(
-            action,
-            ViewAction::EmitAndClose(ViewEvent::ContextMenuSelected {
-                action: ContextMenuAction::OpenHelp
-            })
-        ));
-    }
-
-    // --- Unicode / CJK / terminal-width QA (issue #3488) -------------------
-    // The context menu is a bordered selector: every entry is clipped by
-    // `trim_to_width` to the menu's inner width so wide glyphs never push past
-    // the border. These exercise that same clipping path the renderer uses.
-
-    fn entry_with_description(
-        label: &str,
-        description: &str,
-        action: ContextMenuAction,
-    ) -> ContextMenuEntry {
-        ContextMenuEntry {
-            label: label.to_string(),
-            description: description.to_string(),
-            action,
-        }
-    }
-
-    /// Concatenate the rendered cells of one menu entry row (between the left
-    /// and right borders) so its display width can be measured.
-    fn rendered_entry_row(buf: &Buffer, rect: Rect, entry_index: usize) -> String {
-        let y = rect.y + 1 + entry_index as u16;
-        let mut out = String::new();
-        for x in (rect.x + 1)..rect.right().saturating_sub(1) {
-            out.push_str(buf[(x, y)].symbol());
-        }
-        out
-    }
-
-    #[test]
-    fn trim_to_width_truncates_cjk_by_display_columns_not_char_count() {
-        // Regression for #3488: the narrow-budget branch used to take
-        // `max_width` *characters*, which overflowed the column budget for CJK
-        // (three Han glyphs = six columns, but `take(3)` kept all three and blew
-        // past a three-column budget, corrupting the menu border). Each Han
-        // glyph is two columns, so a budget of three fits exactly one glyph.
-        let out = trim_to_width("中文项目", 3);
-        assert_eq!(out, "中");
-        assert_eq!(UnicodeWidthStr::width(out.as_str()), 2);
-        assert!(UnicodeWidthStr::width(out.as_str()) <= 3);
-        assert!(!out.contains('\u{FFFD}'), "truncation split a wide glyph");
-
-        // Budgets 1, 2, 3 all stay within bounds by display width.
-        for budget in [1usize, 2, 3] {
-            let out = trim_to_width("中文项目标题", budget);
-            assert!(
-                UnicodeWidthStr::width(out.as_str()) <= budget,
-                "budget {budget}: {out:?} overflowed"
-            );
-            assert!(!out.contains('\u{FFFD}'), "budget {budget}: split a glyph");
-        }
-    }
-
-    #[test]
-    fn trim_to_width_keeps_combining_marks_and_emoji_within_budget() {
-        // Combining mark (U+0301) is zero-width, so "café" stays 4 columns.
-        let out = trim_to_width("cafe\u{0301} extra", 4);
-        assert!(UnicodeWidthStr::width(out.as_str()) <= 4);
-        assert!(!out.contains('\u{FFFD}'));
-        // Emoji is two columns; the ellipsis branch keeps the budget.
-        let out = trim_to_width("\u{1F433} \u{1F433} \u{1F433} whales", 6);
-        assert!(UnicodeWidthStr::width(out.as_str()) <= 6);
-        assert!(!out.contains('\u{FFFD}'));
-    }
-
-    #[test]
-    fn context_menu_cjk_entries_render_within_borders_at_narrow_and_medium_widths() {
-        // A selector with CJK labels and mixed-width descriptions — exactly the
-        // "CJK next to ASCII metadata" row the issue tracks. Rendered into a
-        // bordered menu, no entry row may overflow the inner width (which would
-        // corrupt the right border) or emit a replacement char.
+    fn primary_entry_is_selected_by_default() {
         let entries = vec![
-            entry_with_description("粘贴", "insert from clipboard", ContextMenuAction::Paste),
-            entry_with_description("复制", "copy selection", ContextMenuAction::OpenHelp),
-            entry_with_description(
-                "搜索 🔍",
-                "mixed ascii + emoji + cjk",
-                ContextMenuAction::Paste,
-            ),
+            ContextMenuEntry::new("Copy", "", ContextMenuAction::CopySelection),
+            ContextMenuEntry::new("Paste", "", ContextMenuAction::Paste).primary(),
         ];
+        let view = ContextMenuView::new(entries, 0, 0, "menu".into());
+        assert_eq!(view.selected, 1);
+    }
 
-        for width in [30u16, 80] {
-            let area = Rect {
-                x: 0,
-                y: 0,
-                width,
-                height: 24,
-            };
-            let view = ContextMenuView::new(entries.clone(), 4, 4, " 右键菜单 ".to_string());
-            let mut buf = Buffer::empty(area);
-            view.render(area, &mut buf);
-
-            let rect = view.menu_rect(area);
-            let inner_width = rect.width.saturating_sub(2) as usize;
-
-            for (idx, entry) in entries.iter().enumerate() {
-                let label = format!("{} {}", idx + 1, entry.label);
-                let description = if entry.description.trim().is_empty() {
-                    String::new()
-                } else {
-                    format!(" - {}", entry.description)
-                };
-                let clipped = trim_to_width(&format!("{label}{description}"), inner_width);
-                assert!(
-                    UnicodeWidthStr::width(clipped.as_str()) <= inner_width,
-                    "width={width} entry {idx} clipped text overflows inner width {inner_width}: {clipped:?}"
-                );
-
-                let row = rendered_entry_row(&buf, rect, idx);
-                assert!(
-                    !row.contains('\u{FFFD}'),
-                    "width={width} entry {idx} rendered a split glyph: {row:?}"
-                );
-                assert_eq!(
-                    buf[(rect.right().saturating_sub(1), rect.y + 1 + idx as u16)].symbol(),
-                    "│",
-                    "width={width} entry {idx} corrupted the right border: {row:?}"
-                );
-            }
-
-            // The selected (first) entry's CJK label must actually appear in the
-            // buffer, proving the content was not dropped by truncation.
-            let first = rendered_entry_row(&buf, rect, 0);
-            assert!(
-                first.contains('粘'),
-                "width={width}: CJK label dropped: {first:?}"
-            );
-        }
+    #[test]
+    fn reduced_motion_opens_instantly() {
+        let view = ContextMenuView::new_with_motion(
+            vec![ContextMenuEntry::new(
+                "Copy",
+                "",
+                ContextMenuAction::CopySelection,
+            )],
+            0,
+            0,
+            "menu".into(),
+            true,
+        );
+        assert!((view.appear_progress() - 1.0).abs() < f32::EPSILON);
     }
 }

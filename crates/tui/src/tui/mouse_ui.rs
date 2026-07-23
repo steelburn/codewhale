@@ -35,13 +35,10 @@ pub(crate) fn should_drop_loading_mouse_motion(app: &App, mouse: MouseEvent) -> 
     }
 
     match mouse.kind {
-        MouseEventKind::Moved => {
-            let over_sidebar = mouse_hits_rect(mouse, app.viewport.last_sidebar_area);
-            let was_over_sidebar = app.last_mouse_pos.is_some_and(|(column, row)| {
-                point_hits_rect(column, row, app.viewport.last_sidebar_area)
-            });
-            !(over_sidebar || was_over_sidebar || app.sidebar_hover_tooltip.is_some())
-        }
+        // v0.9.1: keep a cheap hover hit-test alive while streaming. Motion
+        // events are no longer dropped wholesale — the frame limiter bounds
+        // redraw cost. Only expensive transcript reflow stays deferred.
+        MouseEventKind::Moved => false,
         MouseEventKind::Drag(_) => {
             // Divider drags must stay live during active turns — dropping
             // these events wedges the resize state mid-drag (#3063).
@@ -1151,11 +1148,13 @@ pub(crate) fn open_context_menu(app: &mut App, mouse: MouseEvent) {
         return;
     }
     let title = app.tr(MessageId::CtxMenuTitle).to_string();
-    app.view_stack.push(ContextMenuView::new(
+    let reduced = app.motion_policy().as_low_motion();
+    app.view_stack.push(ContextMenuView::new_with_motion(
         entries,
         mouse.column,
         mouse.row,
         title,
+        reduced,
     ));
     app.needs_redraw = true;
 }
@@ -1168,47 +1167,71 @@ pub(crate) fn build_context_menu_entries(app: &App, mouse: MouseEvent) -> Vec<Co
         if let Some(command) = sidebar_click_action(app, mouse)
             .and_then(|action| action.as_command().map(str::to_string))
         {
-            entries.push(ContextMenuEntry {
-                label: "Run".to_string(),
-                description: command.clone(),
-                action: ContextMenuAction::ExecuteCommand { command },
-            });
+            entries.push(
+                ContextMenuEntry::new(
+                    "Run",
+                    command.clone(),
+                    ContextMenuAction::ExecuteCommand { command },
+                )
+                .with_glyph("▶")
+                .primary(),
+            );
         }
         // Copy the hovered row's full text (sidebar rows can't be
         // mouse-selected, so the menu is the only copy path).
         if let Some(text) = sidebar_row_copy_text(app, mouse) {
-            entries.push(ContextMenuEntry {
-                label: "Copy".to_string(),
-                description: truncate_line_to_width(first_line(&text), 28),
-                action: ContextMenuAction::CopyText { text },
-            });
+            entries.push(
+                ContextMenuEntry::new(
+                    "Copy",
+                    truncate_line_to_width(first_line(&text), 28),
+                    ContextMenuAction::CopyText { text },
+                )
+                .with_glyph("⎘")
+                .with_hint("y"),
+            );
         }
     } else {
         // Paste first — the most common action when right-clicking in the
         // composer or transcript after copying text from the output area.
-        entries.push(ContextMenuEntry {
-            label: app.tr(MessageId::CtxMenuPaste).to_string(),
-            description: app.tr(MessageId::CtxMenuPasteDesc).to_string(),
-            action: ContextMenuAction::Paste,
-        });
+        entries.push(
+            ContextMenuEntry::new(
+                app.tr(MessageId::CtxMenuPaste),
+                app.tr(MessageId::CtxMenuPasteDesc),
+                ContextMenuAction::Paste,
+            )
+            .with_glyph("📋")
+            .with_hint("p")
+            .primary(),
+        );
     }
 
     if selection_has_content(app) {
-        entries.push(ContextMenuEntry {
-            label: app.tr(MessageId::CtxMenuCopySelection).to_string(),
-            description: app.tr(MessageId::CtxMenuCopySelectionDesc).to_string(),
-            action: ContextMenuAction::CopySelection,
-        });
-        entries.push(ContextMenuEntry {
-            label: app.tr(MessageId::CtxMenuOpenSelection).to_string(),
-            description: app.tr(MessageId::CtxMenuOpenSelectionDesc).to_string(),
-            action: ContextMenuAction::OpenSelection,
-        });
-        entries.push(ContextMenuEntry {
-            label: app.tr(MessageId::CtxMenuClearSelection).to_string(),
-            description: String::new(),
-            action: ContextMenuAction::ClearSelection,
-        });
+        entries.push(
+            ContextMenuEntry::new(
+                app.tr(MessageId::CtxMenuCopySelection),
+                app.tr(MessageId::CtxMenuCopySelectionDesc),
+                ContextMenuAction::CopySelection,
+            )
+            .with_glyph("⎘")
+            .with_hint("y")
+            .section_start(),
+        );
+        entries.push(
+            ContextMenuEntry::new(
+                app.tr(MessageId::CtxMenuOpenSelection),
+                app.tr(MessageId::CtxMenuOpenSelectionDesc),
+                ContextMenuAction::OpenSelection,
+            )
+            .with_glyph("↗"),
+        );
+        entries.push(
+            ContextMenuEntry::new(
+                app.tr(MessageId::CtxMenuClearSelection),
+                "",
+                ContextMenuAction::ClearSelection,
+            )
+            .with_glyph("×"),
+        );
     }
 
     if !on_sidebar && let Some(filtered_cell_index) = transcript_cell_index_from_mouse(app, mouse) {
@@ -1217,34 +1240,51 @@ pub(crate) fn build_context_menu_entries(app: &App, mouse: MouseEvent) -> Vec<Co
         let target = detail_target_label(app, cell_index)
             .map(|label| truncate_line_to_width(label.as_str(), 28))
             .unwrap_or_else(|| "message".to_string());
-        entries.push(ContextMenuEntry {
-            label: app.tr(MessageId::CtxMenuOpenDetails).to_string(),
-            description: target,
-            action: ContextMenuAction::OpenDetails { cell_index },
-        });
-        entries.push(ContextMenuEntry {
-            label: app.tr(MessageId::CtxMenuCopyMessage).to_string(),
-            description: app.tr(MessageId::CtxMenuCopyMessageDesc).to_string(),
-            action: ContextMenuAction::CopyCell { cell_index },
-        });
-        entries.push(ContextMenuEntry {
-            label: app.tr(MessageId::CtxMenuOpenInEditor).to_string(),
-            description: app.tr(MessageId::CtxMenuOpenInEditorDesc).to_string(),
-            action: ContextMenuAction::OpenFileAtLine { cell_index },
-        });
+        entries.push(
+            ContextMenuEntry::new(
+                app.tr(MessageId::CtxMenuOpenDetails),
+                target,
+                ContextMenuAction::OpenDetails { cell_index },
+            )
+            .with_glyph("▣")
+            .section_start(),
+        );
+        entries.push(
+            ContextMenuEntry::new(
+                app.tr(MessageId::CtxMenuCopyMessage),
+                app.tr(MessageId::CtxMenuCopyMessageDesc),
+                ContextMenuAction::CopyCell { cell_index },
+            )
+            .with_glyph("⎘"),
+        );
+        entries.push(
+            ContextMenuEntry::new(
+                app.tr(MessageId::CtxMenuOpenInEditor),
+                app.tr(MessageId::CtxMenuOpenInEditorDesc),
+                ContextMenuAction::OpenFileAtLine { cell_index },
+            )
+            .with_glyph("↗")
+            .with_hint("e"),
+        );
         // Hide/show cell toggle.
         if app.collapsed_cells.contains(&cell_index) {
-            entries.push(ContextMenuEntry {
-                label: app.tr(MessageId::CtxMenuShowCell).to_string(),
-                description: app.tr(MessageId::CtxMenuShowCellDesc).to_string(),
-                action: ContextMenuAction::ShowCell { cell_index },
-            });
+            entries.push(
+                ContextMenuEntry::new(
+                    app.tr(MessageId::CtxMenuShowCell),
+                    app.tr(MessageId::CtxMenuShowCellDesc),
+                    ContextMenuAction::ShowCell { cell_index },
+                )
+                .with_glyph("◇"),
+            );
         } else {
-            entries.push(ContextMenuEntry {
-                label: app.tr(MessageId::CtxMenuHideCell).to_string(),
-                description: app.tr(MessageId::CtxMenuHideCellDesc).to_string(),
-                action: ContextMenuAction::HideCell { cell_index },
-            });
+            entries.push(
+                ContextMenuEntry::new(
+                    app.tr(MessageId::CtxMenuHideCell),
+                    app.tr(MessageId::CtxMenuHideCellDesc),
+                    ContextMenuAction::HideCell { cell_index },
+                )
+                .with_glyph("○"),
+            );
         }
     }
 
@@ -1252,28 +1292,42 @@ pub(crate) fn build_context_menu_entries(app: &App, mouse: MouseEvent) -> Vec<Co
     if !app.collapsed_cells.is_empty() {
         let count = app.collapsed_cells.len();
         let label = app.tr(MessageId::CtxMenuShowHidden).to_string();
-        entries.push(ContextMenuEntry {
-            label: format!("{label} ({count})"),
-            description: app.tr(MessageId::CtxMenuShowHiddenDesc).to_string(),
-            action: ContextMenuAction::ShowAllHidden,
-        });
+        entries.push(
+            ContextMenuEntry::new(
+                format!("{label} ({count})"),
+                app.tr(MessageId::CtxMenuShowHiddenDesc),
+                ContextMenuAction::ShowAllHidden,
+            )
+            .with_glyph("◇")
+            .section_start(),
+        );
     }
 
-    entries.push(ContextMenuEntry {
-        label: app.tr(MessageId::CtxMenuCmdPalette).to_string(),
-        description: app.tr(MessageId::CtxMenuCmdPaletteDesc).to_string(),
-        action: ContextMenuAction::OpenCommandPalette,
-    });
-    entries.push(ContextMenuEntry {
-        label: app.tr(MessageId::CtxMenuContextInspector).to_string(),
-        description: app.tr(MessageId::CtxMenuContextInspectorDesc).to_string(),
-        action: ContextMenuAction::OpenContextInspector,
-    });
-    entries.push(ContextMenuEntry {
-        label: app.tr(MessageId::CtxMenuHelp).to_string(),
-        description: app.tr(MessageId::CtxMenuHelpDesc).to_string(),
-        action: ContextMenuAction::OpenHelp,
-    });
+    entries.push(
+        ContextMenuEntry::new(
+            app.tr(MessageId::CtxMenuCmdPalette),
+            app.tr(MessageId::CtxMenuCmdPaletteDesc),
+            ContextMenuAction::OpenCommandPalette,
+        )
+        .with_glyph("⌘")
+        .section_start(),
+    );
+    entries.push(
+        ContextMenuEntry::new(
+            app.tr(MessageId::CtxMenuContextInspector),
+            app.tr(MessageId::CtxMenuContextInspectorDesc),
+            ContextMenuAction::OpenContextInspector,
+        )
+        .with_glyph("ⓘ"),
+    );
+    entries.push(
+        ContextMenuEntry::new(
+            app.tr(MessageId::CtxMenuHelp),
+            app.tr(MessageId::CtxMenuHelpDesc),
+            ContextMenuAction::OpenHelp,
+        )
+        .with_glyph("?"),
+    );
 
     entries
 }
