@@ -1404,13 +1404,15 @@ If you are upgrading from older releases:
 - `managed_config_path` (string, optional): managed config file loaded after user/env config.
 - `requirements_path` (string, optional): requirements file used to enforce allowed approval/sandbox values.
 - `max_subagents` (int, optional): defaults to `20` and is clamped to `1..=20`.
-- `subagents.*` (optional): per-role/type model defaults for `agent`.
-  Explicit tool `model` values win, then role/type
+- `subagents.*` (optional compatibility table): per-Fleet-role model defaults
+  for `agent`. Explicit tool `model` values win, then role
   overrides, then the parent runtime model. Supported convenience keys are
-  `default_model`, `worker_model`, `explorer_model`, `awaiter_model`,
-  `review_model`, `custom_model`, `max_concurrent`, `max_admitted`,
+  `default_model`, `worker_model`, `scout_model`, `planner_model`,
+  `reviewer_model`, `custom_model`, `max_concurrent`, `max_admitted`,
   `launch_concurrency`, `token_budget`, `api_timeout_secs`, and
-  `heartbeat_timeout_secs`. The `[subagents] max_concurrent` value overrides
+  `heartbeat_timeout_secs`. The v0.9.x keys `explorer_model`, `awaiter_model`,
+  and `review_model` remain accepted as aliases. The `[subagents]
+  max_concurrent` value overrides
   top-level `max_subagents` and is also clamped to `1..=20`. `[subagents]
   max_admitted` (aliases: `max_total`, `admission_limit`) is the bounded total
   of queued plus running sub-agents; it defaults to `200` so high-fanout turns
@@ -1461,8 +1463,9 @@ If you are upgrading from older releases:
 
   `/config subagents status` prints both global values and the active
   provider's resolved profile so rate-limit tuning is visible in the TUI.
-  `[subagents.models]` accepts lower-case role or type keys such as `worker`,
-  `explorer`, `general`, `explore`, `plan`, and `review`. Values are validated
+  `[subagents.models]` accepts lower-case Fleet role keys such as `worker`,
+  `scout`, `planner`, `reviewer`, `builder`, and `verifier`; legacy type keys
+  remain accepted during v0.9.x. Values are validated
   against the active provider at spawn time; direct DeepSeek requires DeepSeek
   IDs, while OpenAI-compatible/custom provider routes pass explicit model IDs
   through to that provider. To route a child to a different provider than the

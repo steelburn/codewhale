@@ -737,7 +737,7 @@ mod tests {
             .clone();
         assert_eq!(
             member_posture(&reviewer),
-            "review worker · read-only · shell read-only"
+            "reviewer worker · read-only · shell read-only"
         );
         assert_eq!(member_routing(&reviewer), "inherit session route");
 
@@ -746,7 +746,7 @@ mod tests {
         let scout = FleetRoster::built_ins_only().get("scout").unwrap().clone();
         assert_eq!(
             member_posture(&scout),
-            "explore worker · read-only · shell read-only"
+            "scout worker · read-only · shell read-only"
         );
         assert_eq!(member_routing(&scout), "inherit session route");
 
@@ -757,7 +757,7 @@ mod tests {
             .clone();
         assert_eq!(
             member_posture(&builder),
-            "implementer worker · write · shell full"
+            "builder worker · write · shell full"
         );
 
         // A pinned model beats the route preset label.

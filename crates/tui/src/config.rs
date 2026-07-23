@@ -1879,9 +1879,10 @@ pub struct ContextConfig {
     pub seam_model: Option<String>,
 }
 
-/// Sub-agent model overrides. Keys in `models` can be role names (`worker`,
-/// `explorer`, `awaiter`) or type names (`general`, `explore`, `plan`,
-/// `review`, `custom`). Per-call explicit model choices still win.
+/// Fleet-role model overrides for delegated workers. Canonical keys in
+/// `models` are `worker`, `scout`, `planner`, `reviewer`, `builder`,
+/// `verifier`, and `custom`. Legacy sub-agent type names remain accepted for
+/// v0.9.x compatibility. Per-call explicit model choices still win.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct SubagentsConfig {
     /// Top-level switch for the model-facing `agent` tool. `None` preserves
@@ -1893,11 +1894,11 @@ pub struct SubagentsConfig {
     pub default_model: Option<String>,
     #[serde(default)]
     pub worker_model: Option<String>,
-    #[serde(default)]
+    #[serde(default, rename = "scout_model", alias = "explorer_model")]
     pub explorer_model: Option<String>,
-    #[serde(default)]
+    #[serde(default, rename = "planner_model", alias = "awaiter_model")]
     pub awaiter_model: Option<String>,
-    #[serde(default)]
+    #[serde(default, rename = "reviewer_model", alias = "review_model")]
     pub review_model: Option<String>,
     #[serde(default)]
     pub custom_model: Option<String>,
@@ -5662,10 +5663,13 @@ impl Config {
         insert("default", &cfg.default_model);
         insert("worker", &cfg.worker_model);
         insert("general", &cfg.worker_model);
+        insert("scout", &cfg.explorer_model);
         insert("explorer", &cfg.explorer_model);
         insert("explore", &cfg.explorer_model);
+        insert("planner", &cfg.awaiter_model);
         insert("awaiter", &cfg.awaiter_model);
         insert("plan", &cfg.awaiter_model);
+        insert("reviewer", &cfg.review_model);
         insert("review", &cfg.review_model);
         insert("custom", &cfg.custom_model);
 

@@ -1741,6 +1741,55 @@ fn launch_concurrency_new_key_wins_over_deprecated_alias() {
 }
 
 #[test]
+fn fleet_role_model_keys_accept_canonical_and_legacy_names() {
+    let canonical: Config = toml::from_str(
+        r#"
+[subagents]
+scout_model = "scout-model"
+planner_model = "planner-model"
+reviewer_model = "reviewer-model"
+"#,
+    )
+    .expect("parse canonical Fleet role keys");
+    let overrides = canonical.subagent_model_overrides();
+    assert_eq!(
+        overrides.get("scout").map(String::as_str),
+        Some("scout-model")
+    );
+    assert_eq!(
+        overrides.get("planner").map(String::as_str),
+        Some("planner-model")
+    );
+    assert_eq!(
+        overrides.get("reviewer").map(String::as_str),
+        Some("reviewer-model")
+    );
+
+    let legacy: Config = toml::from_str(
+        r#"
+[subagents]
+explorer_model = "legacy-scout"
+awaiter_model = "legacy-planner"
+review_model = "legacy-reviewer"
+"#,
+    )
+    .expect("parse v0.9.x role aliases");
+    let overrides = legacy.subagent_model_overrides();
+    assert_eq!(
+        overrides.get("scout").map(String::as_str),
+        Some("legacy-scout")
+    );
+    assert_eq!(
+        overrides.get("planner").map(String::as_str),
+        Some("legacy-planner")
+    );
+    assert_eq!(
+        overrides.get("reviewer").map(String::as_str),
+        Some("legacy-reviewer")
+    );
+}
+
+#[test]
 fn subagent_token_budget_is_optional_and_zero_disables() {
     assert_eq!(Config::default().subagent_token_budget(), None);
 

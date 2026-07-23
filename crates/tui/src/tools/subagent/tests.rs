@@ -1788,6 +1788,20 @@ fn test_agent_type_round_trips_via_as_str() {
 }
 
 #[test]
+fn fleet_role_labels_are_canonical_while_legacy_snapshot_wire_stays_readable() {
+    assert_eq!(SubAgentType::Explore.as_str(), "scout");
+    assert_eq!(SubAgentType::Implementer.as_str(), "builder");
+    assert_eq!(
+        serde_json::to_string(&SubAgentType::Explore).expect("serialize legacy snapshot adapter"),
+        "\"explore\""
+    );
+    assert_eq!(
+        serde_json::from_str::<SubAgentType>("\"explore\"").expect("read v0.9.x snapshot"),
+        SubAgentType::Explore
+    );
+}
+
+#[test]
 fn test_implementer_and_verifier_have_distinct_prompts() {
     // The whole point of adding the types is that they carry distinct
     // posture. Defensive guard: catch the easy bug where copy-paste
@@ -1810,7 +1824,8 @@ fn test_implementer_and_verifier_have_distinct_prompts() {
     // Sanity: each prompt mentions the role's defining verb so the
     // model has clear direction.
     assert!(
-        implementer.to_lowercase().contains("implement")
+        implementer.to_lowercase().contains("builder")
+            || implementer.to_lowercase().contains("implement")
             || implementer.to_lowercase().contains("write the code"),
         "Implementer prompt should reference its role: {implementer}"
     );
@@ -1825,13 +1840,13 @@ fn test_implementer_and_verifier_have_distinct_prompts() {
 #[test]
 fn test_agent_type_prompts_include_shared_output_contract_once() {
     for (agent_type, marker) in [
-        (SubAgentType::General, "general-purpose sub-agent"),
-        (SubAgentType::Explore, "exploration sub-agent"),
-        (SubAgentType::Plan, "planning sub-agent"),
-        (SubAgentType::Review, "code review sub-agent"),
-        (SubAgentType::Implementer, "implementation sub-agent"),
-        (SubAgentType::Verifier, "verification sub-agent"),
-        (SubAgentType::Custom, "custom sub-agent"),
+        (SubAgentType::General, "Fleet worker"),
+        (SubAgentType::Explore, "Fleet scout"),
+        (SubAgentType::Plan, "Fleet planner"),
+        (SubAgentType::Review, "Fleet reviewer"),
+        (SubAgentType::Implementer, "Fleet builder"),
+        (SubAgentType::Verifier, "Fleet verifier"),
+        (SubAgentType::Custom, "custom Fleet worker"),
     ] {
         let prompt = agent_type.system_prompt();
         assert!(prompt.contains(marker));
@@ -1847,7 +1862,7 @@ fn test_agent_type_prompts_include_shared_output_contract_once() {
 #[test]
 fn explore_prompt_orients_before_searching() {
     let prompt = SubAgentType::Explore.system_prompt();
-    assert!(prompt.contains("role: `explore`"));
+    assert!(prompt.contains("role: `scout`"));
     assert!(prompt.contains("AGENTS.md/README"));
     assert!(prompt.contains("workspace/project root"));
     assert!(prompt.contains("compressed reconnaissance"));
@@ -1867,7 +1882,7 @@ fn explore_prompt_is_quick_bounded_and_read_only() {
 #[test]
 fn implementer_prompt_is_not_forced_into_explorer_cap() {
     let prompt = SubAgentType::Implementer.system_prompt();
-    assert!(prompt.contains("not limited to an explorer-style 3-5 tool-call cap"));
+    assert!(prompt.contains("not limited to a scout-style 3-5 tool-call cap"));
     assert!(prompt.contains("Checkpoint before expanding scope"));
     assert!(!prompt.contains("Default to `EFFORT: quick`"));
 }
@@ -2324,7 +2339,7 @@ fn test_parse_spawn_request_accepts_message_and_agent_type_aliases() {
     let parsed = parse_spawn_request(&input).expect("spawn request should parse");
     assert_eq!(parsed.prompt, "Find references to Foo");
     assert_eq!(parsed.agent_type, SubAgentType::Explore);
-    assert_eq!(parsed.assignment.role.as_deref(), Some("explorer"));
+    assert_eq!(parsed.assignment.role.as_deref(), Some("scout"));
 }
 
 #[test]
@@ -2336,7 +2351,7 @@ fn test_parse_spawn_request_accepts_objective_and_role_alias() {
     let parsed = parse_spawn_request(&input).expect("spawn request should parse");
     assert_eq!(parsed.prompt, "Coordinate and wait");
     assert_eq!(parsed.agent_type, SubAgentType::Plan);
-    assert_eq!(parsed.assignment.role.as_deref(), Some("awaiter"));
+    assert_eq!(parsed.assignment.role.as_deref(), Some("planner"));
 }
 
 #[test]
@@ -2640,11 +2655,11 @@ fn test_apply_spawn_profile_rejects_conflicting_explicit_type() {
     let err = apply_spawn_profile(&mut request, &roster).expect_err("type conflict should fail");
     let message = err.to_string();
     assert!(
-        message.contains("profile 'reviewer' implies type review"),
+        message.contains("profile 'reviewer' implies type reviewer"),
         "{message}"
     );
     assert!(
-        message.contains("conflicting explicit type 'implementer'"),
+        message.contains("conflicting explicit type 'builder'"),
         "{message}"
     );
 }
@@ -3108,12 +3123,13 @@ fn test_parse_spawn_request_accepts_fleet_role_token_for_runtime_resolution() {
     assert_eq!(member.id, "manager");
     assert_eq!(parsed.profile.as_deref(), Some("manager"));
 
-    let mut scout =
-        parse_spawn_request(&json!({"prompt": "map it", "role": "scout"})).expect("scout");
-    let member = apply_spawn_profile(&mut scout, &roster)
-        .expect("scout should resolve")
-        .expect("scout should select a roster member");
-    assert_eq!(member.id, "scout");
+    let mut scout = parse_spawn_request(&json!({"prompt": "map it", "role": "scout"}))
+        .expect("canonical scout role");
+    let member = apply_spawn_profile(&mut scout, &roster).expect("scout should resolve");
+    assert!(
+        member.is_none(),
+        "a role posture should not silently select a roster profile; use profile=scout"
+    );
     assert_eq!(scout.agent_type, SubAgentType::Explore);
 }
 
@@ -3128,21 +3144,22 @@ fn test_parse_spawn_request_accepts_full_role_vocabulary() {
         ("general_purpose", SubAgentType::General, "worker"),
         ("worker", SubAgentType::General, "worker"),
         ("default", SubAgentType::General, "default"),
-        ("explore", SubAgentType::Explore, "explorer"),
-        ("exploration", SubAgentType::Explore, "explorer"),
-        ("explorer", SubAgentType::Explore, "explorer"),
-        ("plan", SubAgentType::Plan, "awaiter"),
-        ("planning", SubAgentType::Plan, "awaiter"),
-        ("planner", SubAgentType::Plan, "awaiter"),
-        ("awaiter", SubAgentType::Plan, "awaiter"),
+        ("scout", SubAgentType::Explore, "scout"),
+        ("explore", SubAgentType::Explore, "scout"),
+        ("exploration", SubAgentType::Explore, "scout"),
+        ("explorer", SubAgentType::Explore, "scout"),
+        ("plan", SubAgentType::Plan, "planner"),
+        ("planning", SubAgentType::Plan, "planner"),
+        ("planner", SubAgentType::Plan, "planner"),
+        ("awaiter", SubAgentType::Plan, "planner"),
         ("review", SubAgentType::Review, "reviewer"),
         ("code-review", SubAgentType::Review, "reviewer"),
         ("code_review", SubAgentType::Review, "reviewer"),
         ("reviewer", SubAgentType::Review, "reviewer"),
-        ("implementer", SubAgentType::Implementer, "implementer"),
-        ("implement", SubAgentType::Implementer, "implementer"),
-        ("implementation", SubAgentType::Implementer, "implementer"),
-        ("builder", SubAgentType::Implementer, "implementer"),
+        ("implementer", SubAgentType::Implementer, "builder"),
+        ("implement", SubAgentType::Implementer, "builder"),
+        ("implementation", SubAgentType::Implementer, "builder"),
+        ("builder", SubAgentType::Implementer, "builder"),
         ("verifier", SubAgentType::Verifier, "verifier"),
         ("verify", SubAgentType::Verifier, "verifier"),
         ("verification", SubAgentType::Verifier, "verifier"),
@@ -3214,13 +3231,10 @@ fn test_invalid_role_error_lists_real_aliases() {
     assert!(err.contains("reviewer"), "hint should list reviewer: {err}");
     assert!(err.contains("verifier"), "hint should list verifier: {err}");
     assert!(err.contains("custom"), "hint should list custom: {err}");
+    assert!(err.contains("worker"), "hint should list worker: {err}");
     assert!(
-        err.contains("general-purpose"),
-        "hint should list general-purpose: {err}"
-    );
-    assert!(
-        err.contains("code_review"),
-        "hint should list code_review: {err}"
+        err.contains("legacy aliases remain accepted"),
+        "hint should explain compatibility aliases: {err}"
     );
 }
 
@@ -3238,13 +3252,7 @@ fn subagent_tool_schemas_advertise_real_type_and_role_vocabulary() {
 
     let description = schema_property_description(&agent_schema, "type");
     for alias in [
-        "general",
-        "explore",
-        "plan",
-        "review",
-        "implementer",
-        "verifier",
-        "custom",
+        "worker", "scout", "planner", "reviewer", "builder", "verifier", "custom",
     ] {
         assert!(
             description.contains(alias),
@@ -3952,8 +3960,8 @@ fn test_build_assignment_prompt_includes_metadata() {
         &SubAgentType::Explore,
     );
     assert!(prompt.contains("Assignment metadata"));
-    assert!(prompt.contains("resolved_type: explore"));
-    assert!(prompt.contains("role: explorer"));
+    assert!(prompt.contains("resolved_type: scout"));
+    assert!(prompt.contains("role: scout"));
 }
 
 #[test]
@@ -6369,7 +6377,7 @@ fn subagent_done_sentinel_format_is_well_formed() {
     let parsed: serde_json::Value = serde_json::from_str(inner).expect("inner JSON parses");
     assert_eq!(parsed["agent_id"], "agent_xyz");
     assert_eq!(parsed["status"], "completed");
-    assert_eq!(parsed["agent_type"], "general");
+    assert_eq!(parsed["agent_type"], "worker");
     assert_eq!(parsed["summary_location"], "previous_line");
     // issue #2652: a complete (non-truncated) summary is tagged as such.
     assert_eq!(parsed["summary_kind"], "complete");
@@ -7219,7 +7227,7 @@ async fn general_delegation_still_blocks_suggest_write_without_parent_auto_appro
         .expect_err("general agent should not silently gain write permission");
     let msg = err.to_string();
     assert!(
-        msg.contains("not delegated to general sub-agents"),
+        msg.contains("not delegated to worker sub-agents"),
         "general writes should be rejected with a role-aware message: {msg}"
     );
 
@@ -7256,7 +7264,7 @@ async fn explore_role_still_blocks_suggest_writes_without_parent_auto_approve() 
         .expect_err("explore agents must not write");
     let msg = err.to_string();
     assert!(
-        msg.contains("explore") && msg.contains("not permitted"),
+        msg.contains("scout") && msg.contains("not permitted"),
         "explore writes should be rejected with a role-aware message: {msg}"
     );
     assert!(

@@ -479,11 +479,11 @@ OUTPUT: VERDICT, EVIDENCE, GAPS, NEXT.
 
 Child model choice is explicit. Use `model_strength: "same"` when the child needs your current
 capability level. Use `model_strength: "faster"` for read-only lookup/search, status, or other
-low-risk tasks that should run on a smaller/faster same-family model — `type: "explore"` already
+low-risk tasks that should run on a smaller/faster same-family model — `type: "scout"` already
 defaults to `model_strength: "faster"` for exactly this kind of bounded read-only work, so you only
-need to set it for non-explore children. Use an exact `model` only when you know the
+need to set it for non-scout children. Use an exact `model` only when you know the
 provider-specific id; it overrides `model_strength`.
-Child thinking is explicit too. Use `thinking: "off"` for fast explore/lookups, `thinking: "high"`
+Child thinking is explicit too. Use `thinking: "off"` for fast scout/lookups, `thinking: "high"`
 for ordinary reasoning, `thinking: "max"` for hard design/debug/release/security work, and
 `thinking: "auto"` when you want Codewhale to choose from the child prompt. Omit it to inherit the
 parent thinking mode; explicit `thinking` overrides the default off used with `model_strength:
@@ -491,16 +491,16 @@ parent thinking mode; explicit `thinking` overrides the default off used with `m
 
 Prefer parallel exploration for broad investigations. For repo, version, branch, benchmark,
 API-surface, bug, PR, issue, or multi-module investigations, start by splitting independent
-read-only exploration across 2-4 `type: "explore"` sub-agents when that will reduce uncertainty
+read-only exploration across 2-4 `type: "scout"` Fleet workers when that will reduce uncertainty
 faster than reading sequentially. Each child runs concurrently in one turn and returns findings you
 synthesize; keep architecture decisions, integration, verification, and the final response in the
 parent. Do not open sub-agents for tiny one-step tasks — the spawn overhead is not worth it for a
 single read or search.
 
-For `type: "explore"`, default to `EFFORT: quick`: stay read-only, aim for about 3-5 tool calls,
+For `type: "scout"`, default to `EFFORT: quick`: stay read-only, aim for about 3-5 tool calls,
 do not broaden once QUESTION is answered, and return partial findings if the next step would be
 speculative or duplicative. Review/verifier children can spend more calls but should stop after
-decisive evidence. Implementer/repair children are not subject to the 3-5 call cap; ask them to
+decisive evidence. Builder/repair children are not subject to the 3-5 call cap; ask them to
 checkpoint before expanding scope or after repeated failures.
 
 Sub-agent outputs are self-reports, not verified facts. Re-check material claims before relying on

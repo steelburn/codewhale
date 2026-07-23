@@ -317,21 +317,14 @@ fn subagent_perf_enabled() -> bool {
     })
 }
 
-const VALID_SUBAGENT_TYPES: &str = "general (aliases: general-purpose, general_purpose, worker, default), \
-     explore (aliases: exploration, explorer), plan (aliases: planning, planner, awaiter), \
-     review (aliases: code-review, code_review, reviewer), implementer (aliases: implement, implementation, builder), \
-     verifier (aliases: verify, verification, validator, tester), custom";
+const VALID_SUBAGENT_TYPES: &str = "worker, scout, planner, reviewer, builder, verifier, custom \
+     (legacy aliases remain accepted: general, explore/explorer, plan/awaiter, review, implementer)";
 /// Role aliases accepted by `normalize_role_alias`. Kept in sync with the
 /// match arms below so every input that `SubAgentType::from_str` accepts also
 /// resolves to a canonical role (avoids the dual-validation rejection in #2649).
-const VALID_ROLE_ALIASES: &str = "default; worker (aliases: general, general-purpose, general_purpose); \
-     explorer (aliases: explore, exploration); awaiter (aliases: plan, planning, planner); \
-     reviewer (aliases: review, code-review, code_review); implementer (aliases: implement, implementation, builder); \
-     verifier (aliases: verify, verification, validator, tester); custom";
-const SUBAGENT_TYPE_DESCRIPTION: &str = "Sub-agent type. Accepted vocabulary: general (aliases: general-purpose, general_purpose, worker, default), \
-     explore (aliases: exploration, explorer), plan (aliases: planning, planner, awaiter), \
-     review (aliases: code-review, code_review, reviewer), implementer (aliases: implement, implementation, builder), \
-     verifier (aliases: verify, verification, validator, tester), custom.";
+const VALID_ROLE_ALIASES: &str = "default; worker; scout; planner; reviewer; builder; verifier; custom \
+     (legacy aliases remain accepted)";
+const SUBAGENT_TYPE_DESCRIPTION: &str = "Fleet role for this delegated worker: worker, scout, planner, reviewer, builder, verifier, or custom. Legacy sub-agent type aliases remain accepted for v0.9.x compatibility.";
 /// Whale species used as friendly names for sub-agents in the UI. The full
 /// Cetacea infraorder — baleen whales (Mysticeti), toothed whales
 /// (Odontoceti), plus select dolphin species (family Delphinidae) that
@@ -743,7 +736,7 @@ impl SubAgentType {
             "general" | "general-purpose" | "general_purpose" | "worker" | "default" => {
                 Some(Self::General)
             }
-            "explore" | "exploration" | "explorer" => Some(Self::Explore),
+            "scout" | "explore" | "exploration" | "explorer" => Some(Self::Explore),
             "plan" | "planning" | "planner" | "awaiter" => Some(Self::Plan),
             "review" | "code-review" | "code_review" | "reviewer" => Some(Self::Review),
             "implementer" | "implement" | "implementation" | "builder" => Some(Self::Implementer),
@@ -755,6 +748,22 @@ impl SubAgentType {
 
     #[must_use]
     pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::General => "worker",
+            Self::Explore => "scout",
+            Self::Plan => "planner",
+            Self::Review => "reviewer",
+            Self::Implementer => "builder",
+            Self::Verifier => "verifier",
+            Self::Custom => "custom",
+        }
+    }
+
+    /// Persisted v0.9.x adapter name. Serde still owns snapshot compatibility;
+    /// this helper is only for legacy model-override lookup during the Fleet
+    /// vocabulary migration.
+    #[must_use]
+    fn legacy_type_name(&self) -> &'static str {
         match self {
             Self::General => "general",
             Self::Explore => "explore",
@@ -6319,7 +6328,7 @@ impl ToolSpec for AgentTool {
                 "thinking": {
                     "type": "string",
                     "enum": ["inherit", "auto", "off", "low", "medium", "high", "max"],
-                    "description": "Optional child thinking budget. inherit (default) follows the parent thinking mode. auto chooses from the child prompt. off is best for faster explore/lookups. high is for normal reasoning. max is for hard design/debug/release/security work. Explicit thinking overrides the default off used by model_strength=faster."
+                    "description": "Optional child thinking budget. inherit (default) follows the parent thinking mode. auto chooses from the child prompt. off is best for faster scout/lookups. high is for normal reasoning. max is for hard design/debug/release/security work. Explicit thinking overrides the default off used by model_strength=faster."
                 },
                 "cwd": {
                     "type": "string",
@@ -6343,7 +6352,7 @@ impl ToolSpec for AgentTool {
                 },
                 "fork_context": {
                     "type": "boolean",
-                    "description": "Unset (default): auto — a read-only child (explore/plan/review/verifier or read_only write authority) running the parent's exact model route in the parent workspace forks the parent's cached context prefix; anything else starts fresh. true: force the parent prefix (cheap only on the parent's model route). false: force a fresh isolated context."
+                    "description": "Unset (default): auto — a read-only Fleet worker (scout/planner/reviewer/verifier or read_only write authority) running the parent's exact model route in the parent workspace forks the parent's cached context prefix; anything else starts fresh. true: force the parent prefix (cheap only on the parent's model route). false: force a fresh isolated context."
                 },
                 "max_depth": {
                     "type": "integer",
@@ -6355,7 +6364,7 @@ impl ToolSpec for AgentTool {
                     "type": "integer",
                     "minimum": 0,
                     "maximum": 2000,
-                    "description": "Optional child model-turn budget. Defaults by role (60 for explore/review/plan/verifier, 120 for implementer/general/custom) and is clamped to 2000."
+                    "description": "Optional child model-turn budget. Defaults by Fleet role (60 for scout/reviewer/planner/verifier, 120 for builder/worker/custom) and is clamped to 2000."
                 },
                 "wall_time_secs": {
                     "type": "integer",
@@ -10193,6 +10202,9 @@ pub(crate) fn configured_model_for_role_or_type(
         keys.push(role.to_ascii_lowercase());
     }
     keys.push(agent_type.as_str().to_string());
+    if agent_type.legacy_type_name() != agent_type.as_str() {
+        keys.push(agent_type.legacy_type_name().to_string());
+    }
     keys.push("default".to_string());
 
     for key in keys {
@@ -10876,10 +10888,10 @@ fn normalize_role_alias(input: &str) -> Option<&'static str> {
     match input.to_ascii_lowercase().as_str() {
         "default" => Some("default"),
         "worker" | "general" | "general-purpose" | "general_purpose" => Some("worker"),
-        "explorer" | "explore" | "exploration" => Some("explorer"),
-        "awaiter" | "plan" | "planner" | "planning" => Some("awaiter"),
+        "scout" | "explorer" | "explore" | "exploration" => Some("scout"),
+        "awaiter" | "plan" | "planner" | "planning" => Some("planner"),
         "reviewer" | "review" | "code-review" | "code_review" => Some("reviewer"),
-        "implementer" | "implement" | "implementation" | "builder" => Some("implementer"),
+        "implementer" | "implement" | "implementation" | "builder" => Some("builder"),
         "verifier" | "verify" | "verification" | "validator" | "tester" => Some("verifier"),
         "custom" => Some("custom"),
         _ => None,
@@ -10891,7 +10903,11 @@ fn build_assignment_prompt(
     assignment: &SubAgentAssignment,
     agent_type: &SubAgentType,
 ) -> String {
-    let role = assignment.role.as_deref().unwrap_or("default");
+    let role = assignment
+        .role
+        .as_deref()
+        .map(|role| normalize_role_alias(role).unwrap_or(role))
+        .unwrap_or("default");
     format!(
         "Assignment metadata:\n- objective: {}\n- role: {}\n- resolved_type: {}\n\nTask:\n{}",
         assignment.objective,
@@ -11380,7 +11396,7 @@ impl SubAgentToolRegistry {
         // bypass where a read-only child could quietly write or shell out.
         if !self.posture_permits_tool(name, Some(&input)) {
             return Err(anyhow!(
-                "Tool {name} is not permitted for the read-only `{role}` sub-agent role. Use an `implementer` or `general` role (or a `custom` role with an explicit allowed_tools list) to mutate the workspace or run shell commands.",
+                "Tool {name} is not permitted for the read-only Fleet role `{role}`. Use a `builder` or `worker` role (or `custom` with an explicit allowed_tools list) to mutate the workspace or run shell commands.",
                 role = self.agent_type.as_str()
             ));
         }
@@ -11766,32 +11782,32 @@ fn subagent_status_name(status: &SubAgentStatus) -> &'static str {
 use crate::prompts::text::SUBAGENT_OUTPUT_FORMAT;
 
 const GENERAL_AGENT_INTRO: &str = concat!(
-    "You are a trusted general-purpose sub-agent. Your job is to complete the one task you were given, end-to-end, and report back concisely.\n",
+    "You are a trusted Fleet worker. Your job is to complete the one task you were given, end-to-end, and report back concisely.\n",
     "Stay inside the assigned scope; put adjacent work under RISKS/BLOCKERS.\n",
     "For genuinely multi-step work, track progress with `work_update`; skip it for short, focused tasks.\n",
     "**Stop quickly on failure**: if the same tool call fails 2 times in a row, stop retrying and return what you have so far with a one-line note explaining what's missing. Do not loop on impossible queries (e.g. external API unreachable, rate-limited, or returning empty).\n",
-    "For implementer or repair-style work, keep going within the assigned scope; checkpoint before broadening the task or after repeated failures instead of forcing a tiny tool-call cap.\n\n"
+    "For builder or repair-style work, keep going within the assigned scope; checkpoint before broadening the task or after repeated failures instead of forcing a tiny tool-call cap.\n\n"
 );
 
 const EXPLORE_AGENT_INTRO: &str = concat!(
-    "You are a trusted exploration sub-agent (role: `explore`). Your job is to map the relevant code quickly and stay strictly read-only.\n",
+    "You are a trusted Fleet scout (role: `scout`). Your job is to map the relevant code quickly and stay strictly read-only.\n",
     "Default to `EFFORT: quick`: aim for about 3-5 tool calls unless the brief explicitly asks for more.\n",
     "Orient first: confirm the workspace/project root, read relevant AGENTS.md/README guidance when the tree is unfamiliar, then search only the likely scope.\n",
     "Use `File` with actions `list`, `search_name`, `search_content`, and `read`; use RLM only for long inputs or many semantic slices, not basic path discovery.\n",
     "Honor QUESTION, SCOPE, ALREADY_KNOWN, and STOP_CONDITION. Do not repeat ALREADY_KNOWN work unless evidence contradicts it; do not broaden once QUESTION is answered.\n",
     "Your value is compressed reconnaissance: cite `path:line-range` for each finding and stop once evidence is sufficient. Return partial findings if the next step would be speculative or duplicative.\n",
-    "CHANGES will almost always be \"None.\" for an explorer.\n\n"
+    "CHANGES will almost always be \"None.\" for a scout.\n\n"
 );
 
 const PLAN_AGENT_INTRO: &str = concat!(
-    "You are a trusted planning sub-agent (role: `plan`). Your job is to produce a grounded, prioritized plan, not patches.\n",
+    "You are a trusted Fleet planner (role: `planner`). Your job is to produce a grounded, prioritized plan, not patches.\n",
     "Read enough code to avoid guessing; each step names its artifact and verification.\n",
     "Use work_update for concrete To-do progress; explain key trade-offs in the plan you return.\n",
     "CHANGES should list plan artifacts only, not future speculative edits.\n\n"
 );
 
 const REVIEW_AGENT_INTRO: &str = concat!(
-    "You are an adversarial code review sub-agent (role: `review`). Assume the change is broken until the evidence proves otherwise: actively try to refute the claims made about it, and stay strictly read-only.\n",
+    "You are an adversarial Fleet reviewer (role: `reviewer`). Assume the change is broken until the evidence proves otherwise: actively try to refute the claims made about it, and stay strictly read-only.\n",
     "Read the diff/files, grep sibling patterns/tests, hunt regressions, missing tests, unhandled edge cases, and quiet behavior changes, then order EVIDENCE by severity.\n",
     "Use BLOCKER/MAJOR/MINOR/NIT and include path:line-range plus suggested fix.\n",
     "You may use more tool calls than quick exploration, but stop after decisive evidence instead of widening the review forever.\n",
@@ -11800,20 +11816,20 @@ const REVIEW_AGENT_INTRO: &str = concat!(
 );
 
 const CUSTOM_AGENT_INTRO: &str = concat!(
-    "You are a trusted custom sub-agent (role: `custom`) with a narrowed tool registry. Your job is to stay tightly scoped to the assigned objective.\n",
+    "You are a trusted custom Fleet worker (role: `custom`) with a narrowed tool registry. Your job is to stay tightly scoped to the assigned objective.\n",
     "Use only tools available at runtime; put missing capabilities under BLOCKERS and stop.\n\n"
 );
 
 const IMPLEMENTER_AGENT_INTRO: &str = concat!(
-    "You are a trusted implementation sub-agent (role: `implementer`). Your job is to land the assigned change with minimal surrounding edits.\n",
+    "You are a trusted Fleet builder (role: `builder`). Your job is to land the assigned change with minimal surrounding edits.\n",
     "Read target files with `File` action `read` before editing; prefer action `edit` for narrow changes and action `patch` for hunks.\n",
     "Run relevant verification after edit batches; write needed tests with the implementation.\n",
-    "You are not limited to an explorer-style 3-5 tool-call cap. Checkpoint before expanding scope or after repeated failures, then continue only inside the assigned brief.\n",
+    "You are not limited to a scout-style 3-5 tool-call cap. Checkpoint before expanding scope or after repeated failures, then continue only inside the assigned brief.\n",
     "CHANGES is load-bearing: list every modified file with a one-line why.\n\n"
 );
 
 const VERIFIER_AGENT_INTRO: &str = concat!(
-    "You are a trusted verification sub-agent (role: `verifier`). Your job is to run the requested gates and report results, and stay read-only.\n",
+    "You are a trusted Fleet verifier (role: `verifier`). Your job is to run the requested gates and report results, and stay read-only.\n",
     "Report PASS/FAIL/FLAKY at the top of SUMMARY with exact command evidence.\n",
     "Capture failing assertion and file:line; put obvious fixes under RISKS.\n",
     "You may use more tool calls than quick exploration, but stop after decisive pass/fail evidence.\n",

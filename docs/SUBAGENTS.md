@@ -1,9 +1,11 @@
-# Sub-Agents
+# Fleet Workers and Sub-Agent Compatibility
 
-Sub-agents are the user-facing vocabulary for nested worker assignments: a
-parent launches a focused role (`explore`, `review`, `implementer`, `verifier`,
-...) through `agent` and gets back an `agent_id` plus transcript handle while
-the worker runs.
+Fleet roles are the user-facing vocabulary for delegated work: a parent
+launches a focused `worker`, `scout`, `planner`, `reviewer`, `builder`, or
+`verifier` through `agent` and gets back an `agent_id` plus transcript handle
+while the worker runs. `SubAgentType` and its older role spellings remain an
+internal/persisted compatibility adapter during v0.9.x; new prompts and config
+should use Fleet names.
 
 Architecturally, sub-agents should not be a second execution substrate. The
 durable primitive is the fleet-backed worker run described in
@@ -33,7 +35,7 @@ tool description.
 
 ## Role taxonomy
 
-The `type` field on `agent` selects a system-prompt posture for the child
+The `type` field on `agent` selects a Fleet posture for the child
 (`agent_type` is accepted as a compatibility alias). Each role is a distinct
 stance toward the work — not just a different label.
 
@@ -52,11 +54,11 @@ stewardship.
 
 | Role          | Stance                                 | Writes? | Shell posture | Typical use                                  |
 |---------------|----------------------------------------|---------|---------------|----------------------------------------------|
-| `general`     | flexible; do whatever the parent says  | yes     | yes           | the default; multi-step tasks                |
-| `explore`     | read-only; map the relevant code fast  | no      | read-only     | "find every call site of `Foo`"              |
-| `plan`        | analyse and produce a strategy         | minimal | minimal       | "design the migration; don't execute"        |
-| `review`      | read-and-grade with severity scores    | no      | read-only     | "audit this PR for bugs"                     |
-| `implementer` | land a specific change with min edit   | yes     | yes           | "rewrite `bar.rs::Foo::bar` to do X"         |
+| `worker`      | flexible; do whatever the parent says  | yes     | yes           | the default; multi-step tasks                |
+| `scout`       | read-only; map the relevant code fast  | no      | read-only     | "find every call site of `Foo`"              |
+| `planner`     | analyse and produce a strategy         | minimal | minimal       | "design the migration; don't execute"        |
+| `reviewer`    | read-and-grade with severity scores    | no      | read-only     | "audit this PR for bugs"                     |
+| `builder`     | land a specific change with min edit   | yes     | yes           | "rewrite `bar.rs::Foo::bar` to do X"         |
 | `verifier`    | run tests / validation, report outcome | no      | test-focused  | "run cargo test --workspace, report"         |
 | `custom`      | explicit narrow tool allowlist         | depends | depends       | locked-down dispatch with hand-picked tools  |
 
@@ -95,7 +97,7 @@ session projection and worker record. By default the branch is
 `codex/agent-<name>-<id>` and the checkout lives beside the parent repo under
 `.codewhale-worktrees/`, so the parent checkout stays clean.
 
-Isolation is not write authority. A prompt-only general child starts read-only.
+Isolation is not write authority. A prompt-only worker starts read-only.
 A writer also declares `write_authority: "workspace_write"` or
 `"worktree_write"` and at least one normalized repo-relative `write_roots`,
 `exact_files`, or `coordination_contracts` value. Active overlapping shared
@@ -127,11 +129,11 @@ STOP_CONDITION:
 OUTPUT: VERDICT, EVIDENCE, GAPS, NEXT
 ```
 
-`explore` briefs default to quick, read-only investigation. About 3-5 tool calls
+`scout` briefs default to quick, read-only investigation. About 3-5 tool calls
 is enough for quick exploration: orient, search, read the decisive lines, and
 return. Do not repeat `ALREADY_KNOWN` work unless evidence contradicts it. Review
 and verifier briefs can spend more calls, but should stop after decisive
-evidence. Implementer and repair-style briefs should use checkpoints before
+evidence. Builder and repair-style briefs should use checkpoints before
 scope expansion or after repeated failures rather than a tiny call cap.
 
 Good delegation prompt examples:
@@ -165,25 +167,25 @@ OUTPUT: VERDICT, EVIDENCE, GAPS, NEXT.
 
 ### When to pick which role
 
-- **`general`** — when the task is "do this whole thing", not "go
+- **`worker`** — when the task is "do this whole thing", not "go
   look", "design", or "verify". This is the right default; reach for
   a more specific role only when the posture matters.
-- **`explore`** — when the parent needs evidence before deciding what
-  to do next. Explorers are cheap and fast; open 2–3 in parallel
+- **`scout`** — when the parent needs evidence before deciding what
+  to do next. Scouts are cheap and fast; open 2–3 in parallel
   for independent regions.
   They should orient first: confirm the project root, read relevant
   `AGENTS.md`/`README.md` guidance in unfamiliar trees, search only the
   likely scope, and return `path:line-range` evidence instead of a narrative
-  tour. The role name to use is `explore` or `explorer`.
-- **`plan`** — when the parent has an objective but no executable
+  tour. The role name to use is `scout`.
+- **`planner`** — when the parent has an objective but no executable
   decomposition. Planners write artifacts (`update_plan` rows,
   `checklist_write` entries) but don't carry them out.
-- **`review`** — when there's already a change and the parent wants
+- **`reviewer`** — when there's already a change and the parent wants
   it graded. Reviewers don't patch — they describe the fix in the
-  finding so the parent can dispatch an Implementer if the verdict
+  finding so the parent can dispatch a builder if the verdict
   is "fix it".
-- **`implementer`** — when the change is already specified and just
-  needs to land. Implementers stay tightly scoped: minimum edit, no
+- **`builder`** — when the change is already specified and just
+  needs to land. Builders stay tightly scoped: minimum edit, no
   drive-by refactoring, run a quick verification before handing back.
 - **`verifier`** — when the parent needs an authoritative pass/fail
   on the test suite or other validation. Verifiers don't fix
@@ -200,11 +202,11 @@ The model can spell each role multiple ways:
 
 | Canonical     | Aliases                                                          |
 |---------------|------------------------------------------------------------------|
-| `general`     | `worker`, `default`, `general-purpose`                           |
-| `explore`     | `explorer`, `exploration`                                        |
-| `plan`        | `planning`, `planner`, `awaiter`                                 |
-| `review`      | `reviewer`, `code-review`, `code_review`                         |
-| `implementer` | `implement`, `implementation`, `builder`                         |
+| `worker`      | `general`, `default`, `general-purpose`                          |
+| `scout`       | `explore`, `explorer`, `exploration`                             |
+| `planner`     | `plan`, `planning`, `awaiter`                                    |
+| `reviewer`    | `review`, `code-review`, `code_review`                           |
+| `builder`     | `implementer`, `implement`, `implementation`                     |
 | `verifier`    | `verify`, `verification`, `validator`, `tester`                  |
 | `custom`      | (none; explicit `allowed_tools` array required)                  |
 
@@ -303,16 +305,20 @@ are case-insensitive):
 ```toml
 [subagents]
 default_model  = "deepseek-v4-flash"   # fallback for every role
-worker_model   = "deepseek-v4-pro"     # worker / general
-explorer_model = "deepseek-v4-flash"   # explorer / explore
-awaiter_model  = "deepseek-v4-flash"   # awaiter / plan
-review_model   = "deepseek-v4-pro"     # review
+worker_model   = "deepseek-v4-pro"     # worker
+scout_model    = "deepseek-v4-flash"   # scout
+planner_model  = "deepseek-v4-flash"   # planner
+reviewer_model = "deepseek-v4-pro"     # reviewer
 custom_model   = "deepseek-v4-pro"     # custom
 
 [subagents.models]
 # Free-form role → model map; any role alias accepted by agent works.
-implementation = "deepseek-v4-pro"
+builder = "deepseek-v4-pro"
 ```
+
+The v0.9.x convenience keys `explorer_model`, `awaiter_model`, and
+`review_model` remain accepted as deprecated aliases so existing config files
+do not break.
 
 Model ids may be **any model the active provider accepts** — validation is
 provider-aware and happens at spawn time, not load time. On the official
@@ -482,14 +488,14 @@ BLOCKERS:   what stopped you; "None." if you finished cleanly
 
 The exact format lives in `crates/tui/src/prompts/text.rs` (`SUBAGENT_OUTPUT_FORMAT`).
 The parent reads `EVIDENCE` as a working set for the next turn, so
-explorers and reviewers should be precise here.
+scouts and reviewers should be precise here.
 
 ## Memory and the `remember` tool (#489)
 
 Sub-agents inherit the parent's memory file when memory is enabled
 (`[memory] enabled = true` or `DEEPSEEK_MEMORY=on`). They can
 append durable notes via the `remember` tool — handy for an
-explorer that discovers a project convention worth carrying across
+scout that discovers a project convention worth carrying across
 sessions, or a verifier that learns "this test is flaky".
 
 Memory writes are scoped to the user's own `memory.md` file; they
