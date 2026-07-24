@@ -51,6 +51,78 @@ Thank you for your interest in contributing to codewhale! This document provides
   directory (for example `crates/tui/tests/` or `crates/state/tests/`). The
   repository root `tests/` directory is not used
 
+### Pre-push verification
+
+Run these before every push. They match what CI enforces on pull
+requests, so passing locally means the PR lanes should pass too:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-features --locked -- \
+  -D warnings \
+  -A clippy::uninlined_format_args \
+  -A clippy::too_many_arguments \
+  -A clippy::unnecessary_map_or \
+  -A clippy::collapsible_if \
+  -A clippy::assertions_on_constants
+cargo test --workspace --all-features --locked
+```
+
+The release lane runs a stricter clippy that also lints test, bench, and
+example targets. The PR template checklist asks for this form, and it is
+the right command before requesting review or doing release-bound work,
+because `--all-features` alone skips lints that will fail the release
+lane later:
+
+```bash
+cargo clippy --workspace --all-targets --all-features --locked -- \
+  -D warnings \
+  -A clippy::uninlined_format_args \
+  -A clippy::too_many_arguments \
+  -A clippy::unnecessary_map_or \
+  -A clippy::collapsible_if \
+  -A clippy::assertions_on_constants
+```
+
+Some suites are slow, platform-bound, or intentionally excluded from the
+default run; treat them as documented isolation cases rather than
+failures of the normal gate:
+
+- **PTY snapshots** (`cargo test -p codewhale-tui --test qa_pty
+  --locked`) are Unix-only and internally serialized. One recovery-boot
+  case is `#[ignore]`d for a documented input-starvation issue. When a
+  PTY case fails, rerun that exact case in isolation and diagnose the
+  rendered frame before calling it a flake; `run_verifiers_background_*`
+  is the one known full-suite-parallelism flake that passes in
+  isolation.
+- **Release runtime QA** (`cargo test -p codewhale-tui --test
+  release_runtime_qa --locked`) includes an `#[ignore]`d 32-worker storm
+  benchmark that is only run explicitly for evidence gathering.
+- **OCR** (`image_ocr`) uses the macOS Vision framework or a locally
+  installed `tesseract`; its platform-specific paths are
+  `cfg(target_os = "macos")`-gated and depend on host tooling.
+- **Seatbelt sandbox** tests are macOS-only (`cfg(target_os =
+  "macos")` at the module level) and do not run elsewhere.
+
+#### Local git hooks are optional
+
+This repository does not install git hooks, and no hook installer
+exists; CI is the enforced gate. If you want a local `pre-push` hook
+that runs the commands above, add it yourself (`.git/hooks/pre-push` or
+`git config core.hooksPath`). Constraints for any local hook:
+
+- A hook must never push, tag, publish, deploy, mutate credentials, or
+  rewrite the working tree (no auto-fix commits or silent file
+  modification). It may only verify and report.
+- To bypass your own hook for a knowingly documented reason (for
+  example, pushing work-in-progress to your own fork branch), use
+  `git push --no-verify` and say so in the PR description. Bypassing a
+  local hook does not make the gates pass — CI still runs them, and a
+  bypassed gate must never be reported as a passing one.
+- Release publication (tags, GitHub Releases, crates/npm artifacts) is a
+  separate, owner-approved gate. Neither local hooks nor a green local
+  run authorize any publication step.
+
 ### Commit Messages
 
 Use clear, descriptive commit messages following conventional commits:
@@ -307,12 +379,9 @@ these crates, including the bottom-up build order.
 
 2. Make your changes and commit them
 
-3. Ensure CI passes:
-   ```bash
-   cargo fmt --all -- --check
-   cargo clippy --workspace --all-targets --all-features
-   cargo test --workspace --all-features
-   ```
+3. Run the pre-push verification commands (see
+   [Pre-push verification](#pre-push-verification) above for the exact
+   gate and the stricter release clippy form)
 
 4. Push your branch and create a Pull Request
 
@@ -347,12 +416,8 @@ Typically each PR touches 1–3 new files, modifies 2–5 existing files for wir
 are scoped to a single feature or fix — if you discover related work that needs
 doing, open a separate issue rather than expanding the PR scope.
 
-Before submitting, run:
-```bash
-cargo fmt --check
-cargo clippy --workspace --all-targets --all-features 2>&1 | head -50
-cargo check
-```
+Before submitting, run the commands in
+[Pre-push verification](#pre-push-verification).
 
 ## Reporting Issues
 
