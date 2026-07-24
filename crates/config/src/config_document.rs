@@ -35,6 +35,7 @@ where
             }
             _ => toml_edit::DocumentMut::new(),
         };
+        heal_extras_nesting(&mut document);
         let result = mutate(&mut document)?;
         let body = document.to_string();
         if original.as_deref() == Some(body.as_str()) || (original.is_none() && body.is_empty()) {
@@ -43,6 +44,39 @@ where
         persist_locked(path, original.as_deref(), body.as_bytes())?;
         Ok(result)
     })
+}
+
+/// Lift keys trapped under literal `[extras]` tables back to the top level.
+///
+/// The config structs flatten unknown keys into an `extras` map; a historic
+/// writer serialized that map under a literal `extras` key, and every
+/// subsequent buggy round-trip nested it one level deeper
+/// (`[extras.extras.extras.projects."..."]`). That silently strips real
+/// state — workspace trust records, profiles, saved tokens — from every
+/// reader that looks at the canonical top-level tables (2026-07-23 user
+/// report: saved permission/trust ignored on each new session).
+///
+/// Healing runs on every config mutation: entries move up one level per
+/// pass (existing top-level values always win; shadowed duplicates are
+/// dropped), until no literal `extras` table remains. Bounded passes keep a
+/// pathological file from looping.
+pub fn heal_extras_nesting(document: &mut toml_edit::DocumentMut) -> bool {
+    let mut healed = false;
+    for _ in 0..16 {
+        let Some(extras) = document
+            .remove("extras")
+            .and_then(|item| item.into_table().ok())
+        else {
+            break;
+        };
+        healed = true;
+        for (key, value) in extras {
+            if document.get(&key).is_none() {
+                document.insert(&key, value);
+            }
+        }
+    }
+    healed
 }
 
 /// Create a config file only if it is still absent when the shared lock is
@@ -407,6 +441,78 @@ fn table_like_at_path_mut<'a>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn healing_lifts_nested_extras_towers_to_the_top_level() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            concat!(
+                "reasoning_effort = \"high\"\n\n",
+                "[projects.\"/live\"]\n",
+                "trust_level = \"trusted\"\n\n",
+                "[extras.extras]\n",
+                "chatgpt_access_token = \"tok\"\n",
+                "reasoning_effort = \"low\"\n\n",
+                "[extras.extras.projects.\"/old\"]\n",
+                "trust_level = \"trusted\"\n",
+            ),
+        )
+        .expect("write fixture");
+
+        super::mutate_config_document(&path, |_| anyhow::Ok(())).expect("mutate heals");
+
+        let healed: toml::Value =
+            toml::from_str(&std::fs::read_to_string(&path).expect("read")).expect("parse");
+        assert!(
+            healed.get("extras").is_none(),
+            "tower must be gone: {healed}"
+        );
+        assert_eq!(
+            healed["chatgpt_access_token"].as_str(),
+            Some("tok"),
+            "trapped scalar lifted to the root"
+        );
+        assert_eq!(
+            healed["reasoning_effort"].as_str(),
+            Some("high"),
+            "existing top-level values win over shadowed duplicates"
+        );
+        assert_eq!(
+            healed["projects"]["/live"]["trust_level"].as_str(),
+            Some("trusted"),
+            "live records untouched"
+        );
+        // The nested projects table was shadowed by the live one at the
+        // first lift; healing never merges table contents, only lifts whole
+        // missing keys, so the shadowed duplicate is dropped.
+    }
+
+    #[test]
+    fn healing_recovers_project_tables_when_no_top_level_exists() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            concat!(
+                "[extras.extras.extras.projects.\"/old\"]\n",
+                "trust_level = \"trusted\"\n",
+            ),
+        )
+        .expect("write fixture");
+
+        super::mutate_config_document(&path, |_| anyhow::Ok(())).expect("mutate heals");
+
+        let healed: toml::Value =
+            toml::from_str(&std::fs::read_to_string(&path).expect("read")).expect("parse");
+        assert!(healed.get("extras").is_none(), "{healed}");
+        assert_eq!(
+            healed["projects"]["/old"]["trust_level"].as_str(),
+            Some("trusted"),
+            "trapped trust record restored: {healed}"
+        );
+    }
+
     use std::sync::{Arc, Barrier};
     use std::thread;
 

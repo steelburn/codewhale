@@ -5895,12 +5895,21 @@ pub(crate) fn save_workspace_trust(workspace: &Path) -> Result<PathBuf> {
 
 fn workspace_trust_level_from_doc<'a>(doc: &'a toml::Value, workspace: &Path) -> Option<&'a str> {
     let workspace = canonicalize_or_keep(workspace);
-    let projects = doc.get("projects")?.as_table()?;
-    for (raw_path, project) in projects {
-        let project_path = canonicalize_or_keep(&expand_path(raw_path));
-        if project_path == workspace {
-            return project.get("trust_level").and_then(toml::Value::as_str);
+    // Trust records may sit at the top level or — from the historic
+    // extras-nesting write bug (healed on mutation since 2026-07-23) — under
+    // one or more literal `extras` tables. Read tolerantly so a not-yet-
+    // healed config file still recognizes its trusted workspaces.
+    let mut scope = Some(doc);
+    while let Some(current) = scope {
+        if let Some(projects) = current.get("projects").and_then(toml::Value::as_table) {
+            for (raw_path, project) in projects {
+                let project_path = canonicalize_or_keep(&expand_path(raw_path));
+                if project_path == workspace {
+                    return project.get("trust_level").and_then(toml::Value::as_str);
+                }
+            }
         }
+        scope = current.get("extras");
     }
     None
 }
